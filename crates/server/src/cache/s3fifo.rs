@@ -95,7 +95,10 @@ impl Shard {
             q: Mutex::new(Queues {
                 small: VecDeque::new(),
                 main: VecDeque::new(),
-                ghost: Ghost { order: VecDeque::new(), set: HashSet::default() },
+                ghost: Ghost {
+                    order: VecDeque::new(),
+                    set: HashSet::default(),
+                },
                 used: 0,
                 small_bytes: 0,
                 dead_bytes: 0,
@@ -124,6 +127,8 @@ impl Shard {
 
         let mut q = self.q.lock();
         while q.used + cost > self.capacity {
+            // Not identical: eviction order differs, which is the whole point of S3-FIFO.
+            #[allow(clippy::if_same_then_else)]
             let evicted = if q.small_bytes >= self.small_capacity {
                 self.evict_small(&mut q) || self.evict_main(&mut q)
             } else {
@@ -147,7 +152,9 @@ impl Shard {
     }
 
     pub fn del(&self, key: &[u8]) -> bool {
-        let Some(e) = self.map.remove(key) else { return false };
+        let Some(e) = self.map.remove(key) else {
+            return false;
+        };
         let mut q = self.q.lock();
         self.kill(&mut q, &e);
         self.maybe_compact(&mut q);
@@ -172,7 +179,9 @@ impl Shard {
     }
 
     fn evict_small(&self, q: &mut Queues) -> bool {
-        let Some(e) = q.small.pop_front() else { return false };
+        let Some(e) = q.small.pop_front() else {
+            return false;
+        };
         let cost = e.cost();
         q.small_bytes -= cost;
         if !e.live.load(Relaxed) {
@@ -192,7 +201,9 @@ impl Shard {
 
     fn evict_main(&self, q: &mut Queues) -> bool {
         loop {
-            let Some(e) = q.main.pop_front() else { return false };
+            let Some(e) = q.main.pop_front() else {
+                return false;
+            };
             let cost = e.cost();
             if !e.live.load(Relaxed) {
                 q.dead_bytes -= cost;
@@ -282,7 +293,10 @@ mod tests {
             set(&s, i, 100);
         }
         let survivors = (0..10).filter(|&i| s.get(&key(i)).is_some()).count();
-        assert_eq!(survivors, 10, "hot keys should be promoted to main and survive a scan");
+        assert_eq!(
+            survivors, 10,
+            "hot keys should be promoted to main and survive a scan"
+        );
     }
 
     #[test]
@@ -295,7 +309,10 @@ mod tests {
         }
         assert!(s.get(&key(0)).is_none());
         set(&s, 0, 100);
-        assert!(s.q.lock().main.iter().any(|e| e.key == key(0)), "ghost hit should insert into main");
+        assert!(
+            s.q.lock().main.iter().any(|e| e.key == key(0)),
+            "ghost hit should insert into main"
+        );
     }
 
     #[test]
@@ -310,7 +327,10 @@ mod tests {
         }
         assert_eq!(s.used_bytes(), 0);
         let q = s.q.lock();
-        assert!(q.dead_bytes <= cap / 4, "compaction should bound dead bytes");
+        assert!(
+            q.dead_bytes <= cap / 4,
+            "compaction should bound dead bytes"
+        );
         assert!(q.small.len() + q.main.len() <= 25);
     }
 
@@ -351,8 +371,21 @@ mod tests {
         }
         assert!(s.used_bytes() <= 200 * 1024);
         let q = s.q.lock();
-        let live: usize = q.small.iter().chain(q.main.iter()).filter(|e| e.live.load(Relaxed)).map(|e| e.cost()).sum();
+        let live: usize = q
+            .small
+            .iter()
+            .chain(q.main.iter())
+            .filter(|e| e.live.load(Relaxed))
+            .map(|e| e.cost())
+            .sum();
         assert_eq!(live, q.used, "accounting must match live entries");
-        assert_eq!(s.map.len(), q.small.iter().chain(q.main.iter()).filter(|e| e.live.load(Relaxed)).count());
+        assert_eq!(
+            s.map.len(),
+            q.small
+                .iter()
+                .chain(q.main.iter())
+                .filter(|e| e.live.load(Relaxed))
+                .count()
+        );
     }
 }

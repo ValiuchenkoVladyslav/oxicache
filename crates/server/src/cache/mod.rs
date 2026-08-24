@@ -33,7 +33,11 @@ impl Cache {
         let mut h = self.hasher.build_hasher();
         h.write(key);
         let hash = h.finish();
-        let idx = if self.shift == 64 { 0 } else { (hash >> self.shift) as usize };
+        let idx = if self.shift == 64 {
+            0
+        } else {
+            (hash >> self.shift) as usize
+        };
         (&self.shards[idx], hash)
     }
 
@@ -57,6 +61,10 @@ impl Cache {
         self.shards.iter().map(Shard::len).sum()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn used_bytes(&self) -> usize {
         self.shards.iter().map(Shard::used_bytes).sum()
     }
@@ -74,7 +82,10 @@ mod tests {
             c.set(Bytes::from(i.to_string()), Bytes::from_static(b"v"));
         }
         assert_eq!(c.len(), 10_000);
-        assert!(c.shards.iter().all(|s| s.len() > 300), "hash should distribute keys evenly");
+        assert!(
+            c.shards.iter().all(|s| s.len() > 300),
+            "hash should distribute keys evenly"
+        );
         assert_eq!(c.get(b"42").as_deref(), Some(&b"v"[..]));
         assert!(c.del(b"42"));
         assert_eq!(c.len(), 9_999);
