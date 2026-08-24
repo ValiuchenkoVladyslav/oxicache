@@ -33,6 +33,17 @@ pub struct Entry {
 }
 
 impl Entry {
+    #[cfg(test)]
+    pub(super) fn for_test(key: Bytes) -> Arc<Self> {
+        Arc::new(Self {
+            key,
+            value: Bytes::new(),
+            hash: 0,
+            freq: AtomicU8::new(0),
+            live: AtomicBool::new(true),
+        })
+    }
+
     #[inline]
     fn cost(&self) -> usize {
         self.key.len() + self.value.len() + ENTRY_OVERHEAD

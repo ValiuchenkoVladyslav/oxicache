@@ -13,6 +13,9 @@ use crate::cache::Cache;
 use crate::error::{Error, Result};
 use crate::tls::Identity;
 
+/// Upper bound on body capacity reserved up front from `content-length`.
+const MAX_PREALLOC: usize = 16 << 20;
+
 type H3Conn = h3::server::Connection<h3_quinn::Connection, Bytes>;
 type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
@@ -103,7 +106,13 @@ async fn serve_connection(conn: quinn::Connection, cache: Arc<Cache>) {
 }
 
 async fn serve_request(req: Request<()>, mut stream: H3Stream, cache: &Cache) -> Result<()> {
-    let mut body = BytesMut::new();
+    let hint = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_PREALLOC);
+    let mut body = BytesMut::with_capacity(hint);
     while let Some(chunk) = stream.recv_data().await? {
         body.put(chunk);
     }
@@ -130,8 +139,13 @@ pub fn dispatch(method: &Method, path: &str, body: Bytes, cache: &Cache) -> (Sta
         }),
         wire::path::SET => wire::decode_entries(body).map(|entries| {
             for (k, v) in entries {
-                // Copy out of the request buffer so cached data never pins the whole body.
-                cache.set(Bytes::copy_from_slice(&k), Bytes::copy_from_slice(&v));
+                // Copy out of the request buffer so cached data never pins the whole
+                // body; key and value share one allocation.
+                let mut buf = BytesMut::with_capacity(k.len() + v.len());
+                buf.extend_from_slice(&k);
+                buf.extend_from_slice(&v);
+                let buf = buf.freeze();
+                cache.set(buf.slice(..k.len()), buf.slice(k.len()..));
             }
             Bytes::new()
         }),

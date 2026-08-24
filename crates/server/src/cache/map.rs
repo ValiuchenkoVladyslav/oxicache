@@ -23,9 +23,17 @@ impl Map {
         self.0.get(key).map(|g| g.value().clone())
     }
 
+    /// Insert, replacing both key and value when present: the stored key may
+    /// share an allocation with the old value, so it must not be retained.
     #[inline]
     pub fn insert(&self, key: Bytes, entry: Arc<Entry>) -> Option<Arc<Entry>> {
-        self.0.insert(key, entry)
+        match self.0.entry(key) {
+            dashmap::Entry::Occupied(o) => Some(o.replace_entry(entry).1),
+            dashmap::Entry::Vacant(v) => {
+                v.insert(entry);
+                None
+            }
+        }
     }
 
     #[inline]
@@ -42,5 +50,21 @@ impl Map {
     #[inline]
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn overwrite_replaces_key_object() {
+        let m = Map::new();
+        let a = Bytes::from_static(b"key");
+        let b = Bytes::from(b"key".to_vec());
+        m.insert(a.clone(), Entry::for_test(a.clone()));
+        m.insert(b.clone(), Entry::for_test(b.clone()));
+        let stored = m.0.get(&b"key"[..]).map(|r| r.key().as_ptr()).unwrap();
+        assert_eq!(stored, b.as_ptr(), "old key object must not be retained");
     }
 }
