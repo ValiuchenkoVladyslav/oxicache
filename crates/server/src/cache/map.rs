@@ -1,5 +1,6 @@
 //! Thin wrapper around the concurrent map used per shard, so the backing
-//! crate can be swapped in one place.
+//! crate can be swapped in one place. Only clone-out accessors are exposed so
+//! no dashmap guard can outlive a single expression (see docs/hashmap-bench.md).
 
 use std::sync::Arc;
 
@@ -8,7 +9,7 @@ use dashmap::DashMap;
 
 use super::s3fifo::Entry;
 
-type Hasher = foldhash::fast::FixedState;
+type Hasher = foldhash::fast::RandomState;
 
 pub struct Map(DashMap<Bytes, Arc<Entry>, Hasher>);
 

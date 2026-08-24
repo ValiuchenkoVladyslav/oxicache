@@ -49,7 +49,7 @@ impl Entry {
 
 struct Ghost {
     order: VecDeque<u64>,
-    set: HashSet<u64, foldhash::fast::FixedState>,
+    set: HashSet<u64, foldhash::fast::RandomState>,
 }
 
 impl Ghost {

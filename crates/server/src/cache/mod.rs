@@ -12,7 +12,7 @@ use s3fifo::Shard;
 pub struct Cache {
     shards: Box<[Shard]>,
     shift: u32,
-    hasher: foldhash::fast::FixedState,
+    hasher: foldhash::fast::RandomState,
 }
 
 impl Cache {
@@ -24,7 +24,7 @@ impl Cache {
         Self {
             shards: (0..n).map(|_| Shard::new(per)).collect(),
             shift: 64 - n.trailing_zeros(),
-            hasher: foldhash::fast::FixedState::default(),
+            hasher: foldhash::fast::RandomState::default(),
         }
     }
 
