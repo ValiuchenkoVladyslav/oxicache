@@ -23,3 +23,8 @@ tracing-subscriber.workspace = true
 foldhash.workspace = true
 parking_lot.workspace = true
 dashmap = "6.2"
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+default = []
+mimalloc = ["dep:mimalloc"]

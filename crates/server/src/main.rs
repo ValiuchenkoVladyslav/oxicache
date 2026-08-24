@@ -6,6 +6,10 @@ use clap::Parser;
 use oxicache_server::{Cache, Identity, Server};
 use tracing::info;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// HTTP/3 in-memory cache server with S3-FIFO eviction.
