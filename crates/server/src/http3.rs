@@ -3,7 +3,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use http::{Method, Request, Response, StatusCode};
 use oxicache_wire as wire;
@@ -11,6 +10,7 @@ use rustls_pki_types::CertificateDer;
 use tracing::{debug, info, warn};
 
 use crate::cache::Cache;
+use crate::error::{Error, Result};
 use crate::tls::Identity;
 
 type H3Conn = h3::server::Connection<h3_quinn::Connection, Bytes>;
@@ -25,18 +25,14 @@ pub struct Server {
 impl Server {
     /// Bind a QUIC endpoint on `addr` serving `cache` with the given identity.
     pub fn bind(addr: SocketAddr, identity: Identity, cache: Arc<Cache>) -> Result<Self> {
-        let cert = identity
-            .certs
-            .first()
-            .context("identity has no certificate")?
-            .clone();
+        let cert = identity.certs.first().ok_or(Error::NoCertificate)?.clone();
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(identity.server_config()?)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(4096u32.into());
         config.transport_config(Arc::new(transport));
         let endpoint =
-            quinn::Endpoint::server(config, addr).with_context(|| format!("binding {addr}"))?;
+            quinn::Endpoint::server(config, addr).map_err(|source| Error::Bind { addr, source })?;
         Ok(Self {
             endpoint,
             cache,

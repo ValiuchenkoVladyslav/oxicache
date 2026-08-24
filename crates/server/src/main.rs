@@ -2,10 +2,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
 use clap::Parser;
 use oxicache_server::{Cache, Identity, Server};
 use tracing::info;
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// HTTP/3 in-memory cache server with S3-FIFO eviction.
 #[derive(Parser)]
@@ -35,7 +36,7 @@ fn parse_size(s: &str) -> Result<usize> {
         Some('K' | 'k') => (&s[..s.len() - 1], 1 << 10),
         Some('M' | 'm') => (&s[..s.len() - 1], 1 << 20),
         Some('G' | 'g') => (&s[..s.len() - 1], 1 << 30),
-        _ => bail!("unknown size suffix in {s:?}"),
+        _ => return Err(format!("unknown size suffix in {s:?}").into()),
     };
     Ok(num.trim().parse::<usize>()? * mul)
 }

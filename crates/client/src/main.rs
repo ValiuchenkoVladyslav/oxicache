@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use oxicache_client::{Client, Config, Tls};
 use rustls_pki_types::{CertificateDer, pem::PemObject};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Command line client for oxicache.
 #[derive(Parser)]
@@ -62,7 +63,9 @@ enum Cmd {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let tls = match &args.ca {
-        Some(p) => Tls::Pinned(CertificateDer::pem_file_iter(p)?.collect::<Result<Vec<_>, _>>()?),
+        Some(p) => Tls::Pinned(
+            CertificateDer::pem_file_iter(p)?.collect::<std::result::Result<Vec<_>, _>>()?,
+        ),
         None => Tls::Insecure,
     };
     let config = Config {
@@ -83,7 +86,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Set { kv } => {
             if kv.len() % 2 != 0 {
-                bail!("set expects key value pairs");
+                return Err("set expects key value pairs".into());
             }
             let client = Client::connect(args.addr, config).await?;
             let pairs: Vec<(&[u8], &[u8])> = kv

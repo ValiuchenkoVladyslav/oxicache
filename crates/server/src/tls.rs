@@ -4,9 +4,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use rustls::ServerConfig;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject};
+
+use crate::error::{Error, Result};
 
 pub const ALPN: &[u8] = b"h3";
 
@@ -25,11 +26,15 @@ impl Identity {
     }
 
     pub fn from_pem(cert: &Path, key: &Path) -> Result<Self> {
+        fn pem_err(path: &Path) -> impl FnOnce(rustls_pki_types::pem::Error) -> Error {
+            let path = path.to_owned();
+            move |source| Error::Pem { path, source }
+        }
         let certs = CertificateDer::pem_file_iter(cert)
-            .with_context(|| format!("reading {}", cert.display()))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let key = PrivateKeyDer::from_pem_file(key)
-            .with_context(|| format!("reading {}", key.display()))?;
+            .map_err(pem_err(cert))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(pem_err(cert))?;
+        let key = PrivateKeyDer::from_pem_file(key).map_err(pem_err(key))?;
         Ok(Self { certs, key })
     }
 

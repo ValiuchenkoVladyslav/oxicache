@@ -62,12 +62,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -649,7 +643,6 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "oxicache-client"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
  "clap",
  "h3",
@@ -670,7 +663,6 @@ dependencies = [
 name = "oxicache-server"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "bytes",
  "clap",
  "dashmap",
@@ -684,6 +676,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pki-types",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
