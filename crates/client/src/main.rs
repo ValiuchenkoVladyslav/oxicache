@@ -144,13 +144,18 @@ async fn bench(
     let ops = Arc::new(AtomicU64::new(0));
     let reqs = Arc::new(AtomicU64::new(0));
     let hits = Arc::new(AtomicU64::new(0));
-    let deadline = Instant::now() + Duration::from_secs(seconds);
     let value = vec![b'x'; value_size];
     let key = |i: usize| format!("bench:{i:08}");
 
+    let mut clients = Vec::with_capacity(conns);
+    for _ in 0..conns {
+        clients.push(Client::connect(addr, config.clone()).await?);
+    }
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(seconds);
+
     let mut tasks = Vec::new();
-    for c in 0..conns {
-        let client = Client::connect(addr, config.clone()).await?;
+    for (c, client) in clients.into_iter().enumerate() {
         for p in 0..pipeline {
             let (client, ops, reqs, hits, value) = (
                 client.clone(),
@@ -188,7 +193,6 @@ async fn bench(
             }));
         }
     }
-    let start = Instant::now();
     for t in tasks {
         t.await??;
     }
