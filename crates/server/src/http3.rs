@@ -96,6 +96,7 @@ async fn serve_connection(conn: quinn::Connection, cache: Arc<Cache>) {
                 });
             }
             Ok(None) => break,
+            Err(e) if e.is_h3_no_error() => break,
             Err(e) => {
                 warn!(%remote, error = %e, "connection error");
                 break;
