@@ -40,7 +40,9 @@ const U32: usize = 4;
 #[inline]
 fn need(buf: &Bytes, n: usize) -> Result<()> {
     if buf.remaining() < n {
-        Err(DecodeError::Truncated { needed: n - buf.remaining() })
+        Err(DecodeError::Truncated {
+            needed: n - buf.remaining(),
+        })
     } else {
         Ok(())
     }
@@ -66,7 +68,11 @@ fn put_blob(out: &mut BytesMut, b: &[u8]) {
 }
 
 fn finish(buf: Bytes) -> Result<()> {
-    if buf.is_empty() { Ok(()) } else { Err(DecodeError::Trailing(buf.len())) }
+    if buf.is_empty() {
+        Ok(())
+    } else {
+        Err(DecodeError::Trailing(buf.len()))
+    }
 }
 
 /// Exact encoded size of a list of keys.
@@ -107,7 +113,10 @@ where
     I::IntoIter: ExactSizeIterator + Clone,
 {
     let it = entries.into_iter();
-    let size = U32 + it.clone().map(|(k, v)| 2 * U32 + k.len() + v.len()).sum::<usize>();
+    let size = U32
+        + it.clone()
+            .map(|(k, v)| 2 * U32 + k.len() + v.len())
+            .sum::<usize>();
     let mut out = BytesMut::with_capacity(size);
     out.put_u32_le(it.len() as u32);
     for (k, v) in it {
@@ -137,7 +146,10 @@ where
     I::IntoIter: ExactSizeIterator + Clone,
 {
     let it = values.into_iter();
-    let size = U32 + it.clone().map(|v| 1 + v.map_or(0, |v| U32 + v.len())).sum::<usize>();
+    let size = U32
+        + it.clone()
+            .map(|v| 1 + v.map_or(0, |v| U32 + v.len()))
+            .sum::<usize>();
     let mut out = BytesMut::with_capacity(size);
     out.put_u32_le(it.len() as u32);
     for v in it {
@@ -210,7 +222,10 @@ mod tests {
     fn values_roundtrip() {
         let vals: [Option<&[u8]>; 3] = [Some(b"x"), None, Some(b"")];
         let dec = decode_values(encode_values(vals)).unwrap();
-        assert_eq!(dec, vec![Some(Bytes::from_static(b"x")), None, Some(Bytes::new())]);
+        assert_eq!(
+            dec,
+            vec![Some(Bytes::from_static(b"x")), None, Some(Bytes::new())]
+        );
     }
 
     #[test]
@@ -221,19 +236,36 @@ mod tests {
 
     #[test]
     fn empty_frames() {
-        assert!(decode_keys(encode_keys([] as [&[u8]; 0])).unwrap().is_empty());
-        assert!(decode_values(encode_values([] as [Option<&[u8]>; 0])).unwrap().is_empty());
+        assert!(
+            decode_keys(encode_keys([] as [&[u8]; 0]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            decode_values(encode_values([] as [Option<&[u8]>; 0]))
+                .unwrap()
+                .is_empty()
+        );
         assert!(decode_flags(encode_flags(&[])).unwrap().is_empty());
     }
 
     #[test]
     fn rejects_malformed() {
-        assert!(matches!(decode_keys(Bytes::from_static(&[1, 0])), Err(DecodeError::Truncated { .. })));
+        assert!(matches!(
+            decode_keys(Bytes::from_static(&[1, 0])),
+            Err(DecodeError::Truncated { .. })
+        ));
         assert!(matches!(
             decode_keys(Bytes::from_static(&[1, 0, 0, 0, 100, 0, 0, 0])),
             Err(DecodeError::Truncated { needed: 100 })
         ));
-        assert_eq!(decode_values(Bytes::from_static(&[1, 0, 0, 0, 7])), Err(DecodeError::InvalidTag(7)));
-        assert_eq!(decode_flags(Bytes::from_static(&[0, 0, 0, 0, 9])), Err(DecodeError::Trailing(1)));
+        assert_eq!(
+            decode_values(Bytes::from_static(&[1, 0, 0, 0, 7])),
+            Err(DecodeError::InvalidTag(7))
+        );
+        assert_eq!(
+            decode_flags(Bytes::from_static(&[0, 0, 0, 0, 9])),
+            Err(DecodeError::Trailing(1))
+        );
     }
 }
