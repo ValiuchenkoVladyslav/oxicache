@@ -1,0 +1,10 @@
+[package]
+name = "oxicache-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Binary wire format shared by the oxicache server and client"
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
