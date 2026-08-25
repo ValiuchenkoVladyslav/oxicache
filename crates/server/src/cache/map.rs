@@ -8,6 +8,20 @@ use bytes::Bytes;
 
 use super::s3fifo::Entry;
 
+#[cfg(not(feature = "papaya"))]
+impl Default for Map {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "papaya")]
+impl Default for Map {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 type Hasher = foldhash::fast::RandomState;
 
 #[cfg(not(feature = "papaya"))]
@@ -21,6 +35,11 @@ impl Map {
 
     pub fn new() -> Self {
         Self(dashmap::DashMap::with_hasher(Hasher::default()))
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     #[inline]
@@ -73,6 +92,11 @@ impl Map {
 
     pub fn new() -> Self {
         Self(papaya::HashMap::builder().hasher(Hasher::default()).build())
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     #[inline]
