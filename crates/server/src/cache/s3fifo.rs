@@ -40,6 +40,13 @@ pub struct Meta {
 #[derive(Clone)]
 pub struct Entry(ThinArc<Meta, u8>);
 
+impl AsRef<[u8]> for Entry {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self.value()
+    }
+}
+
 impl Entry {
     fn new(key: Key, value: &[u8], hash: u64) -> Self {
         let meta = Meta {
@@ -66,17 +73,19 @@ impl Entry {
         &self.0.slice
     }
 
-    /// Hint the CPU to fetch this entry's header and first data line.
+    /// Hint the CPU to fetch this entry's header and the first few data lines.
     #[inline]
     pub fn prefetch(&self) {
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
             let p = self.0.heap_ptr() as *const i8;
+            let lines = (self.0.slice.len() / 64).min(3) + 1;
             // SAFETY: prefetch is a pure hint; it never faults or dereferences.
             unsafe {
-                _mm_prefetch(p, _MM_HINT_T0);
-                _mm_prefetch(p.add(64), _MM_HINT_T0);
+                for i in 0..lines {
+                    _mm_prefetch(p.add(i * 64), _MM_HINT_T0);
+                }
             }
         }
     }

@@ -55,15 +55,15 @@ impl Cache {
         Some(e)
     }
 
-    /// Look up many keys with a single pin of the index, calling `f` with
-    /// each value (or `None`) in order. No refcounts are touched. Lookups run
-    /// in two passes so the cache misses of independent keys overlap: the
-    /// first resolves entries and prefetches them, the second reads them.
+    /// Look up many keys and hand the resolved entries (in key order) to `f`.
+    /// Lookups run in two passes so the cache misses of independent keys
+    /// overlap: the first resolves entries and prefetches them, the second
+    /// (inside `f`) reads them. The entries stay valid until `f` returns.
     #[inline]
-    pub fn get_many<'a, I, F>(&self, keys: I, mut f: F)
+    pub fn get_many<'a, I, F, R>(&self, keys: I, f: F) -> R
     where
         I: IntoIterator<Item = &'a [u8]>,
-        F: FnMut(Option<&[u8]>),
+        F: FnOnce(&[Option<map::EntryRef<'_>>]) -> R,
     {
         let reader = self.map.read();
         let mut found: smallvec::SmallVec<[Option<map::EntryRef<'_>>; 32]> =
@@ -72,18 +72,11 @@ impl Cache {
             let e = reader.get(k);
             if let Some(e) = &e {
                 e.prefetch();
+                e.touch();
             }
             found.push(e);
         }
-        for e in found {
-            match e {
-                Some(e) => {
-                    e.touch();
-                    f(Some(e.value()));
-                }
-                None => f(None),
-            }
-        }
+        f(&found)
     }
 
     #[inline]
@@ -138,9 +131,10 @@ mod tests {
     fn get_many_in_order() {
         let c = Cache::new(1 << 20, 1);
         c.set(b"k", b"v");
-        let mut seen = Vec::new();
-        c.get_many([&b"k"[..], &b"x"[..], &b"k"[..]], |v| {
-            seen.push(v.map(<[u8]>::to_vec))
+        let seen: Vec<Option<Vec<u8>>> = c.get_many([&b"k"[..], &b"x"[..], &b"k"[..]], |es| {
+            es.iter()
+                .map(|e| e.as_ref().map(|e| e.value().to_vec()))
+                .collect()
         });
         assert_eq!(seen, vec![Some(b"v".to_vec()), None, Some(b"v".to_vec())]);
     }

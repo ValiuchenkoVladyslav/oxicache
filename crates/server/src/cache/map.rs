@@ -14,9 +14,10 @@ type Hasher = foldhash::fast::RandomState;
 /// other lookups.
 #[cfg(feature = "papaya")]
 pub type EntryRef<'a> = &'a Entry;
-#[cfg(not(feature = "papaya"))]
-pub type EntryRef<'a> = Entry;
 
+#[cfg(not(feature = "papaya"))]
+/// Owned handle: dashmap guards must not be held across other lookups.
+pub type EntryRef<'a> = Entry;
 #[cfg(feature = "papaya")]
 type Table = papaya::HashMap<Key, Entry, Hasher>;
 
