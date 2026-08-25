@@ -119,3 +119,34 @@ profiles (server CPU/req, req/s):
 
 mimalloc re-measured here: −8 % CPU on the first two profiles and at 64 connections, but
 +17 % on the 4 KiB write-heavy profile and +30 % RSS on all of them; still opt-in.
+
+## Round 4: copies, allocator behaviour, client (2026-08-25)
+
+Server-side, from `perf` after the index work: `dispatch` (the lookups themselves, memory
+latency) plus `memmove` of values and glibc malloc.
+
+| change | result | decision |
+|---|---|---|
+| server: zero-copy request bodies (slices of the read buffer), vectored response writes | noise-level | kept (needed for the next row) |
+| server: `get` responses reference cache entries for values ≥ 1 KiB (`writev` reads them in place) | 1 KiB 50/50: 39 → 35 µs; 4 KiB writes: 129 → 122 µs | kept |
+| `mallopt` trim/mmap/top-pad tuning (glibc only) | client page faults 88k → 4.5k per 5 s run; server 35 → 34 µs | kept |
+| shared `FrameReader`/`FrameWriter` in `oxicache-wire`, used by the client too | client CPU/req: 10.2 → 7.8 µs (read-heavy), 13.8 → 12.2 (64 conns), 15.5 → 16 (1 KiB) | kept |
+| client: zero-copy response bodies shared across tasks | contended refcounts, no gain | copies each body out instead |
+| `FrameWriter` growing its buffer past 64 KiB | crossed glibc's mmap threshold: every flush faulted fresh pages | bounded at 64 KiB, spills to piece list |
+
+Measuring note: the bench client and server share the box, so a cheaper client shifts the
+loopback equilibrium (fewer requests per server read → more syscalls per request on the
+server). Compare server CPU/req only across runs with the same client, and prefer
+`perf stat` task-clock over shell `time` for client CPU.
+
+### Current numbers (server CPU/req, req/s)
+
+| profile | default | `--per-core` |
+|---|---|---|
+| 8×16, 128 B, 10 % writes | 7 µs, 451k | 7 µs, 474k |
+| 8×16, 1 KiB, 50 % writes | 38 µs, 131k | **27 µs**, 136k |
+| 12×32, 4 KiB, 90 % writes | 129 µs, 41k | 123 µs, 41k |
+| 64×2, 128 B, 10 % writes | 11 µs, 291k | 13 µs, 308k |
+
+From the HTTP/3 starting point (34 / 118 / 286 / 44 µs): **−80 % / −68…−77 % / −57 % / −75 %**
+server CPU per request.
