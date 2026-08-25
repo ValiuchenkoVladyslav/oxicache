@@ -164,6 +164,38 @@ where
     out.freeze()
 }
 
+/// Incremental encoder for a `/get` response, for callers that produce values
+/// one at a time and want a single output buffer.
+pub struct ValuesEncoder {
+    out: BytesMut,
+    count: u32,
+}
+
+impl ValuesEncoder {
+    pub fn with_capacity(count: usize, bytes_hint: usize) -> Self {
+        let mut out = BytesMut::with_capacity(U32 + count * (1 + U32) + bytes_hint);
+        out.put_u32_le(0);
+        Self { out, count: 0 }
+    }
+
+    #[inline]
+    pub fn push(&mut self, value: Option<&[u8]>) {
+        match value {
+            Some(v) => {
+                self.out.put_u8(1);
+                put_blob(&mut self.out, v);
+            }
+            None => self.out.put_u8(0),
+        }
+        self.count += 1;
+    }
+
+    pub fn finish(mut self) -> Bytes {
+        self.out[..U32].copy_from_slice(&self.count.to_le_bytes());
+        self.out.freeze()
+    }
+}
+
 /// Decode a `/get` response.
 pub fn decode_values(mut body: Bytes) -> Result<Vec<Option<Bytes>>> {
     let n = get_u32(&mut body)? as usize;
@@ -226,6 +258,16 @@ mod tests {
             dec,
             vec![Some(Bytes::from_static(b"x")), None, Some(Bytes::new())]
         );
+    }
+
+    #[test]
+    fn values_encoder_matches_encode_values() {
+        let vals: [Option<&[u8]>; 3] = [Some(b"x"), None, Some(b"")];
+        let mut enc = ValuesEncoder::with_capacity(3, 0);
+        for v in vals {
+            enc.push(v);
+        }
+        assert_eq!(enc.finish(), encode_values(vals));
     }
 
     #[test]

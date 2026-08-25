@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http::{Method, Request, Response, StatusCode};
 use oxicache_wire as wire;
 use rustls_pki_types::CertificateDer;
@@ -20,7 +20,7 @@ type H3Conn = h3::server::Connection<h3_quinn::Connection, Bytes>;
 type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
 pub struct Server {
-    endpoint: quinn::Endpoint,
+    endpoints: Vec<quinn::Endpoint>,
     cache: Arc<Cache>,
     cert: CertificateDer<'static>,
 }
@@ -28,23 +28,52 @@ pub struct Server {
 impl Server {
     /// Bind a QUIC endpoint on `addr` serving `cache` with the given identity.
     pub fn bind(addr: SocketAddr, identity: Identity, cache: Arc<Cache>) -> Result<Self> {
+        Self::bind_with(addr, identity, cache, 1)
+    }
+
+    /// Bind `endpoints` QUIC endpoints on `addr`, all sharing the port via
+    /// `SO_REUSEPORT` so the kernel spreads connections over independent
+    /// sockets and driver tasks. Connection migration across addresses is
+    /// not supported in that mode (a migrated flow may land on another socket).
+    pub fn bind_with(
+        addr: SocketAddr,
+        identity: Identity,
+        cache: Arc<Cache>,
+        endpoints: usize,
+    ) -> Result<Self> {
+        if endpoints == 0 {
+            return Err(Error::NoEndpoints);
+        }
         let cert = identity.certs.first().ok_or(Error::NoCertificate)?.clone();
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(identity.server_config()?)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_concurrent_bidi_streams(4096u32.into());
-        config.transport_config(Arc::new(transport));
-        let endpoint =
-            quinn::Endpoint::server(config, addr).map_err(|source| Error::Bind { addr, source })?;
+        config.transport_config(Arc::new(transport_config()));
+
+        let bind = |source| Error::Bind { addr, source };
+        let mut eps = Vec::with_capacity(endpoints);
+        let mut bound = addr;
+        for _ in 0..endpoints {
+            let socket = udp_socket(bound, endpoints > 1).map_err(bind)?;
+            let ep = quinn::Endpoint::new(
+                quinn::EndpointConfig::default(),
+                Some(config.clone()),
+                socket,
+                Arc::new(quinn::TokioRuntime),
+            )
+            .map_err(bind)?;
+            // Port 0 must resolve once so every endpoint shares the same port.
+            bound = ep.local_addr().map_err(bind)?;
+            eps.push(ep);
+        }
         Ok(Self {
-            endpoint,
+            endpoints: eps,
             cache,
             cert,
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
-        self.endpoint.local_addr().expect("bound endpoint")
+        self.endpoints[0].local_addr().expect("bound endpoint")
     }
 
     /// The leaf certificate clients may pin when it is self-signed.
@@ -52,24 +81,55 @@ impl Server {
         &self.cert
     }
 
-    /// Accept connections until the endpoint is closed via [`Server::close`].
+    /// Accept connections until the endpoints are closed via [`Server::close`].
     pub async fn run(&self) {
-        info!(addr = %self.local_addr(), "listening (h3)");
-        while let Some(incoming) = self.endpoint.accept().await {
-            let cache = self.cache.clone();
-            tokio::spawn(async move {
-                match incoming.await {
-                    Ok(conn) => serve_connection(conn, cache).await,
-                    Err(e) => debug!(error = %e, "handshake failed"),
+        info!(addr = %self.local_addr(), endpoints = self.endpoints.len(), "listening (h3)");
+        let accept = |ep: &quinn::Endpoint| {
+            let (ep, cache) = (ep.clone(), self.cache.clone());
+            async move {
+                while let Some(incoming) = ep.accept().await {
+                    let cache = cache.clone();
+                    tokio::spawn(async move {
+                        match incoming.await {
+                            Ok(conn) => serve_connection(conn, cache).await,
+                            Err(e) => debug!(error = %e, "handshake failed"),
+                        }
+                    });
                 }
-            });
+            }
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        for ep in &self.endpoints {
+            tasks.spawn(accept(ep));
         }
+        while tasks.join_next().await.is_some() {}
     }
 
     pub async fn close(&self) {
-        self.endpoint.close(0u32.into(), b"shutdown");
-        self.endpoint.wait_idle().await;
+        for ep in &self.endpoints {
+            ep.close(0u32.into(), b"shutdown");
+        }
+        for ep in &self.endpoints {
+            ep.wait_idle().await;
+        }
     }
+}
+
+fn transport_config() -> quinn::TransportConfig {
+    let mut t = quinn::TransportConfig::default();
+    t.max_concurrent_bidi_streams(4096u32.into());
+    t
+}
+
+fn udp_socket(addr: SocketAddr, reuse_port: bool) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    if reuse_port {
+        socket.set_reuse_port(true)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 async fn serve_connection(conn: quinn::Connection, cache: Arc<Cache>) {
@@ -112,11 +172,8 @@ async fn serve_request(req: Request<()>, mut stream: H3Stream, cache: &Cache) ->
         .and_then(|v| v.to_str().ok()?.parse::<usize>().ok())
         .unwrap_or(0)
         .min(MAX_PREALLOC);
-    let mut body = BytesMut::with_capacity(hint);
-    while let Some(chunk) = stream.recv_data().await? {
-        body.put(chunk);
-    }
-    let (status, out) = dispatch(req.method(), req.uri().path(), body.freeze(), cache);
+    let body = read_body(&mut stream, hint).await?;
+    let (status, out) = dispatch(req.method(), req.uri().path(), body, cache);
     stream
         .send_response(Response::builder().status(status).body(()).unwrap())
         .await?;
@@ -127,6 +184,25 @@ async fn serve_request(req: Request<()>, mut stream: H3Stream, cache: &Cache) ->
     Ok(())
 }
 
+/// Collect the request body. A single-chunk body is taken without copying:
+/// h3-quinn yields `Bytes`, whose `copy_to_bytes` is a refcount bump.
+async fn read_body(stream: &mut H3Stream, hint: usize) -> Result<Bytes> {
+    let Some(mut first) = stream.recv_data().await? else {
+        return Ok(Bytes::new());
+    };
+    let first = first.copy_to_bytes(first.remaining());
+    let Some(mut second) = stream.recv_data().await? else {
+        return Ok(first);
+    };
+    let mut body = BytesMut::with_capacity(hint.max(first.len() + second.remaining()));
+    body.extend_from_slice(&first);
+    body.put(&mut second);
+    while let Some(mut chunk) = stream.recv_data().await? {
+        body.put(&mut chunk);
+    }
+    Ok(body.freeze())
+}
+
 /// Route a request to the cache and produce the response status and body.
 pub fn dispatch(method: &Method, path: &str, body: Bytes, cache: &Cache) -> (StatusCode, Bytes) {
     if method != Method::POST {
@@ -134,18 +210,26 @@ pub fn dispatch(method: &Method, path: &str, body: Bytes, cache: &Cache) -> (Sta
     }
     let res = match path {
         wire::path::GET => wire::decode_keys(body).map(|keys| {
-            let values: Vec<Option<Bytes>> = keys.iter().map(|k| cache.get(k)).collect();
-            wire::encode_values(values.iter().map(Option::as_deref))
+            let mut out = wire::ValuesEncoder::with_capacity(keys.len(), keys.len() * 64);
+            for k in &keys {
+                out.push(cache.get(k).as_deref());
+            }
+            out.finish()
         }),
         wire::path::SET => wire::decode_entries(body).map(|entries| {
             for (k, v) in entries {
                 // Copy out of the request buffer so cached data never pins the whole
-                // body; key and value share one allocation.
-                let mut buf = BytesMut::with_capacity(k.len() + v.len());
-                buf.extend_from_slice(&k);
-                buf.extend_from_slice(&v);
-                let buf = buf.freeze();
-                cache.set(buf.slice(..k.len()), buf.slice(k.len()..));
+                // body. Key and value share one allocation when the map is known to
+                // drop the old key object on overwrite.
+                if crate::cache::Map::REPLACES_KEY {
+                    let mut buf = BytesMut::with_capacity(k.len() + v.len());
+                    buf.extend_from_slice(&k);
+                    buf.extend_from_slice(&v);
+                    let buf = buf.freeze();
+                    cache.set(buf.slice(..k.len()), buf.slice(k.len()..));
+                } else {
+                    cache.set(Bytes::copy_from_slice(&k), Bytes::copy_from_slice(&v));
+                }
             }
             Bytes::new()
         }),
