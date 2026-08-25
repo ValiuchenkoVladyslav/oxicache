@@ -18,6 +18,8 @@ pub enum Error {
         addr: std::net::SocketAddr,
         source: std::io::Error,
     },
+    #[error("endpoint count must be at least 1")]
+    NoEndpoints,
     #[error("identity has no certificate")]
     NoCertificate,
     #[error("h3 stream: {0}")]

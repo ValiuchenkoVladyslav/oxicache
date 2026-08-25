@@ -37,3 +37,11 @@ applied instead:
 
 A size-class slab store (memcached style) would be the next step if allocator time grows;
 mimalloc is already that design internally and did not help here.
+
+## Transport experiments (2026-08-25)
+
+| change | 8–12 conns | 64 conns × 2 in flight | decision |
+|---|---|---|---|
+| zero-copy single-chunk request body + streaming `get` encoder | noise-level; −27 % CPU/req on 4 KiB writes | — | kept |
+| one quinn endpoint per CPU via `SO_REUSEPORT` (`--endpoints`) | noise-level | +8 % req/s (106k → 114k) | kept, default = CPUs |
+| 8 MiB stream / 256 MiB connection windows, 4 MiB datagram buffer | −2…−5 % | — | rejected |

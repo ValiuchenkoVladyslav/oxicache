@@ -25,6 +25,9 @@ struct Args {
     /// Number of independent cache shards (default: available CPUs).
     #[arg(long)]
     shards: Option<usize>,
+    /// QUIC endpoints sharing the port via SO_REUSEPORT (default: available CPUs).
+    #[arg(long)]
+    endpoints: Option<usize>,
     /// PEM certificate chain; a self-signed cert is generated when omitted.
     #[arg(long, requires = "key")]
     cert: Option<PathBuf>,
@@ -65,7 +68,8 @@ async fn main() -> Result<()> {
             Identity::self_signed()?
         }
     };
-    let server = Server::bind(args.bind, identity, cache)?;
+    let endpoints = args.endpoints.unwrap_or(shards);
+    let server = Server::bind_with(args.bind, identity, cache, endpoints)?;
     info!(capacity = args.capacity, shards, "cache ready");
 
     tokio::select! {
