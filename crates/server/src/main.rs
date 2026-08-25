@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use oxicache_server::{Cache, Identity, Server};
+use oxicache_server::{Cache, Identity, Options, Server};
 use tracing::info;
 
 #[cfg(feature = "mimalloc")]
@@ -28,6 +28,9 @@ struct Args {
     /// QUIC endpoints sharing the port via SO_REUSEPORT (default: available CPUs).
     #[arg(long)]
     endpoints: Option<usize>,
+    /// Run each endpoint on its own single-threaded runtime (thread-per-core).
+    #[arg(long)]
+    per_core: bool,
     /// PEM certificate chain; a self-signed cert is generated when omitted.
     #[arg(long, requires = "key")]
     cert: Option<PathBuf>,
@@ -68,14 +71,26 @@ async fn main() -> Result<()> {
             Identity::self_signed()?
         }
     };
-    let endpoints = args.endpoints.unwrap_or(shards);
-    let server = Server::bind_with(args.bind, identity, cache, endpoints)?;
+    let opts = Options {
+        endpoints: args.endpoints.unwrap_or(shards),
+    };
+    let server = Server::bind_with(args.bind, identity, cache, opts)?;
     info!(capacity = args.capacity, shards, "cache ready");
 
-    tokio::select! {
-        _ = server.run() => {}
-        _ = tokio::signal::ctrl_c() => info!("shutting down"),
+    if args.per_core {
+        let server = Arc::new(server);
+        let s = server.clone();
+        let worker = std::thread::spawn(move || s.run_per_core());
+        tokio::signal::ctrl_c().await?;
+        info!("shutting down");
+        server.close().await;
+        let _ = worker.join();
+    } else {
+        tokio::select! {
+            _ = server.run() => {}
+            _ = tokio::signal::ctrl_c() => info!("shutting down"),
+        }
+        server.close().await;
     }
-    server.close().await;
     Ok(())
 }

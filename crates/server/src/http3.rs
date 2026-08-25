@@ -26,34 +26,31 @@ pub struct Server {
 }
 
 impl Server {
-    /// Bind a QUIC endpoint on `addr` serving `cache` with the given identity.
+    /// Bind a single QUIC endpoint on `addr` serving `cache` with the given identity.
     pub fn bind(addr: SocketAddr, identity: Identity, cache: Arc<Cache>) -> Result<Self> {
-        Self::bind_with(addr, identity, cache, 1)
+        Self::bind_with(addr, identity, cache, Options::default())
     }
 
-    /// Bind `endpoints` QUIC endpoints on `addr`, all sharing the port via
-    /// `SO_REUSEPORT` so the kernel spreads connections over independent
-    /// sockets and driver tasks. Connection migration across addresses is
-    /// not supported in that mode (a migrated flow may land on another socket).
+    /// Bind with explicit transport [`Options`].
     pub fn bind_with(
         addr: SocketAddr,
         identity: Identity,
         cache: Arc<Cache>,
-        endpoints: usize,
+        opts: Options,
     ) -> Result<Self> {
-        if endpoints == 0 {
+        if opts.endpoints == 0 {
             return Err(Error::NoEndpoints);
         }
         let cert = identity.certs.first().ok_or(Error::NoCertificate)?.clone();
         let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(identity.server_config()?)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
-        config.transport_config(Arc::new(transport_config()));
+        config.transport_config(Arc::new(transport_config(&opts)));
 
         let bind = |source| Error::Bind { addr, source };
-        let mut eps = Vec::with_capacity(endpoints);
+        let mut eps = Vec::with_capacity(opts.endpoints);
         let mut bound = addr;
-        for _ in 0..endpoints {
-            let socket = udp_socket(bound, endpoints > 1).map_err(bind)?;
+        for _ in 0..opts.endpoints {
+            let socket = udp_socket(bound, opts.endpoints > 1).map_err(bind)?;
             let ep = quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
                 Some(config.clone()),
@@ -84,25 +81,33 @@ impl Server {
     /// Accept connections until the endpoints are closed via [`Server::close`].
     pub async fn run(&self) {
         info!(addr = %self.local_addr(), endpoints = self.endpoints.len(), "listening (h3)");
-        let accept = |ep: &quinn::Endpoint| {
-            let (ep, cache) = (ep.clone(), self.cache.clone());
-            async move {
-                while let Some(incoming) = ep.accept().await {
-                    let cache = cache.clone();
-                    tokio::spawn(async move {
-                        match incoming.await {
-                            Ok(conn) => serve_connection(conn, cache).await,
-                            Err(e) => debug!(error = %e, "handshake failed"),
-                        }
-                    });
-                }
-            }
-        };
         let mut tasks = tokio::task::JoinSet::new();
         for ep in &self.endpoints {
-            tasks.spawn(accept(ep));
+            tasks.spawn(accept_loop(ep.clone(), self.cache.clone()));
         }
         while tasks.join_next().await.is_some() {}
+    }
+
+    /// Thread-per-core mode: every endpoint gets its own OS thread running a
+    /// single-threaded tokio runtime, so a connection never crosses threads.
+    /// Blocks the calling thread until all endpoints are closed.
+    pub fn run_per_core(&self) {
+        info!(addr = %self.local_addr(), endpoints = self.endpoints.len(), "listening (h3, thread-per-core)");
+        std::thread::scope(|scope| {
+            for (i, ep) in self.endpoints.iter().enumerate() {
+                let (ep, cache) = (ep.clone(), self.cache.clone());
+                std::thread::Builder::new()
+                    .name(format!("oxicache-{i}"))
+                    .spawn_scoped(scope, move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("runtime");
+                        rt.block_on(accept_loop(ep, cache));
+                    })
+                    .expect("spawn endpoint thread");
+            }
+        });
     }
 
     pub async fn close(&self) {
@@ -115,7 +120,22 @@ impl Server {
     }
 }
 
-fn transport_config() -> quinn::TransportConfig {
+/// Transport tuning for [`Server::bind_with`].
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// Number of QUIC endpoints sharing the port via `SO_REUSEPORT`, so the
+    /// kernel spreads connections over independent sockets and driver tasks.
+    /// Connection migration across addresses is not supported when > 1.
+    pub endpoints: usize,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self { endpoints: 1 }
+    }
+}
+
+fn transport_config(_opts: &Options) -> quinn::TransportConfig {
     let mut t = quinn::TransportConfig::default();
     t.max_concurrent_bidi_streams(4096u32.into());
     t
@@ -132,6 +152,22 @@ fn udp_socket(addr: SocketAddr, reuse_port: bool) -> std::io::Result<std::net::U
     Ok(socket.into())
 }
 
+async fn accept_loop(ep: quinn::Endpoint, cache: Arc<Cache>) {
+    while let Some(incoming) = ep.accept().await {
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            match incoming.await {
+                Ok(conn) => serve_connection(conn, cache).await,
+                Err(e) => debug!(error = %e, "handshake failed"),
+            }
+        });
+    }
+}
+
+/// Requests are handled inline on the connection task rather than spawned:
+/// every stream of a connection shares quinn's connection lock anyway, and
+/// keeping them on one task avoids task allocation, cross-thread wakeups and
+/// lock contention (measured −13…−32 % CPU per request, see docs/performance.md).
 async fn serve_connection(conn: quinn::Connection, cache: Arc<Cache>) {
     let remote = conn.remote_address();
     let mut h3: H3Conn = match h3::server::Connection::new(h3_quinn::Connection::new(conn)).await {
@@ -141,19 +177,7 @@ async fn serve_connection(conn: quinn::Connection, cache: Arc<Cache>) {
     debug!(%remote, "connection open");
     loop {
         match h3.accept().await {
-            Ok(Some(resolver)) => {
-                let cache = cache.clone();
-                tokio::spawn(async move {
-                    match resolver.resolve_request().await {
-                        Ok((req, stream)) => {
-                            if let Err(e) = serve_request(req, stream, &cache).await {
-                                debug!(error = %e, "request failed");
-                            }
-                        }
-                        Err(e) => debug!(error = %e, "bad request headers"),
-                    }
-                });
-            }
+            Ok(Some(resolver)) => handle(resolver, &cache).await,
             Ok(None) => break,
             Err(e) if e.is_h3_no_error() => break,
             Err(e) => {
@@ -163,6 +187,17 @@ async fn serve_connection(conn: quinn::Connection, cache: Arc<Cache>) {
         }
     }
     debug!(%remote, "connection closed");
+}
+
+async fn handle(resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>, cache: &Cache) {
+    match resolver.resolve_request().await {
+        Ok((req, stream)) => {
+            if let Err(e) = serve_request(req, stream, cache).await {
+                debug!(error = %e, "request failed");
+            }
+        }
+        Err(e) => debug!(error = %e, "bad request headers"),
+    }
 }
 
 async fn serve_request(req: Request<()>, mut stream: H3Stream, cache: &Cache) -> Result<()> {

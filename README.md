@@ -30,6 +30,9 @@ POST /del  body: keys     -> u32 count, count × u8 found
 ```sh
 cargo run --release -p oxicache-server -- --bind 0.0.0.0:4433 --capacity 1G
 # a self-signed cert is generated unless --cert/--key are given
+# --endpoints N   QUIC sockets sharing the port via SO_REUSEPORT (default: CPUs)
+# --per-core      one single-threaded runtime per endpoint (thread-per-core)
+# --shards N      independent S3-FIFO shards (default: CPUs)
 
 cargo run --release -p oxicache-client -- set a 1 b 2
 cargo run --release -p oxicache-client -- get a b c
@@ -48,4 +51,8 @@ The CLI accepts any certificate unless `--ca cert.pem` pins one.
   only by writes and eviction.
 - Entries are immutable; delete/overwrite marks them dead and they are skipped lazily at
   the queue head, with compaction once dead bytes exceed 25 % of the shard budget.
-- One tokio task per QUIC connection and per request stream.
+- One tokio task per QUIC connection; requests are handled inline on it (see
+  `docs/performance.md` for why that beats a task per request). `--endpoints` binds one
+  socket per CPU with `SO_REUSEPORT`; `--per-core` pins each to its own runtime.
+- Build-time options: `--features mimalloc` (allocator), `--features papaya` (map backend);
+  both measured and documented in `docs/`.

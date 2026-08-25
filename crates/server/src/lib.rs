@@ -5,5 +5,5 @@ pub mod tls;
 
 pub use cache::Cache;
 pub use error::{Error, Result};
-pub use http3::Server;
+pub use http3::{Options, Server};
 pub use tls::Identity;
