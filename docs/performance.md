@@ -72,3 +72,18 @@ The trade is head-of-line blocking inside one connection while a large body is r
 Where the remaining CPU goes (perf, read-heavy profile): ~30 % kernel UDP I/O, the rest is
 quinn packet processing, AES-GCM, memcpy and glibc malloc; the cache engine itself is ~7 %
 and is bound by three cache misses per lookup (hashbrown control bytes, bucket, entry).
+
+## Rejected after measurement (2026-08-25, final round)
+
+| change | result | decision |
+|---|---|---|
+| `-C target-cpu=native` build | 33/122/296 µs vs 34/118/286 µs — noise | rejected (ring already dispatches on CPU features) |
+| client: prebuilt `Uri`s, no `content-length` header | 135k vs 135k req/s, server 34 µs both | rejected |
+
+## Where it stands
+
+Per-request server CPU on the read-heavy 8×16 profile went from 40 µs to 34 µs over the
+optimisation loop (−15 %), and from 426 µs to 286 µs (−33 %) on the 4 KiB write-heavy profile.
+The remaining profile is transport-bound: kernel UDP I/O (~30 %), quinn packet
+processing, AES-GCM and h3 framing. Further gains would need changes below this project
+(quinn/h3 internals, io_uring UDP, or dropping HTTP/3 for raw QUIC streams).
