@@ -9,12 +9,12 @@
 //! and the queues are compacted when they accumulate.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 
-use bytes::Bytes;
 use parking_lot::Mutex;
+use triomphe::ThinArc;
 
+use super::key::Key;
 use super::map::Map;
 
 /// Maximum frequency value tracked per entry.
@@ -24,36 +24,78 @@ const ENTRY_OVERHEAD: usize = 96;
 /// Minimum number of ghost hashes retained regardless of main queue length.
 const GHOST_MIN: usize = 64;
 
-pub struct Entry {
-    key: Bytes,
-    value: Bytes,
+/// Per-entry metadata stored in front of the key and value bytes.
+pub struct Meta {
     hash: u64,
+    klen: u32,
     freq: AtomicU8,
     live: AtomicBool,
 }
 
+/// A cached item: refcount, metadata, key and value live in one allocation
+/// so a hit touches one or two adjacent cache lines.
+#[derive(Clone)]
+pub struct Entry(ThinArc<Meta, u8>);
+
 impl Entry {
-    #[cfg(test)]
-    pub(super) fn for_test(key: Bytes) -> Arc<Self> {
-        Arc::new(Self {
-            key,
-            value: Bytes::new(),
-            hash: 0,
+    fn new(key: &[u8], value: &[u8], hash: u64) -> Self {
+        let mut data = Vec::with_capacity(key.len() + value.len());
+        data.extend_from_slice(key);
+        data.extend_from_slice(value);
+        let meta = Meta {
+            hash,
+            klen: key.len() as u32,
             freq: AtomicU8::new(0),
             live: AtomicBool::new(true),
-        })
+        };
+        Self(ThinArc::from_header_and_slice(meta, &data))
+    }
+
+    #[inline]
+    fn meta(&self) -> &Meta {
+        &self.0.header.header
+    }
+
+    #[inline]
+    pub fn key(&self) -> &[u8] {
+        &self.0.slice[..self.meta().klen as usize]
+    }
+
+    #[inline]
+    pub fn value(&self) -> &[u8] {
+        &self.0.slice[self.meta().klen as usize..]
+    }
+
+    #[inline]
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.0.heap_ptr() == b.0.heap_ptr()
     }
 
     #[inline]
     fn cost(&self) -> usize {
-        self.key.len() + self.value.len() + ENTRY_OVERHEAD
+        self.0.slice.len() + ENTRY_OVERHEAD
+    }
+
+    #[inline]
+    fn hash(&self) -> u64 {
+        self.meta().hash
+    }
+
+    #[inline]
+    fn freq(&self) -> &AtomicU8 {
+        &self.meta().freq
+    }
+
+    #[inline]
+    fn live(&self) -> &AtomicBool {
+        &self.meta().live
     }
 
     #[inline]
     fn touch(&self) {
-        let f = self.freq.load(Relaxed);
+        let f = self.freq().load(Relaxed);
         if f < FREQ_CAP {
-            self.freq.store(f + 1, Relaxed);
+            self.freq().store(f + 1, Relaxed);
         }
     }
 }
@@ -80,8 +122,8 @@ impl Ghost {
 }
 
 struct Queues {
-    small: VecDeque<Arc<Entry>>,
-    main: VecDeque<Arc<Entry>>,
+    small: VecDeque<Entry>,
+    main: VecDeque<Entry>,
     ghost: Ghost,
     /// Bytes of live entries across both queues.
     used: usize,
@@ -120,21 +162,16 @@ impl Shard {
     }
 
     #[inline]
-    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+    pub fn get(&self, key: &[u8]) -> Option<Entry> {
         let e = self.map.get(key)?;
         e.touch();
-        Some(e.value.clone())
+        Some(e)
     }
 
-    pub fn set(&self, key: Bytes, value: Bytes, hash: u64) {
-        let entry = Arc::new(Entry {
-            key: key.clone(),
-            value,
-            hash,
-            freq: AtomicU8::new(0),
-            live: AtomicBool::new(true),
-        });
+    pub fn set(&self, key: &[u8], value: &[u8], hash: u64) {
+        let entry = Entry::new(key, value, hash);
         let cost = entry.cost();
+        let key = Key::new(key);
 
         let mut q = self.q.lock();
         while q.used + cost > self.capacity {
@@ -182,7 +219,7 @@ impl Shard {
 
     /// Mark an entry removed from the index as dead and release its budget.
     fn kill(&self, q: &mut Queues, e: &Entry) {
-        if e.live.swap(false, Relaxed) {
+        if e.live().swap(false, Relaxed) {
             let cost = e.cost();
             q.used -= cost;
             q.dead_bytes += cost;
@@ -195,17 +232,17 @@ impl Shard {
         };
         let cost = e.cost();
         q.small_bytes -= cost;
-        if !e.live.load(Relaxed) {
+        if !e.live().load(Relaxed) {
             q.dead_bytes -= cost;
-        } else if e.freq.load(Relaxed) > 1 {
-            e.freq.store(0, Relaxed);
+        } else if e.freq().load(Relaxed) > 1 {
+            e.freq().store(0, Relaxed);
             q.main.push_back(e);
         } else {
-            self.map.remove_if_same(&e.key, &e);
-            e.live.store(false, Relaxed);
+            self.map.remove_if_same(e.key(), &e);
+            e.live().store(false, Relaxed);
             q.used -= cost;
             let limit = q.main.len();
-            q.ghost.push(e.hash, limit);
+            q.ghost.push(e.hash(), limit);
         }
         true
     }
@@ -216,18 +253,18 @@ impl Shard {
                 return false;
             };
             let cost = e.cost();
-            if !e.live.load(Relaxed) {
+            if !e.live().load(Relaxed) {
                 q.dead_bytes -= cost;
                 return true;
             }
-            let f = e.freq.load(Relaxed);
+            let f = e.freq().load(Relaxed);
             if f > 0 {
-                e.freq.store(f - 1, Relaxed);
+                e.freq().store(f - 1, Relaxed);
                 q.main.push_back(e);
                 continue;
             }
-            self.map.remove_if_same(&e.key, &e);
-            e.live.store(false, Relaxed);
+            self.map.remove_if_same(e.key(), &e);
+            e.live().store(false, Relaxed);
             q.used -= cost;
             return true;
         }
@@ -238,8 +275,8 @@ impl Shard {
         if q.dead_bytes <= self.capacity / 4 {
             return;
         }
-        q.small.retain(|e| e.live.load(Relaxed));
-        q.main.retain(|e| e.live.load(Relaxed));
+        q.small.retain(|e| e.live().load(Relaxed));
+        q.main.retain(|e| e.live().load(Relaxed));
         q.small_bytes = q.small.iter().map(|e| e.cost()).sum();
         q.dead_bytes = 0;
     }
@@ -253,25 +290,29 @@ mod tests {
         Shard::new(cap)
     }
 
-    fn key(i: usize) -> Bytes {
-        Bytes::from(format!("key-{i:06}"))
+    fn key(i: usize) -> Vec<u8> {
+        format!("key-{i:06}").into_bytes()
     }
 
     fn set(s: &Shard, i: usize, vlen: usize) {
-        s.set(key(i), Bytes::from(vec![0u8; vlen]), i as u64);
+        s.set(&key(i), &vec![0u8; vlen], i as u64);
+    }
+
+    fn val(s: &Shard, k: &[u8]) -> Option<Vec<u8>> {
+        s.get(k).map(|e| e.value().to_vec())
     }
 
     #[test]
     fn get_set_del() {
         let s = shard(1 << 20);
-        assert_eq!(s.get(b"a"), None);
-        s.set(Bytes::from_static(b"a"), Bytes::from_static(b"1"), 1);
-        assert_eq!(s.get(b"a").as_deref(), Some(&b"1"[..]));
-        s.set(Bytes::from_static(b"a"), Bytes::from_static(b"2"), 1);
-        assert_eq!(s.get(b"a").as_deref(), Some(&b"2"[..]));
+        assert!(s.get(b"a").is_none());
+        s.set(b"a", b"1", 1);
+        assert_eq!(val(&s, b"a").as_deref(), Some(&b"1"[..]));
+        s.set(b"a", b"2", 1);
+        assert_eq!(val(&s, b"a").as_deref(), Some(&b"2"[..]));
         assert!(s.del(b"a"));
         assert!(!s.del(b"a"));
-        assert_eq!(s.get(b"a"), None);
+        assert!(s.get(b"a").is_none());
         assert_eq!(s.used_bytes(), 0);
     }
 
@@ -321,7 +362,7 @@ mod tests {
         assert!(s.get(&key(0)).is_none());
         set(&s, 0, 100);
         assert!(
-            s.q.lock().main.iter().any(|e| e.key == key(0)),
+            s.q.lock().main.iter().any(|e| e.key() == key(0)),
             "ghost hit should insert into main"
         );
     }
@@ -357,7 +398,7 @@ mod tests {
 
     #[test]
     fn concurrent_stress() {
-        let s = Arc::new(shard(200 * 1024));
+        let s = std::sync::Arc::new(shard(200 * 1024));
         let threads: Vec<_> = (0..8)
             .map(|t| {
                 let s = s.clone();
@@ -386,7 +427,7 @@ mod tests {
             .small
             .iter()
             .chain(q.main.iter())
-            .filter(|e| e.live.load(Relaxed))
+            .filter(|e| e.live().load(Relaxed))
             .map(|e| e.cost())
             .sum();
         assert_eq!(live, q.used, "accounting must match live entries");
@@ -395,7 +436,7 @@ mod tests {
             q.small
                 .iter()
                 .chain(q.main.iter())
-                .filter(|e| e.live.load(Relaxed))
+                .filter(|e| e.live().load(Relaxed))
                 .count()
         );
     }

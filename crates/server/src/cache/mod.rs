@@ -1,14 +1,14 @@
 //! Sharded S3-FIFO cache. Keys are hashed once; the top bits pick a shard and
 //! the full hash feeds that shard's ghost queue.
 
+mod key;
 mod map;
 mod s3fifo;
 
-pub use map::Map;
+pub use s3fifo::Entry;
 
 use std::hash::{BuildHasher, Hasher};
 
-use bytes::Bytes;
 use s3fifo::Shard;
 
 pub struct Cache {
@@ -43,14 +43,16 @@ impl Cache {
         (&self.shards[idx], hash)
     }
 
+    /// Look up a key. The returned entry keeps the value alive; read it with
+    /// [`Entry::value`].
     #[inline]
-    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+    pub fn get(&self, key: &[u8]) -> Option<Entry> {
         self.locate(key).0.get(key)
     }
 
     #[inline]
-    pub fn set(&self, key: Bytes, value: Bytes) {
-        let (shard, hash) = self.locate(&key);
+    pub fn set(&self, key: &[u8], value: &[u8]) {
+        let (shard, hash) = self.locate(key);
         shard.set(key, value, hash);
     }
 
@@ -81,14 +83,17 @@ mod tests {
         let c = Cache::new(64 << 20, 12);
         assert_eq!(c.shards.len(), 16);
         for i in 0..10_000u32 {
-            c.set(Bytes::from(i.to_string()), Bytes::from_static(b"v"));
+            c.set(i.to_string().as_bytes(), b"v");
         }
         assert_eq!(c.len(), 10_000);
         assert!(
             c.shards.iter().all(|s| s.len() > 300),
             "hash should distribute keys evenly"
         );
-        assert_eq!(c.get(b"42").as_deref(), Some(&b"v"[..]));
+        assert_eq!(
+            c.get(b"42").map(|e| e.value().to_vec()).as_deref(),
+            Some(&b"v"[..])
+        );
         assert!(c.del(b"42"));
         assert_eq!(c.len(), 9_999);
     }
@@ -96,7 +101,7 @@ mod tests {
     #[test]
     fn single_shard() {
         let c = Cache::new(1 << 20, 1);
-        c.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        c.set(b"k", b"v");
         assert!(c.get(b"k").is_some());
     }
 }

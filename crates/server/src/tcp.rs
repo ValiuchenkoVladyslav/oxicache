@@ -179,26 +179,17 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(
 pub fn dispatch(op: u8, body: Bytes, cache: &Cache) -> (Status, Bytes) {
     let res = match Op::from_u8(op) {
         Some(Op::Get) => wire::decode_keys(body).map(|keys| {
-            let mut out = wire::ValuesEncoder::with_capacity(keys.len(), keys.len() * 64);
+            let mut out = wire::ValuesEncoder::with_capacity(keys.len(), keys.len() * 256);
             for k in &keys {
-                out.push(cache.get(k).as_deref());
+                out.push(cache.get(k).as_ref().map(|e| e.value()));
             }
             out.finish()
         }),
         Some(Op::Set) => wire::decode_entries(body).map(|entries| {
             for (k, v) in entries {
-                // Copy out of the request buffer so cached data never pins the whole
-                // body. Key and value share one allocation when the map is known to
-                // drop the old key object on overwrite.
-                if crate::cache::Map::REPLACES_KEY {
-                    let mut buf = BytesMut::with_capacity(k.len() + v.len());
-                    buf.extend_from_slice(&k);
-                    buf.extend_from_slice(&v);
-                    let buf = buf.freeze();
-                    cache.set(buf.slice(..k.len()), buf.slice(k.len()..));
-                } else {
-                    cache.set(Bytes::copy_from_slice(&k), Bytes::copy_from_slice(&v));
-                }
+                // The cache copies key and value into its own allocation, so the
+                // request body is released as soon as this returns.
+                cache.set(&k, &v);
             }
             Bytes::new()
         }),
