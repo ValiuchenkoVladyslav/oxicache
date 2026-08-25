@@ -150,3 +150,25 @@ server). Compare server CPU/req only across runs with the same client, and prefe
 
 From the HTTP/3 starting point (34 / 118 / 286 / 44 µs): **−80 % / −68…−77 % / −57 % / −75 %**
 server CPU per request.
+
+## Round 5: memory-latency and buffer experiments (2026-08-25)
+
+Same method (min of 3 alternating runs, server utime+stime from `/proc`, client task-clock
+from `perf stat`). Kernel share of server CPU: 2.4 of 7.8 µs (8×16, 128 B), 14.4 of 38 µs
+(1 KiB 50/50; 11.6 of 32 with `--per-core`), 61 of 130 µs (4 KiB writes) — genuine loopback
+TCP work, not runtime wakeups.
+
+| change | result | decision |
+|---|---|---|
+| server: lookup-and-prefetch pass over all keys of a GET/SET before the real pass (no refcount touch in pass 1) | small 7.8 vs 7.8 µs, 1 KiB 37.7 vs 38.0 µs | rejected (noise) |
+| server: 256 KiB read buffer | 1 KiB 38 → 53 µs, 4 KiB 130 → 163 µs (user time too: a bigger `BytesMut` cannot be reused in place while zero-copy bodies are alive) | rejected |
+| server: 32 KiB read buffer | noise on all profiles | rejected |
+| server: `Key` inline 30 → 22 bytes so a bucket is 32 B and never straddles two lines | 1 KiB −0.3…−1.5 µs, small +0…+1 µs | rejected (noise) |
+| bench client: key space as one contiguous buffer with fixed stride | client CPU/req 7.8 → 6.7 µs (small), 12.2 → 11.4 (64 conns); +5…10 % req/s; server neutral | kept |
+
+`perf annotate` on `dispatch` (1 KiB profile) puts the samples on the refcount bump of a
+GET hit (24 %), bucket key-tag checks (28 %), the `live.swap` of the overwritten entry (17 %)
+and the shard mutex/queue state (13 %), i.e. memory latency; but prefetching those lines a
+pass earlier did not move the total, so the remaining user time is bounded by the
+DRAM-resident working set (100k × ~1.2 KiB ≫ L3) plus glibc's non-tcache path for
+chunks over 1032 bytes (`unlink_chunk` + `_int_malloc` ≈ 20 % of user time on 1 KiB values).
