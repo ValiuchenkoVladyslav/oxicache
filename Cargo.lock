@@ -319,6 +319,7 @@ dependencies = [
  "oxicache-wire",
  "papaya",
  "parking_lot",
+ "smallvec",
  "socket2",
  "thiserror",
  "tokio",

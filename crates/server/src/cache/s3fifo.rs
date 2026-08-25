@@ -1,8 +1,10 @@
-//! One S3-FIFO shard: a concurrent index plus FIFO queues guarded by a mutex.
+//! One S3-FIFO shard: the FIFO queues (small, main, ghost) for a slice of
+//! the key space, guarded by a mutex. The index itself is the cache-wide
+//! [`Map`]; this module only decides what stays in it.
 //!
-//! Reads never take the mutex: they hit the index, bump a relaxed atomic
-//! frequency counter (capped at 3) and clone the value handle. Writes take a
-//! short critical section to push onto the small/main queues and evict.
+//! Reads never take the mutex: they hit the index and bump a relaxed atomic
+//! frequency counter (capped at 3). Writes take a short critical section to
+//! push onto the small/main queues and evict.
 //!
 //! Entries are immutable once created; removing one marks it `dead` and it is
 //! skipped lazily when it reaches the head of its queue. Dead bytes are tracked
@@ -20,35 +22,33 @@ use super::map::Map;
 /// Maximum frequency value tracked per entry.
 const FREQ_CAP: u8 = 3;
 /// Approximate per-entry bookkeeping overhead in bytes (Arc, atomics, index slot).
-const ENTRY_OVERHEAD: usize = 96;
+const ENTRY_OVERHEAD: usize = 128;
 /// Minimum number of ghost hashes retained regardless of main queue length.
 const GHOST_MIN: usize = 64;
 
 /// Per-entry metadata stored in front of the key and value bytes.
 pub struct Meta {
+    key: Key,
     hash: u64,
-    klen: u32,
     freq: AtomicU8,
     live: AtomicBool,
 }
 
 /// A cached item: refcount, metadata, key and value live in one allocation
-/// so a hit touches one or two adjacent cache lines.
+/// (plus one more for keys longer than [`super::key::INLINE`]) so a hit
+/// touches one or two adjacent cache lines.
 #[derive(Clone)]
 pub struct Entry(ThinArc<Meta, u8>);
 
 impl Entry {
-    fn new(key: &[u8], value: &[u8], hash: u64) -> Self {
-        let mut data = Vec::with_capacity(key.len() + value.len());
-        data.extend_from_slice(key);
-        data.extend_from_slice(value);
+    fn new(key: Key, value: &[u8], hash: u64) -> Self {
         let meta = Meta {
+            key,
             hash,
-            klen: key.len() as u32,
             freq: AtomicU8::new(0),
             live: AtomicBool::new(true),
         };
-        Self(ThinArc::from_header_and_slice(meta, &data))
+        Self(ThinArc::from_header_and_slice(meta, value))
     }
 
     #[inline]
@@ -58,12 +58,27 @@ impl Entry {
 
     #[inline]
     pub fn key(&self) -> &[u8] {
-        &self.0.slice[..self.meta().klen as usize]
+        self.meta().key.as_slice()
     }
 
     #[inline]
     pub fn value(&self) -> &[u8] {
-        &self.0.slice[self.meta().klen as usize..]
+        &self.0.slice
+    }
+
+    /// Hint the CPU to fetch this entry's header and first data line.
+    #[inline]
+    pub fn prefetch(&self) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let p = self.0.heap_ptr() as *const i8;
+            // SAFETY: prefetch is a pure hint; it never faults or dereferences.
+            unsafe {
+                _mm_prefetch(p, _MM_HINT_T0);
+                _mm_prefetch(p.add(64), _MM_HINT_T0);
+            }
+        }
     }
 
     #[inline]
@@ -73,7 +88,7 @@ impl Entry {
 
     #[inline]
     fn cost(&self) -> usize {
-        self.0.slice.len() + ENTRY_OVERHEAD
+        self.key().len() + self.value().len() + ENTRY_OVERHEAD
     }
 
     #[inline]
@@ -92,7 +107,7 @@ impl Entry {
     }
 
     #[inline]
-    fn touch(&self) {
+    pub(super) fn touch(&self) {
         let f = self.freq().load(Relaxed);
         if f < FREQ_CAP {
             self.freq().store(f + 1, Relaxed);
@@ -134,7 +149,6 @@ struct Queues {
 }
 
 pub struct Shard {
-    map: Map,
     q: Mutex<Queues>,
     capacity: usize,
     small_capacity: usize,
@@ -144,7 +158,6 @@ impl Shard {
     /// `capacity` is the byte budget of live entries; the small queue gets 10%.
     pub fn new(capacity: usize) -> Self {
         Self {
-            map: Map::new(),
             q: Mutex::new(Queues {
                 small: VecDeque::new(),
                 main: VecDeque::new(),
@@ -161,32 +174,25 @@ impl Shard {
         }
     }
 
-    #[inline]
-    pub fn get(&self, key: &[u8]) -> Option<Entry> {
-        let e = self.map.get(key)?;
-        e.touch();
-        Some(e)
-    }
-
-    pub fn set(&self, key: &[u8], value: &[u8], hash: u64) {
-        let entry = Entry::new(key, value, hash);
-        let cost = entry.cost();
+    pub fn set(&self, map: &Map, key: &[u8], value: &[u8], hash: u64) {
         let key = Key::new(key);
+        let entry = Entry::new(key.clone(), value, hash);
+        let cost = entry.cost();
 
         let mut q = self.q.lock();
         while q.used + cost > self.capacity {
             // Not identical: eviction order differs, which is the whole point of S3-FIFO.
             #[allow(clippy::if_same_then_else)]
             let evicted = if q.small_bytes >= self.small_capacity {
-                self.evict_small(&mut q) || self.evict_main(&mut q)
+                self.evict_small(map, &mut q) || self.evict_main(map, &mut q)
             } else {
-                self.evict_main(&mut q) || self.evict_small(&mut q)
+                self.evict_main(map, &mut q) || self.evict_small(map, &mut q)
             };
             if !evicted {
                 break;
             }
         }
-        if let Some(old) = self.map.insert(key, entry.clone()) {
+        if let Some(old) = map.insert(key, entry.clone()) {
             self.kill(&mut q, &old);
         }
         q.used += cost;
@@ -199,18 +205,14 @@ impl Shard {
         self.maybe_compact(&mut q);
     }
 
-    pub fn del(&self, key: &[u8]) -> bool {
-        let Some(e) = self.map.remove(key) else {
+    pub fn del(&self, map: &Map, key: &[u8]) -> bool {
+        let Some(e) = map.remove(key) else {
             return false;
         };
         let mut q = self.q.lock();
         self.kill(&mut q, &e);
         self.maybe_compact(&mut q);
         true
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
     }
 
     pub fn used_bytes(&self) -> usize {
@@ -226,7 +228,7 @@ impl Shard {
         }
     }
 
-    fn evict_small(&self, q: &mut Queues) -> bool {
+    fn evict_small(&self, map: &Map, q: &mut Queues) -> bool {
         let Some(e) = q.small.pop_front() else {
             return false;
         };
@@ -238,7 +240,7 @@ impl Shard {
             e.freq().store(0, Relaxed);
             q.main.push_back(e);
         } else {
-            self.map.remove_if_same(e.key(), &e);
+            map.remove_if_same(e.key(), &e);
             e.live().store(false, Relaxed);
             q.used -= cost;
             let limit = q.main.len();
@@ -247,7 +249,7 @@ impl Shard {
         true
     }
 
-    fn evict_main(&self, q: &mut Queues) -> bool {
+    fn evict_main(&self, map: &Map, q: &mut Queues) -> bool {
         loop {
             let Some(e) = q.main.pop_front() else {
                 return false;
@@ -263,7 +265,7 @@ impl Shard {
                 q.main.push_back(e);
                 continue;
             }
-            self.map.remove_if_same(e.key(), &e);
+            map.remove_if_same(e.key(), &e);
             e.live().store(false, Relaxed);
             q.used -= cost;
             return true;
@@ -286,20 +288,39 @@ impl Shard {
 mod tests {
     use super::*;
 
-    fn shard(cap: usize) -> Shard {
-        Shard::new(cap)
+    struct T {
+        map: Map,
+        s: Shard,
+    }
+
+    impl T {
+        fn get(&self, k: &[u8]) -> Option<Vec<u8>> {
+            self.map.get(k).map(|e| e.value().to_vec())
+        }
+        fn set(&self, k: &[u8], v: &[u8], hash: u64) {
+            self.s.set(&self.map, k, v, hash)
+        }
+        fn del(&self, k: &[u8]) -> bool {
+            self.s.del(&self.map, k)
+        }
+        fn len(&self) -> usize {
+            self.map.len()
+        }
+    }
+
+    fn shard(cap: usize) -> T {
+        T {
+            map: Map::new(),
+            s: Shard::new(cap),
+        }
     }
 
     fn key(i: usize) -> Vec<u8> {
         format!("key-{i:06}").into_bytes()
     }
 
-    fn set(s: &Shard, i: usize, vlen: usize) {
-        s.set(&key(i), &vec![0u8; vlen], i as u64);
-    }
-
-    fn val(s: &Shard, k: &[u8]) -> Option<Vec<u8>> {
-        s.get(k).map(|e| e.value().to_vec())
+    fn set(t: &T, i: usize, vlen: usize) {
+        t.set(&key(i), &vec![0u8; vlen], i as u64);
     }
 
     #[test]
@@ -307,13 +328,13 @@ mod tests {
         let s = shard(1 << 20);
         assert!(s.get(b"a").is_none());
         s.set(b"a", b"1", 1);
-        assert_eq!(val(&s, b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(s.get(b"a").as_deref(), Some(&b"1"[..]));
         s.set(b"a", b"2", 1);
-        assert_eq!(val(&s, b"a").as_deref(), Some(&b"2"[..]));
+        assert_eq!(s.get(b"a").as_deref(), Some(&b"2"[..]));
         assert!(s.del(b"a"));
         assert!(!s.del(b"a"));
         assert!(s.get(b"a").is_none());
-        assert_eq!(s.used_bytes(), 0);
+        assert_eq!(s.s.used_bytes(), 0);
     }
 
     #[test]
@@ -323,7 +344,7 @@ mod tests {
         for i in 0..1000 {
             set(&s, i, 100);
         }
-        assert!(s.used_bytes() <= cap);
+        assert!(s.s.used_bytes() <= cap);
         assert!(s.len() <= 100 && s.len() >= 90);
         assert!(s.get(&key(999)).is_some());
         assert!(s.get(&key(0)).is_none());
@@ -338,7 +359,7 @@ mod tests {
         }
         for _ in 0..3 {
             for i in 0..10 {
-                s.get(&key(i));
+                s.map.get(&key(i)).unwrap().touch();
             }
         }
         for i in 10..2000 {
@@ -362,7 +383,7 @@ mod tests {
         assert!(s.get(&key(0)).is_none());
         set(&s, 0, 100);
         assert!(
-            s.q.lock().main.iter().any(|e| e.key() == key(0)),
+            s.s.q.lock().main.iter().any(|e| e.key() == key(0)),
             "ghost hit should insert into main"
         );
     }
@@ -377,8 +398,8 @@ mod tests {
         for i in 0..100 {
             assert!(s.del(&key(i)));
         }
-        assert_eq!(s.used_bytes(), 0);
-        let q = s.q.lock();
+        assert_eq!(s.s.used_bytes(), 0);
+        let q = s.s.q.lock();
         assert!(
             q.dead_bytes <= cap / 4,
             "compaction should bound dead bytes"
@@ -421,8 +442,8 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        assert!(s.used_bytes() <= 200 * 1024);
-        let q = s.q.lock();
+        assert!(s.s.used_bytes() <= 200 * 1024);
+        let q = s.s.q.lock();
         let live: usize = q
             .small
             .iter()
@@ -432,7 +453,7 @@ mod tests {
             .sum();
         assert_eq!(live, q.used, "accounting must match live entries");
         assert_eq!(
-            s.map.len(),
+            s.len(),
             q.small
                 .iter()
                 .chain(q.main.iter())

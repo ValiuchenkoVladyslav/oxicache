@@ -60,3 +60,23 @@ dashmap on read-heavy loads; with `Bytes` keys, a `Bytes` clone per hit and the 
 small share of per-request cost, the difference reverses slightly here. papaya remains
 available via `--features papaya` (keys are then allocated separately from values because
 papaya documents that `insert` keeps the existing key object).
+
+## Round 3, after the TCP switch (2026-08-25)
+
+With transport cost gone the index dominates. Changes measured (server CPU/req, min of 3):
+
+| build | 8×16, 128 B, 10 % w | 8×16, 1 KiB, 50 % w |
+|---|---|---|
+| dashmap, `Bytes` keys + `Arc<Entry{key,value: Bytes}>` | 11.0 µs | 62 µs |
+| + inline `Key` in bucket, key‖value in one `Box<[u8]>` | 9–10 µs | 40 µs |
+| + `triomphe::ThinArc` (refcount + meta + value in one allocation) | 8.2 µs | 37 µs |
+| papaya, one pin per batch, no refcount on hits | 9.0 µs | 45 µs |
+| papaya + two-pass prefetch | 7.7 µs | 44 µs |
+| **dashmap + two-pass prefetch** (default) | **7.2 µs** | **38 µs** |
+| dashmap + prefetch + mimalloc | 6.6 µs | 35 µs (but +17 % on 4 KiB writes, +30 % RSS) |
+
+Why: a lookup is a chain of dependent cache misses (control bytes → bucket → entry → value);
+`lock`-prefixed atomics are full barriers on x86, so with a refcount bump per hit the misses
+of consecutive keys cannot overlap. The two-pass `get_many` resolves all keys first and
+prefetches their entries, then reads them. Papaya removes the atomics but boxes every table
+entry, which costs ~20 % on inserts; dashmap keeps entries inline in the bucket.

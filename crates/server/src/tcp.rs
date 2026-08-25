@@ -180,9 +180,7 @@ pub fn dispatch(op: u8, body: Bytes, cache: &Cache) -> (Status, Bytes) {
     let res = match Op::from_u8(op) {
         Some(Op::Get) => wire::decode_keys(body).map(|keys| {
             let mut out = wire::ValuesEncoder::with_capacity(keys.len(), keys.len() * 256);
-            for k in &keys {
-                out.push(cache.get(k).as_ref().map(|e| e.value()));
-            }
+            cache.get_many(keys.iter().map(|k| &k[..]), |v| out.push(v));
             out.finish()
         }),
         Some(Op::Set) => wire::decode_entries(body).map(|entries| {

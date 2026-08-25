@@ -44,11 +44,13 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
 
 ## Design
 
-- Keys hash once (foldhash); top bits pick one of N shards (default: CPU count), each an
-  independent S3-FIFO with `capacity / N` bytes.
-- Per shard: a concurrent map for lookups (reads never take a lock; they bump a relaxed
-  atomic frequency counter capped at 3) plus a mutex over the small/main/ghost queues used
-  only by writes and eviction.
+- One concurrent index (dashmap; `--features papaya` for a lock-free alternative) holds
+  every key: short keys inline in the bucket, each value a single `ThinArc` allocation
+  carrying refcount, metadata and bytes. Batch gets resolve all keys first and prefetch
+  their entries so the cache misses of independent keys overlap.
+- Keys hash once (foldhash); top bits pick one of N S3-FIFO shards (default: CPU count),
+  each a mutex over its small/main/ghost queues, used only by writes and eviction. Reads
+  never lock; they bump a relaxed atomic frequency counter capped at 3.
 - Entries are immutable; delete/overwrite marks them dead and they are skipped lazily at
   the queue head, with compaction once dead bytes exceed 25 % of the shard budget.
 - One tokio task per TCP connection; requests are handled inline and answered in order,

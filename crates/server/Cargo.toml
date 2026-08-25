@@ -16,10 +16,11 @@ tracing-subscriber.workspace = true
 foldhash.workspace = true
 parking_lot.workspace = true
 dashmap = "6.2"
+papaya = { version = "0.2", optional = true }
 socket2 = "0.6"
 triomphe = "0.1"
+smallvec = "1"
 mimalloc = { version = "0.1", optional = true }
-papaya = { version = "0.2", optional = true }
 
 [features]
 default = []

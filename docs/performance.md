@@ -104,3 +104,18 @@ The entire HTTP/3 stack (QUIC packetisation, AES-GCM, ACK handling, h3/qpack fra
 answered in order and the response buffer is flushed only when the reader has no more
 buffered input, so a burst of pipelined requests costs one `write` syscall. `--per-core`
 is now a clear win on write-heavy pipelined loads (−20 % CPU) and neutral elsewhere.
+
+## Index and allocation work after the TCP switch (2026-08-25)
+
+See docs/hashmap-bench.md, round 3, for the per-step numbers. Net effect on the four
+profiles (server CPU/req, req/s):
+
+| profile | after TCP switch | now (dashmap + ThinArc + prefetch) |
+|---|---|---|
+| 8×16, 128 B, 10 % writes | 11 µs, 329k | **7 µs, 421k** |
+| 8×16, 1 KiB, 50 % writes | 62 µs, 76k | **39 µs, 126k** |
+| 12×32, 4 KiB, 90 % writes | 152 µs, 33k | **133 µs, 40k** |
+| 64×2, 128 B, 10 % writes | 15 µs, 242k | **10 µs, 280k** |
+
+mimalloc re-measured here: −8 % CPU on the first two profiles and at 64 connections, but
++17 % on the 4 KiB write-heavy profile and +30 % RSS on all of them; still opt-in.
