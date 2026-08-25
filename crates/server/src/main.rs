@@ -46,6 +46,7 @@ fn parse_size(s: &str) -> Result<usize> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    oxicache_wire::io::tune_allocator();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),

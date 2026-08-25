@@ -21,6 +21,8 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+pub mod io;
+
 /// Size of a request or response frame header.
 pub const HEADER_LEN: usize = 5;
 

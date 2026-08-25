@@ -333,7 +333,9 @@ name = "oxicache-wire"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

@@ -5,9 +5,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
-use oxicache_wire::{self as wire, HEADER_LEN, Op, Status};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use bytes::Bytes;
+use oxicache_wire::io::{BUF, FrameReader, FrameWriter};
+use oxicache_wire::{self as wire, Op, Status};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
@@ -27,7 +28,8 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-const BUF: usize = 64 << 10;
+/// Largest response body accepted from the server.
+const MAX_FRAME: usize = 64 << 20;
 
 type Reply = oneshot::Sender<Result<Bytes>>;
 
@@ -57,8 +59,8 @@ impl Client {
         let (r, w) = stream.into_split();
         let (tx, rx) = mpsc::channel::<(Op, Bytes, Reply)>(1024);
         let (pending_tx, pending_rx) = mpsc::unbounded_channel::<Reply>();
-        let writer = tokio::spawn(write_loop(BufWriter::with_capacity(BUF, w), rx, pending_tx));
-        let reader = tokio::spawn(read_loop(BufReader::with_capacity(BUF, r), pending_rx));
+        let writer = tokio::spawn(write_loop(w, rx, pending_tx));
+        let reader = tokio::spawn(read_loop(r, pending_rx));
         Ok(Self {
             tx,
             _conn: Arc::new(Connection { writer, reader }),
@@ -108,60 +110,63 @@ impl Client {
 }
 
 /// Writes queued requests, coalescing everything already queued into one flush.
-async fn write_loop<W: AsyncWriteExt + Unpin>(
+async fn write_loop<W: AsyncWrite + Unpin>(
     mut w: W,
     mut rx: mpsc::Receiver<(Op, Bytes, Reply)>,
     pending: mpsc::UnboundedSender<Reply>,
 ) {
+    // Request bodies were just encoded and are hot; copy them into the
+    // coalescing buffer unless they are huge.
+    let mut out = FrameWriter::with_inline_limit(BUF);
     while let Some(mut msg) = rx.recv().await {
         loop {
             let (op, body, reply) = msg;
             if pending.send(reply).is_err() {
                 return;
             }
-            let ok = w
-                .write_all(&wire::encode_header(op as u8, body.len()))
-                .await
-                .is_ok()
-                && (body.is_empty() || w.write_all(&body).await.is_ok());
-            if !ok {
-                return;
-            }
+            out.frame(op as u8, body);
             match rx.try_recv() {
                 Ok(next) => msg = next,
                 Err(_) => break,
             }
         }
-        if w.flush().await.is_err() {
+        if out.flush(&mut w).await.is_err() {
             return;
         }
     }
 }
 
 /// Reads responses and hands each to the oldest pending caller.
-async fn read_loop<R: AsyncReadExt + Unpin>(mut r: R, mut pending: mpsc::UnboundedReceiver<Reply>) {
-    let mut hdr = [0u8; HEADER_LEN];
-    while let Some(reply) = pending.recv().await {
-        let res = async {
-            r.read_exact(&mut hdr).await?;
-            let (status, len) = wire::decode_header(&hdr);
-            let mut body = BytesMut::zeroed(len);
-            r.read_exact(&mut body).await?;
-            let body = body.freeze();
-            match Status::from_u8(status) {
-                Some(Status::Ok) => Ok(body),
-                Some(status) => Err(Error::Status {
-                    status,
-                    message: String::from_utf8_lossy(&body).into_owned(),
-                }),
-                None => Err(Error::InvalidStatus(status)),
+async fn read_loop<R: AsyncRead + Unpin>(mut r: R, mut pending: mpsc::UnboundedReceiver<Reply>) {
+    let mut reader = FrameReader::new(MAX_FRAME);
+    loop {
+        loop {
+            match reader.next_buffered_owned() {
+                Ok(Some((status, body))) => {
+                    let Some(reply) = pending.recv().await else {
+                        return;
+                    };
+                    let res = match Status::from_u8(status) {
+                        Some(Status::Ok) => Ok(body),
+                        Some(status) => Err(Error::Status {
+                            status,
+                            message: String::from_utf8_lossy(&body).into_owned(),
+                        }),
+                        None => Err(Error::InvalidStatus(status)),
+                    };
+                    let fatal = matches!(res, Err(Error::InvalidStatus(_)));
+                    let _ = reply.send(res);
+                    if fatal {
+                        return; // dropping `pending` fails every queued caller with Closed
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return,
             }
         }
-        .await;
-        let fatal = matches!(res, Err(Error::Io(_) | Error::InvalidStatus(_)));
-        let _ = reply.send(res);
-        if fatal {
-            return; // dropping `pending` fails every queued caller with Closed
+        match reader.fill(&mut r).await {
+            Ok(true) => {}
+            _ => return,
         }
     }
 }

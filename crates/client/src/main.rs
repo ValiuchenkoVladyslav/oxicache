@@ -54,6 +54,7 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    oxicache_wire::io::tune_allocator();
     let args = Args::parse();
     match args.cmd {
         Cmd::Get { keys } => {
@@ -125,7 +126,11 @@ async fn bench(
     let reqs = Arc::new(AtomicU64::new(0));
     let hits = Arc::new(AtomicU64::new(0));
     let value = vec![b'x'; value_size];
-    let key = |i: usize| format!("bench:{i:08}");
+    let keys: Arc<Vec<Vec<u8>>> = Arc::new(
+        (0..keyspace)
+            .map(|i| format!("bench:{i:08}").into_bytes())
+            .collect(),
+    );
 
     let mut clients = Vec::with_capacity(conns);
     for _ in 0..conns {
@@ -137,12 +142,13 @@ async fn bench(
     let mut tasks = Vec::new();
     for (c, client) in clients.into_iter().enumerate() {
         for p in 0..pipeline {
-            let (client, ops, reqs, hits, value) = (
+            let (client, ops, reqs, hits, value, keys) = (
                 client.clone(),
                 ops.clone(),
                 reqs.clone(),
                 hits.clone(),
                 value.clone(),
+                keys.clone(),
             );
             tasks.push(tokio::spawn(async move {
                 let mut rng = (c * 1_000_003 + p * 7919 + 1) as u64;
@@ -153,17 +159,15 @@ async fn bench(
                     rng
                 };
                 while Instant::now() < deadline {
-                    let ks: Vec<String> = (0..batch)
-                        .map(|_| key(next() as usize % keyspace))
+                    let ks: Vec<&[u8]> = (0..batch)
+                        .map(|_| keys[next() as usize % keyspace].as_slice())
                         .collect();
                     if (next() % 10_000) as f64 / 10_000.0 < write_ratio {
-                        let pairs: Vec<(&[u8], &[u8])> = ks
-                            .iter()
-                            .map(|k| (k.as_bytes(), value.as_slice()))
-                            .collect();
+                        let pairs: Vec<(&[u8], &[u8])> =
+                            ks.iter().map(|k| (*k, value.as_slice())).collect();
                         client.set(pairs.iter().copied()).await?;
                     } else {
-                        let r = client.get(ks.iter().map(String::as_bytes)).await?;
+                        let r = client.get(ks.iter().copied()).await?;
                         hits.fetch_add(r.iter().flatten().count() as u64, Relaxed);
                     }
                     ops.fetch_add(batch as u64, Relaxed);
