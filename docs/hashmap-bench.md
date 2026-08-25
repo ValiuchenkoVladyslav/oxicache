@@ -44,3 +44,19 @@ papaya ~138 MB · flurry ~230 MB · dashmap ~286 MB · sharded RwLock ~286 MB ·
 2. `get_mut` takes the write lock — not used; metadata is atomic.
 3. Eviction walks our own FIFO queues, never `iter()`.
 4. Use a randomly seeded hasher (`foldhash::fast::RandomState`) for HashDoS resistance.
+
+## In-situ check: papaya 0.2.5 behind a feature flag (2026-08-25)
+
+Same server, same `oxicache-cli bench` profiles, best of 2, quiet machine:
+
+| profile | dashmap | papaya |
+|---|---|---|
+| 10 % writes, 128 B, batch 16 | 128k req/s, 39 µs CPU/req | 124k req/s, 42 µs CPU/req |
+| 50 % writes, 1 KiB, batch 16 | 40k req/s, 128 µs CPU/req | 37k req/s, 139 µs CPU/req |
+| 90 % writes, 4 KiB, batch 8, 12×32 in flight | 16.1k req/s, 345 µs CPU/req | 14.1k req/s, 392 µs CPU/req |
+
+The upstream papaya benchmarks (integer keys, no value clone-out, ahash) show papaya ahead of
+dashmap on read-heavy loads; with `Bytes` keys, a `Bytes` clone per hit and the map being a
+small share of per-request cost, the difference reverses slightly here. papaya remains
+available via `--features papaya` (keys are then allocated separately from values because
+papaya documents that `insert` keeps the existing key object).

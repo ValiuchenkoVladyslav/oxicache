@@ -23,8 +23,11 @@ tracing-subscriber.workspace = true
 foldhash.workspace = true
 parking_lot.workspace = true
 dashmap = "6.2"
+socket2 = "0.6"
 mimalloc = { version = "0.1", optional = true }
+papaya = { version = "0.2", optional = true }
 
 [features]
 default = []
 mimalloc = ["dep:mimalloc"]
+papaya = ["dep:papaya"]

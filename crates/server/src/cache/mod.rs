@@ -4,6 +4,8 @@
 mod map;
 mod s3fifo;
 
+pub use map::Map;
+
 use std::hash::{BuildHasher, Hasher};
 
 use bytes::Bytes;
