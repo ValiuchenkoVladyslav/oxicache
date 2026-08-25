@@ -3,7 +3,7 @@ name = "oxicache-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "HTTP/3 client for oxicache"
+description = "TCP client for oxicache"
 
 [[bin]]
 name = "oxicache-cli"
@@ -13,12 +13,6 @@ path = "src/main.rs"
 oxicache-wire.workspace = true
 bytes.workspace = true
 tokio.workspace = true
-h3.workspace = true
-h3-quinn.workspace = true
-quinn.workspace = true
-rustls.workspace = true
-rustls-pki-types.workspace = true
-http.workspace = true
 thiserror.workspace = true
 clap.workspace = true
 tracing.workspace = true

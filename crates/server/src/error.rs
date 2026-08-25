@@ -1,29 +1,16 @@
-use std::path::PathBuf;
+use std::net::SocketAddr;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("reading {path}: {source}")]
-    Pem {
-        path: PathBuf,
-        source: rustls_pki_types::pem::Error,
-    },
-    #[error("generating self-signed certificate: {0}")]
-    Rcgen(#[from] rcgen::Error),
-    #[error("tls: {0}")]
-    Tls(#[from] rustls::Error),
-    #[error("tls config not usable for quic: {0}")]
-    Quic(#[from] quinn::crypto::rustls::NoInitialCipherSuite),
     #[error("binding {addr}: {source}")]
     Bind {
-        addr: std::net::SocketAddr,
+        addr: SocketAddr,
         source: std::io::Error,
     },
     #[error("endpoint count must be at least 1")]
     NoEndpoints,
-    #[error("identity has no certificate")]
-    NoCertificate,
-    #[error("h3 stream: {0}")]
-    Stream(#[from] h3::error::StreamError),
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

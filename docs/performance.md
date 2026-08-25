@@ -87,3 +87,20 @@ optimisation loop (−15 %), and from 426 µs to 286 µs (−33 %) on the 4 KiB 
 The remaining profile is transport-bound: kernel UDP I/O (~30 %), quinn packet
 processing, AES-GCM and h3 framing. Further gains would need changes below this project
 (quinn/h3 internals, io_uring UDP, or dropping HTTP/3 for raw QUIC streams).
+
+## Transport switch: HTTP/3 → framed TCP (2026-08-25)
+
+Same profiles, same box, same client bench; server CPU per request and req/s:
+
+| profile | HTTP/3 (quinn + h3) | TCP frames | TCP `--per-core` |
+|---|---|---|---|
+| 8×16, 128 B, 10 % writes | 34 µs, 137k req/s | **11 µs**, 329k req/s | 11 µs, 319k req/s |
+| 8×16, 1 KiB, 50 % writes | 118 µs, 43k req/s | 62 µs, 76k req/s | **49 µs**, 81k req/s |
+| 12×32, 4 KiB, 90 % writes | 286 µs, 19k req/s | 152 µs, 33k req/s | **130 µs**, 35k req/s |
+| 64×2, 128 B, 10 % writes | 44 µs, 115k req/s | **15 µs**, 242k req/s | 17 µs, 247k req/s |
+
+The entire HTTP/3 stack (QUIC packetisation, AES-GCM, ACK handling, h3/qpack framing) was
+~70 % of server CPU; plain TCP with a 5-byte frame header removes it. Pipelined requests are
+answered in order and the response buffer is flushed only when the reader has no more
+buffered input, so a burst of pipelined requests costs one `write` syscall. `--per-core`
+is now a clear win on write-heavy pipelined loads (−20 % CPU) and neutral elsewhere.

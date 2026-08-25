@@ -13,14 +13,7 @@ oxicache-server = { path = "crates/server" }
 oxicache-client = { path = "crates/client" }
 
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal"] }
-h3 = "0.0.8"
-h3-quinn = "0.0.10"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pki-types = "1"
-rcgen = "0.14"
-http = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

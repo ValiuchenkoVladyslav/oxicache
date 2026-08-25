@@ -1,146 +1,77 @@
-//! HTTP/3 client for oxicache. One [`Client`] owns one QUIC connection and is
-//! cheap to clone; every call opens a fresh request stream, so clones may be
-//! used concurrently from many tasks.
+//! TCP client for oxicache. One [`Client`] owns one connection and is cheap
+//! to clone; calls from any number of tasks are pipelined onto it and matched
+//! to responses in order.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::{BufMut, Bytes, BytesMut};
-use http::{Method, Request, StatusCode, Uri};
-use oxicache_wire as wire;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
+use bytes::{Bytes, BytesMut};
+use oxicache_wire::{self as wire, HEADER_LEN, Op, Status};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("connect: {0}")]
-    Connect(#[from] quinn::ConnectError),
-    #[error("connection: {0}")]
-    Connection(#[from] quinn::ConnectionError),
-    #[error("h3: {0}")]
-    H3Connection(#[from] h3::error::ConnectionError),
-    #[error("h3 stream: {0}")]
-    H3Stream(#[from] h3::error::StreamError),
-    #[error("tls: {0}")]
-    Tls(#[from] rustls::Error),
-    #[error("server returned {status}: {message}")]
-    Status { status: StatusCode, message: String },
-    #[error("decode: {0}")]
-    Decode(#[from] wire::DecodeError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("connection closed")]
+    Closed,
+    #[error("server returned {status:?}: {message}")]
+    Status { status: Status, message: String },
+    #[error("invalid status byte {0}")]
+    InvalidStatus(u8),
+    #[error("decode: {0}")]
+    Decode(#[from] wire::DecodeError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// How the server certificate is validated.
-#[derive(Clone, Debug, Default)]
-pub enum Tls {
-    /// Accept any certificate. Only for development against self-signed servers.
-    #[default]
-    Insecure,
-    /// Trust exactly these DER certificates (e.g. the server's self-signed cert).
-    Pinned(Vec<CertificateDer<'static>>),
-}
+const BUF: usize = 64 << 10;
 
-#[derive(Clone, Debug)]
-pub struct Config {
-    /// SNI / certificate name presented by the server.
-    pub server_name: String,
-    pub tls: Tls,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server_name: "localhost".into(),
-            tls: Tls::Insecure,
-        }
-    }
-}
+type Reply = oneshot::Sender<Result<Bytes>>;
 
 #[derive(Clone)]
 pub struct Client {
-    send: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
-    _endpoint: quinn::Endpoint,
+    tx: mpsc::Sender<(Op, Bytes, Reply)>,
+    _conn: Arc<Connection>,
+}
+
+/// Aborts the I/O tasks when the last clone is dropped.
+struct Connection {
+    writer: tokio::task::JoinHandle<()>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.writer.abort();
+        self.reader.abort();
+    }
 }
 
 impl Client {
-    pub async fn connect(addr: SocketAddr, config: Config) -> Result<Self> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13])?;
-        let mut tls = match config.tls {
-            Tls::Insecure => builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(SkipVerify(provider)))
-                .with_no_client_auth(),
-            Tls::Pinned(certs) => {
-                let mut roots = rustls::RootCertStore::empty();
-                for c in certs {
-                    roots.add(c)?;
-                }
-                builder.with_root_certificates(roots).with_no_client_auth()
-            }
-        };
-        tls.alpn_protocols = vec![b"h3".to_vec()];
-
-        let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
-            .map_err(|e| Error::Io(std::io::Error::other(e)))?;
-        let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic));
-        let mut transport = quinn::TransportConfig::default();
-        transport.max_concurrent_bidi_streams(4096u32.into());
-        client_cfg.transport_config(Arc::new(transport));
-
-        let bind: SocketAddr = match addr.ip() {
-            IpAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
-            IpAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
-        };
-        let mut endpoint = quinn::Endpoint::client(bind)?;
-        endpoint.set_default_client_config(client_cfg);
-        let conn = endpoint.connect(addr, &config.server_name)?.await?;
-
-        let (mut driver, send) = h3::client::new(h3_quinn::Connection::new(conn)).await?;
-        tokio::spawn(async move {
-            let _ = driver.wait_idle().await;
-        });
+    pub async fn connect(addr: SocketAddr) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        let (r, w) = stream.into_split();
+        let (tx, rx) = mpsc::channel::<(Op, Bytes, Reply)>(1024);
+        let (pending_tx, pending_rx) = mpsc::unbounded_channel::<Reply>();
+        let writer = tokio::spawn(write_loop(BufWriter::with_capacity(BUF, w), rx, pending_tx));
+        let reader = tokio::spawn(read_loop(BufReader::with_capacity(BUF, r), pending_rx));
         Ok(Self {
-            send,
-            _endpoint: endpoint,
+            tx,
+            _conn: Arc::new(Connection { writer, reader }),
         })
     }
 
-    async fn call(&self, path: &'static str, body: Bytes) -> Result<Bytes> {
-        let uri = Uri::builder()
-            .scheme("https")
-            .authority("oxicache")
-            .path_and_query(path)
-            .build()
-            .unwrap();
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(uri)
-            .body(())
-            .unwrap();
-        let mut send = self.send.clone();
-        let mut stream = send.send_request(req).await?;
-        if !body.is_empty() {
-            stream.send_data(body).await?;
-        }
-        stream.finish().await?;
-
-        let resp = stream.recv_response().await?;
-        let mut out = BytesMut::new();
-        while let Some(chunk) = stream.recv_data().await? {
-            out.put(chunk);
-        }
-        if resp.status() != StatusCode::OK {
-            return Err(Error::Status {
-                status: resp.status(),
-                message: String::from_utf8_lossy(&out).into_owned(),
-            });
-        }
-        Ok(out.freeze())
+    async fn call(&self, op: Op, body: Bytes) -> Result<Bytes> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send((op, body, reply))
+            .await
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
     }
 
     /// Fetch many keys; the result has one slot per key in request order.
@@ -150,7 +81,7 @@ impl Client {
         I::IntoIter: ExactSizeIterator + Clone,
     {
         Ok(wire::decode_values(
-            self.call(wire::path::GET, wire::encode_keys(keys)).await?,
+            self.call(Op::Get, wire::encode_keys(keys)).await?,
         )?)
     }
 
@@ -160,8 +91,7 @@ impl Client {
         I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
         I::IntoIter: ExactSizeIterator + Clone,
     {
-        self.call(wire::path::SET, wire::encode_entries(entries))
-            .await?;
+        self.call(Op::Set, wire::encode_entries(entries)).await?;
         Ok(())
     }
 
@@ -172,43 +102,66 @@ impl Client {
         I::IntoIter: ExactSizeIterator + Clone,
     {
         Ok(wire::decode_flags(
-            self.call(wire::path::DEL, wire::encode_keys(keys)).await?,
+            self.call(Op::Del, wire::encode_keys(keys)).await?,
         )?)
     }
 }
 
-/// Accepts any server certificate. Only for development against self-signed servers.
-#[derive(Debug)]
-struct SkipVerify(Arc<rustls::crypto::CryptoProvider>);
+/// Writes queued requests, coalescing everything already queued into one flush.
+async fn write_loop<W: AsyncWriteExt + Unpin>(
+    mut w: W,
+    mut rx: mpsc::Receiver<(Op, Bytes, Reply)>,
+    pending: mpsc::UnboundedSender<Reply>,
+) {
+    while let Some(mut msg) = rx.recv().await {
+        loop {
+            let (op, body, reply) = msg;
+            if pending.send(reply).is_err() {
+                return;
+            }
+            let ok = w
+                .write_all(&wire::encode_header(op as u8, body.len()))
+                .await
+                .is_ok()
+                && (body.is_empty() || w.write_all(&body).await.is_ok());
+            if !ok {
+                return;
+            }
+            match rx.try_recv() {
+                Ok(next) => msg = next,
+                Err(_) => break,
+            }
+        }
+        if w.flush().await.is_err() {
+            return;
+        }
+    }
+}
 
-impl ServerCertVerifier for SkipVerify {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-    fn verify_tls12_signature(
-        &self,
-        m: &[u8],
-        c: &CertificateDer<'_>,
-        d: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
-    }
-    fn verify_tls13_signature(
-        &self,
-        m: &[u8],
-        c: &CertificateDer<'_>,
-        d: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
-    }
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
+/// Reads responses and hands each to the oldest pending caller.
+async fn read_loop<R: AsyncReadExt + Unpin>(mut r: R, mut pending: mpsc::UnboundedReceiver<Reply>) {
+    let mut hdr = [0u8; HEADER_LEN];
+    while let Some(reply) = pending.recv().await {
+        let res = async {
+            r.read_exact(&mut hdr).await?;
+            let (status, len) = wire::decode_header(&hdr);
+            let mut body = BytesMut::zeroed(len);
+            r.read_exact(&mut body).await?;
+            let body = body.freeze();
+            match Status::from_u8(status) {
+                Some(Status::Ok) => Ok(body),
+                Some(status) => Err(Error::Status {
+                    status,
+                    message: String::from_utf8_lossy(&body).into_owned(),
+                }),
+                None => Err(Error::InvalidStatus(status)),
+            }
+        }
+        .await;
+        let fatal = matches!(res, Err(Error::Io(_) | Error::InvalidStatus(_)));
+        let _ = reply.send(res);
+        if fatal {
+            return; // dropping `pending` fails every queued caller with Closed
+        }
     }
 }

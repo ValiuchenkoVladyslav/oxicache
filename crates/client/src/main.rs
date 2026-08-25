@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use oxicache_client::{Client, Config, Tls};
-use rustls_pki_types::{CertificateDer, pem::PemObject};
+use oxicache_client::Client;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -16,12 +15,6 @@ struct Args {
     /// Server address.
     #[arg(long, default_value = "127.0.0.1:4433")]
     addr: SocketAddr,
-    /// Expected server name (SNI).
-    #[arg(long, default_value = "localhost")]
-    server_name: String,
-    /// PEM certificate to pin; without it any certificate is accepted.
-    #[arg(long)]
-    ca: Option<std::path::PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -62,20 +55,9 @@ enum Cmd {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let tls = match &args.ca {
-        Some(p) => Tls::Pinned(
-            CertificateDer::pem_file_iter(p)?.collect::<std::result::Result<Vec<_>, _>>()?,
-        ),
-        None => Tls::Insecure,
-    };
-    let config = Config {
-        server_name: args.server_name.clone(),
-        tls,
-    };
-
     match args.cmd {
         Cmd::Get { keys } => {
-            let client = Client::connect(args.addr, config).await?;
+            let client = Client::connect(args.addr).await?;
             let vals = client.get(keys.iter().map(String::as_bytes)).await?;
             for (k, v) in keys.iter().zip(vals) {
                 match v {
@@ -88,7 +70,7 @@ async fn main() -> Result<()> {
             if kv.len() % 2 != 0 {
                 return Err("set expects key value pairs".into());
             }
-            let client = Client::connect(args.addr, config).await?;
+            let client = Client::connect(args.addr).await?;
             let pairs: Vec<(&[u8], &[u8])> = kv
                 .chunks(2)
                 .map(|c| (c[0].as_bytes(), c[1].as_bytes()))
@@ -97,7 +79,7 @@ async fn main() -> Result<()> {
             println!("OK ({} entries)", pairs.len());
         }
         Cmd::Del { keys } => {
-            let client = Client::connect(args.addr, config).await?;
+            let client = Client::connect(args.addr).await?;
             let flags = client.del(keys.iter().map(String::as_bytes)).await?;
             for (k, f) in keys.iter().zip(flags) {
                 println!("{k}: {}", if f { "deleted" } else { "(nil)" });
@@ -114,7 +96,6 @@ async fn main() -> Result<()> {
         } => {
             bench(
                 args.addr,
-                config,
                 conns,
                 pipeline,
                 batch,
@@ -132,7 +113,6 @@ async fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn bench(
     addr: SocketAddr,
-    config: Config,
     conns: usize,
     pipeline: usize,
     batch: usize,
@@ -149,7 +129,7 @@ async fn bench(
 
     let mut clients = Vec::with_capacity(conns);
     for _ in 0..conns {
-        clients.push(Client::connect(addr, config.clone()).await?);
+        clients.push(Client::connect(addr).await?);
     }
     let start = Instant::now();
     let deadline = start + Duration::from_secs(seconds);

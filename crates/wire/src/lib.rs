@@ -1,25 +1,84 @@
 //! Binary wire format shared by the oxicache server and client.
 //!
-//! Every request is an HTTP/3 `POST` to one of the [`path`] constants with a
-//! body encoded as below. All integers are little-endian. Values are opaque
-//! byte strings; the format never inspects them.
+//! Transport is a plain TCP stream carrying length-prefixed frames. Requests
+//! on one connection are answered in order, so clients may pipeline freely.
+//! All integers are little-endian. Values are opaque byte strings; the format
+//! never inspects them.
 //!
 //! ```text
+//! request     := u8 op, u32 len, len bytes of body
+//! response    := u8 status, u32 len, len bytes of body
+//!
 //! keys        := u32 count, count × (u32 len, len bytes)
 //! entries     := u32 count, count × (u32 klen, key, u32 vlen, value)
 //!
-//! POST /get   body: keys      -> u32 count, count × (u8 0 | u8 1, u32 len, value)
-//! POST /set   body: entries   -> empty
-//! POST /del   body: keys      -> u32 count, count × u8 found
+//! op GET(1)   body: keys      -> u32 count, count × (u8 0 | u8 1, u32 len, value)
+//! op SET(2)   body: entries   -> empty
+//! op DEL(3)   body: keys      -> u32 count, count × u8 found
 //! ```
+//!
+//! A non-OK status carries a UTF-8 message as its body.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-/// Request paths, one per supported command.
-pub mod path {
-    pub const GET: &str = "/get";
-    pub const SET: &str = "/set";
-    pub const DEL: &str = "/del";
+/// Size of a request or response frame header.
+pub const HEADER_LEN: usize = 5;
+
+/// Request operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Op {
+    Get = 1,
+    Set = 2,
+    Del = 3,
+}
+
+impl Op {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Op::Get),
+            2 => Some(Op::Set),
+            3 => Some(Op::Del),
+            _ => None,
+        }
+    }
+}
+
+/// Response status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Status {
+    Ok = 0,
+    BadRequest = 1,
+    UnknownOp = 2,
+    TooLarge = 3,
+}
+
+impl Status {
+    pub fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Status::Ok),
+            1 => Some(Status::BadRequest),
+            2 => Some(Status::UnknownOp),
+            3 => Some(Status::TooLarge),
+            _ => None,
+        }
+    }
+}
+
+/// Encode a frame header (request `op` or response `status` as the tag byte).
+#[inline]
+pub fn encode_header(tag: u8, len: usize) -> [u8; HEADER_LEN] {
+    let mut h = [0u8; HEADER_LEN];
+    h[0] = tag;
+    h[1..].copy_from_slice(&(len as u32).to_le_bytes());
+    h
+}
+
+/// Decode a frame header into its tag byte and body length.
+#[inline]
+pub fn decode_header(h: &[u8; HEADER_LEN]) -> (u8, usize) {
+    (h[0], u32::from_le_bytes([h[1], h[2], h[3], h[4]]) as usize)
 }
 
 /// Error returned while decoding a malformed frame.
@@ -289,6 +348,15 @@ mod tests {
                 .is_empty()
         );
         assert!(decode_flags(encode_flags(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn header_roundtrip() {
+        let h = encode_header(Op::Set as u8, 0xdead_beef);
+        assert_eq!(decode_header(&h), (2, 0xdead_beef));
+        assert_eq!(Op::from_u8(3), Some(Op::Del));
+        assert_eq!(Op::from_u8(9), None);
+        assert_eq!(Status::from_u8(1), Some(Status::BadRequest));
     }
 
     #[test]

@@ -1,9 +1,8 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use oxicache_server::{Cache, Identity, Options, Server};
+use oxicache_server::{Cache, Options, Server};
 use tracing::info;
 
 #[cfg(feature = "mimalloc")]
@@ -12,11 +11,11 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// HTTP/3 in-memory cache server with S3-FIFO eviction.
+/// TCP in-memory cache server with S3-FIFO eviction.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// UDP address to listen on.
+    /// Address to listen on.
     #[arg(long, default_value = "0.0.0.0:4433")]
     bind: SocketAddr,
     /// Memory budget for cached entries, e.g. 512M, 4G.
@@ -25,18 +24,12 @@ struct Args {
     /// Number of independent cache shards (default: available CPUs).
     #[arg(long)]
     shards: Option<usize>,
-    /// QUIC endpoints sharing the port via SO_REUSEPORT (default: available CPUs).
+    /// Listeners sharing the port via SO_REUSEPORT (default: available CPUs).
     #[arg(long)]
     endpoints: Option<usize>,
-    /// Run each endpoint on its own single-threaded runtime (thread-per-core).
+    /// Run each listener on its own single-threaded runtime (thread-per-core).
     #[arg(long)]
     per_core: bool,
-    /// PEM certificate chain; a self-signed cert is generated when omitted.
-    #[arg(long, requires = "key")]
-    cert: Option<PathBuf>,
-    /// PEM private key.
-    #[arg(long, requires = "cert")]
-    key: Option<PathBuf>,
 }
 
 fn parse_size(s: &str) -> Result<usize> {
@@ -64,33 +57,22 @@ async fn main() -> Result<()> {
         .shards
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let cache = Arc::new(Cache::new(args.capacity, shards));
-    let identity = match (&args.cert, &args.key) {
-        (Some(c), Some(k)) => Identity::from_pem(c, k)?,
-        _ => {
-            info!("no --cert/--key given, using an ephemeral self-signed certificate");
-            Identity::self_signed()?
-        }
-    };
     let opts = Options {
         endpoints: args.endpoints.unwrap_or(shards),
     };
-    let server = Server::bind_with(args.bind, identity, cache, opts)?;
+    let server = Arc::new(Server::bind_with(args.bind, cache, opts)?);
     info!(capacity = args.capacity, shards, "cache ready");
 
     if args.per_core {
-        let server = Arc::new(server);
         let s = server.clone();
-        let worker = std::thread::spawn(move || s.run_per_core());
+        std::thread::spawn(move || s.run_per_core());
         tokio::signal::ctrl_c().await?;
-        info!("shutting down");
-        server.close().await;
-        let _ = worker.join();
     } else {
         tokio::select! {
             _ = server.run() => {}
-            _ = tokio::signal::ctrl_c() => info!("shutting down"),
+            _ = tokio::signal::ctrl_c() => {}
         }
-        server.close().await;
     }
+    info!("shutting down");
     Ok(())
 }
