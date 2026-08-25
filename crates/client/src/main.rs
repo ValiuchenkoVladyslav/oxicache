@@ -126,9 +126,12 @@ async fn bench(
     let reqs = Arc::new(AtomicU64::new(0));
     let hits = Arc::new(AtomicU64::new(0));
     let value = vec![b'x'; value_size];
-    let keys: Arc<Vec<Vec<u8>>> = Arc::new(
+    // One contiguous buffer with a fixed stride: picking a key is index
+    // arithmetic, not a pointer chase into a separate allocation per key.
+    let key_len = "bench:00000000".len();
+    let keys: Arc<Vec<u8>> = Arc::new(
         (0..keyspace)
-            .map(|i| format!("bench:{i:08}").into_bytes())
+            .flat_map(|i| format!("bench:{i:08}").into_bytes())
             .collect(),
     );
 
@@ -160,7 +163,10 @@ async fn bench(
                 };
                 while Instant::now() < deadline {
                     let ks: Vec<&[u8]> = (0..batch)
-                        .map(|_| keys[next() as usize % keyspace].as_slice())
+                        .map(|_| {
+                            let i = next() as usize % keyspace * key_len;
+                            &keys[i..i + key_len]
+                        })
                         .collect();
                     if (next() % 10_000) as f64 / 10_000.0 < write_ratio {
                         let pairs: Vec<(&[u8], &[u8])> =
