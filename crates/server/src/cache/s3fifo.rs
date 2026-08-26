@@ -49,6 +49,7 @@ struct Header {
 }
 
 const HEADER: usize = std::mem::size_of::<Header>();
+const _: () = assert!(HEADER == 64, "entry header must be exactly one cache line");
 /// Values at least this long are copied with non-temporal stores: their
 /// destination is a cold, recycled chunk, and streaming past the cache
 /// avoids a read-for-ownership per line (2-3x faster on 1-4 KiB copies).
@@ -528,7 +529,6 @@ mod tests {
 
     #[test]
     fn entry_layout_and_copies() {
-        assert_eq!(HEADER, 64);
         for len in [0, 1, 31, 64, 1000, NT_MIN, NT_MIN + 33, 3 * NT_MIN + 7] {
             let v: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
             let e = Entry::new(Key::new(b"k"), &v, 7);
