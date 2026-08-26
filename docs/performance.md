@@ -180,6 +180,13 @@ alternating min-of-3: 7.2 vs 7.2 µs/req (497k vs 496k req/s) read-heavy, 38.2 v
 1 KiB 50/50 — identical. Hashing a 14-byte key is a few nanoseconds either way; the lookup
 cost is the memory latency after the hash. foldhash stays (seeded, HashDoS-resistant).
 
+`rapidhash::fast` 4.5 (the in-memory flavour: no avalanche, sponge mixing) vs `foldhash::fast`,
+after round 7: read-heavy 4.38 vs 4.24 µs (pairs split 3/4), 1 KiB 21.9 vs 22.1, 64 conns
+4.96 vs 4.94 — noise. Isolated, on the bench's 14-byte keys: foldhash 1.35 ns/key,
+rapidhash fast 1.28, rapidhash quality 2.21; a 16-key request differs by ~1 ns of ~4,250.
+Adopted anyway (marginally faster, same seeded HashDoS resistance, `quality` flavour
+available behind the same API); foldhash removed.
+
 ## Round 6: cuckoo index (2026-08-26)
 
 Replaced dashmap with a per-shard cuckoo hash index (`crates/server/src/cache/table.rs`):

@@ -55,7 +55,7 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
   displacement copies before it clears, so a present key is never invisible. Replaced and
   evicted entries are retired through the epoch collector and reclaimed after every write
   batch, so memory stays bounded under sustained writes.
-- Keys hash once (foldhash); top bits pick one of N S3-FIFO shards (default: CPU count),
+- Keys hash once (`rapidhash::fast`, randomly seeded); top bits pick one of N S3-FIFO shards (default: CPU count),
   each a mutex over its small/main/ghost queues, used only by writes and eviction. Reads
   never lock; they bump a relaxed atomic frequency counter capped at 3.
 - Entries are immutable; delete/overwrite marks them dead and they are skipped lazily at

@@ -387,7 +387,7 @@ mod tests {
 
     fn h(k: &[u8]) -> u64 {
         use std::hash::{BuildHasher, Hasher};
-        let mut s = foldhash::fast::FixedState::default().build_hasher();
+        let mut s = rapidhash::fast::SeedableState::fixed().build_hasher();
         s.write(k);
         s.finish()
     }

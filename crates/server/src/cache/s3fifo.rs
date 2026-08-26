@@ -264,7 +264,7 @@ unsafe fn copy_nontemporal(dst: *mut u8, src: &[u8]) {
 
 struct Ghost {
     order: VecDeque<u64>,
-    set: HashSet<u64, foldhash::fast::RandomState>,
+    set: HashSet<u64, rapidhash::fast::RandomState>,
 }
 
 impl Ghost {
@@ -491,7 +491,7 @@ mod tests {
 
     fn h(k: &[u8]) -> u64 {
         use std::hash::{BuildHasher, Hasher};
-        let mut s = foldhash::fast::FixedState::default().build_hasher();
+        let mut s = rapidhash::fast::SeedableState::fixed().build_hasher();
         s.write(k);
         s.finish()
     }

@@ -17,7 +17,7 @@ pub use table::EntryRef;
 pub struct Cache {
     shards: Box<[Shard]>,
     shift: u32,
-    hasher: foldhash::fast::RandomState,
+    hasher: rapidhash::fast::RandomState,
 }
 
 impl Cache {
@@ -29,7 +29,7 @@ impl Cache {
         Self {
             shards: (0..n).map(|_| Shard::new(per)).collect(),
             shift: 64 - n.trailing_zeros(),
-            hasher: foldhash::fast::RandomState::default(),
+            hasher: rapidhash::fast::RandomState::default(),
         }
     }
 
