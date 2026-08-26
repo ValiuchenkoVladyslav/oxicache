@@ -172,3 +172,10 @@ and the shard mutex/queue state (13 %), i.e. memory latency; but prefetching tho
 pass earlier did not move the total, so the remaining user time is bounded by the
 DRAM-resident working set (100k × ~1.2 KiB ≫ L3) plus glibc's non-tcache path for
 chunks over 1032 bytes (`unlink_chunk` + `_int_malloc` ≈ 20 % of user time on 1 KiB values).
+
+## Hasher check (2026-08-26)
+
+`rustc-hash` (FxHash) vs `foldhash::fast` for the index and shard selection, same client,
+alternating min-of-3: 7.2 vs 7.2 µs/req (497k vs 496k req/s) read-heavy, 38.2 vs 38.4 µs on
+1 KiB 50/50 — identical. Hashing a 14-byte key is a few nanoseconds either way; the lookup
+cost is the memory latency after the hash. foldhash stays (seeded, HashDoS-resistant).
