@@ -155,10 +155,10 @@ async fn serve_connection(stream: TcpStream, cache: &Cache) -> std::io::Result<(
 }
 
 /// Route a request to the cache and append the response frame to `out`.
-pub fn dispatch(op: u8, body: Bytes, cache: &Cache, out: &mut FrameWriter) {
+pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
     let res = match Op::from_u8(op) {
-        Some(Op::Get) => wire::decode_keys(body).map(|keys| {
-            cache.get_many(keys.iter().map(|k| &k[..]), |entries| {
+        Some(Op::Get) => wire::keys(body).map(|keys| {
+            cache.get_many(keys, |entries| {
                 let total = 4 + entries
                     .iter()
                     .map(|e| 1 + e.as_ref().map_or(0, |e| 4 + e.value().len()))
@@ -181,15 +181,18 @@ pub fn dispatch(op: u8, body: Bytes, cache: &Cache, out: &mut FrameWriter) {
                 }
             })
         }),
-        Some(Op::Set) => wire::decode_entries(body).map(|entries| {
+        Some(Op::Set) => wire::entries(body).map(|entries| {
             // The cache copies key and value into its own allocation, so the
             // request body is released as soon as this returns.
-            cache.set_many(entries.iter().map(|(k, v)| (&k[..], &v[..])));
+            cache.set_many(entries);
             out.header(Status::Ok as u8, 0);
         }),
-        Some(Op::Del) => wire::decode_keys(body).map(|keys| {
-            let flags: Vec<bool> = keys.iter().map(|k| cache.del(k)).collect();
-            out.frame(Status::Ok as u8, wire::encode_flags(&flags));
+        Some(Op::Del) => wire::keys(body).map(|keys| {
+            out.header(Status::Ok as u8, 4 + keys.len());
+            out.put_slice(&(keys.len() as u32).to_le_bytes());
+            for k in keys {
+                out.put_slice(&[cache.del(k) as u8]);
+            }
         }),
         None => {
             return out.frame(
@@ -209,7 +212,7 @@ mod tests {
 
     fn call(cache: &Cache, op: u8, body: Bytes) -> (Status, Bytes) {
         let mut out = FrameWriter::new();
-        dispatch(op, body, cache, &mut out);
+        dispatch(op, &body, cache, &mut out);
         let raw = out.take();
         let (status, len) = wire::decode_header(raw[..wire::HEADER_LEN].try_into().unwrap());
         assert_eq!(raw.len(), wire::HEADER_LEN + len);

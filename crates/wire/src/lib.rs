@@ -200,6 +200,118 @@ pub fn decode_entries(mut body: Bytes) -> Result<Vec<(Bytes, Bytes)>> {
     Ok(entries)
 }
 
+/// Borrowed view of an encoded key list. Construction validates the whole
+/// body, so iteration cannot fail and yields plain slices of it: no
+/// allocation and no refcount traffic per key.
+#[derive(Clone)]
+pub struct Keys<'a> {
+    rest: &'a [u8],
+    left: usize,
+}
+
+/// Validate and borrow a key list (body of `GET` and `DEL`).
+pub fn keys(body: &[u8]) -> Result<Keys<'_>> {
+    let (n, mut rest) = split_count(body)?;
+    for _ in 0..n {
+        rest = skip_blob(rest)?.1;
+    }
+    if !rest.is_empty() {
+        return Err(DecodeError::Trailing(rest.len()));
+    }
+    Ok(Keys {
+        rest: &body[U32..],
+        left: n,
+    })
+}
+
+impl<'a> Iterator for Keys<'a> {
+    type Item = &'a [u8];
+    #[inline]
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let (k, rest) = take_blob(self.rest);
+        self.rest = rest;
+        Some(k)
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+impl ExactSizeIterator for Keys<'_> {}
+
+/// Borrowed view of encoded key/value entries; see [`Keys`].
+#[derive(Clone)]
+pub struct Entries<'a> {
+    rest: &'a [u8],
+    left: usize,
+}
+
+/// Validate and borrow an entry list (body of `SET`).
+pub fn entries(body: &[u8]) -> Result<Entries<'_>> {
+    let (n, mut rest) = split_count(body)?;
+    for _ in 0..n {
+        rest = skip_blob(skip_blob(rest)?.1)?.1;
+    }
+    if !rest.is_empty() {
+        return Err(DecodeError::Trailing(rest.len()));
+    }
+    Ok(Entries {
+        rest: &body[U32..],
+        left: n,
+    })
+}
+
+impl<'a> Iterator for Entries<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let (k, rest) = take_blob(self.rest);
+        let (v, rest) = take_blob(rest);
+        self.rest = rest;
+        Some((k, v))
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
+}
+impl ExactSizeIterator for Entries<'_> {}
+
+#[inline]
+fn split_count(body: &[u8]) -> Result<(usize, &[u8])> {
+    let Some((n, rest)) = body.split_first_chunk::<U32>() else {
+        return Err(DecodeError::Truncated {
+            needed: U32 - body.len(),
+        });
+    };
+    Ok((u32::from_le_bytes(*n) as usize, rest))
+}
+
+/// Validate one length-prefixed blob, returning it and the remainder.
+#[inline]
+fn skip_blob(b: &[u8]) -> Result<(&[u8], &[u8])> {
+    let (len, rest) = split_count(b)?;
+    if rest.len() < len {
+        return Err(DecodeError::Truncated {
+            needed: len - rest.len(),
+        });
+    }
+    Ok(rest.split_at(len))
+}
+
+/// Split one blob off an already validated buffer.
+#[inline]
+fn take_blob(b: &[u8]) -> (&[u8], &[u8]) {
+    let (len, rest) = b.split_first_chunk::<U32>().expect("validated");
+    rest.split_at(u32::from_le_bytes(*len) as usize)
+}
+
 /// Encode a `/get` response: one optional value per requested key.
 pub fn encode_values<'a, I>(values: I) -> Bytes
 where
@@ -293,6 +405,27 @@ pub fn decode_flags(mut body: Bytes) -> Result<Vec<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_iterators_match_owned() {
+        let ks: [&[u8]; 3] = [b"a", b"", b"hello world"];
+        let enc = encode_keys(ks);
+        let it = keys(&enc).unwrap();
+        assert_eq!(it.len(), 3);
+        assert_eq!(it.collect::<Vec<_>>(), ks);
+        let es: [(&[u8], &[u8]); 2] = [(b"k1", b"v1"), (b"k2", &[0u8, 255, 1])];
+        let enc = encode_entries(es);
+        assert_eq!(entries(&enc).unwrap().collect::<Vec<_>>(), es);
+        assert!(matches!(keys(&[1, 0]), Err(DecodeError::Truncated { .. })));
+        assert!(matches!(
+            keys(&[1, 0, 0, 0, 100, 0, 0, 0]),
+            Err(DecodeError::Truncated { needed: 100 })
+        ));
+        assert!(matches!(
+            entries(&[0, 0, 0, 0, 9]),
+            Err(DecodeError::Trailing(1))
+        ));
+    }
 
     #[test]
     fn keys_roundtrip() {

@@ -23,6 +23,9 @@ pub struct FrameReader {
     max_frame: usize,
     /// Total bytes the frame at the head of the buffer needs, if known.
     need: usize,
+    /// Bytes of the frame lent out by the last `next_buffered`, released on
+    /// the next call.
+    lent: usize,
 }
 
 impl FrameReader {
@@ -32,16 +35,35 @@ impl FrameReader {
             buf: BytesMut::with_capacity(BUF),
             max_frame,
             need: 0,
+            lent: 0,
         }
     }
 
-    /// Next complete frame already in the buffer, as `(tag, body)`; the body
-    /// is a zero-copy slice. `Ok(None)` means more input is needed.
-    pub fn next_buffered(&mut self) -> Result<Option<(u8, Bytes)>, FrameTooLarge> {
+    /// Next complete frame already in the buffer, as `(tag, body)`. The body
+    /// borrows the read buffer and is released by the next call on the reader.
+    /// `Ok(None)` means more input is needed.
+    pub fn next_buffered(&mut self) -> Result<Option<(u8, &[u8])>, FrameTooLarge> {
+        self.release();
+        let Some(len) = self.head()? else {
+            return Ok(None);
+        };
+        self.lent = HEADER_LEN + len;
+        Ok(Some((self.buf[0], &self.buf[HEADER_LEN..self.lent])))
+    }
+
+    #[inline]
+    fn release(&mut self) {
+        self.buf.advance(self.lent);
+        self.lent = 0;
+    }
+
+    /// Body length of the frame at the head of the buffer, if complete.
+    #[inline]
+    fn head(&mut self) -> Result<Option<usize>, FrameTooLarge> {
         if self.buf.len() < HEADER_LEN {
             return Ok(None);
         }
-        let (tag, len) = decode_header(self.buf[..HEADER_LEN].try_into().unwrap());
+        let (_, len) = decode_header(self.buf[..HEADER_LEN].try_into().unwrap());
         if len > self.max_frame {
             return Err(FrameTooLarge(len));
         }
@@ -50,27 +72,17 @@ impl FrameReader {
             return Ok(None);
         }
         self.need = 0;
-        self.buf.advance(HEADER_LEN);
-        Ok(Some((tag, self.buf.split_to(len).freeze())))
+        Ok(Some(len))
     }
 
     /// Like [`next_buffered`](Self::next_buffered) but the body is copied into
-    /// its own allocation. Use this when bodies are handed to other tasks:
-    /// zero-copy slices would share one refcount across tasks (a contended
-    /// atomic per slice) and keep the read buffer from being reused in place.
+    /// its own allocation, for bodies handed to other tasks.
     pub fn next_buffered_owned(&mut self) -> Result<Option<(u8, Bytes)>, FrameTooLarge> {
-        if self.buf.len() < HEADER_LEN {
+        self.release();
+        let Some(len) = self.head()? else {
             return Ok(None);
-        }
-        let (tag, len) = decode_header(self.buf[..HEADER_LEN].try_into().unwrap());
-        if len > self.max_frame {
-            return Err(FrameTooLarge(len));
-        }
-        if self.buf.len() < HEADER_LEN + len {
-            self.need = HEADER_LEN + len;
-            return Ok(None);
-        }
-        self.need = 0;
+        };
+        let tag = self.buf[0];
         self.buf.advance(HEADER_LEN);
         let body = Bytes::copy_from_slice(&self.buf[..len]);
         self.buf.advance(len);
@@ -79,6 +91,7 @@ impl FrameReader {
 
     /// Read more input. Returns `false` at EOF.
     pub async fn fill<R: AsyncRead + Unpin>(&mut self, r: &mut R) -> io::Result<bool> {
+        self.release();
         // One reservation covers both the pending frame and a healthy read
         // size, so a large frame never triggers two reallocations.
         let want = self.need.saturating_sub(self.buf.len()).max(BUF / 4);
@@ -240,8 +253,8 @@ mod tests {
         let mut r = FrameReader::new(1 << 20);
         let mut got = Vec::new();
         while got.len() < 3 {
-            while let Some(f) = r.next_buffered().unwrap() {
-                got.push(f);
+            while let Some((tag, body)) = r.next_buffered().unwrap() {
+                got.push((tag, Bytes::copy_from_slice(body)));
             }
             if got.len() < 3 {
                 assert!(r.fill(&mut b).await.unwrap());
