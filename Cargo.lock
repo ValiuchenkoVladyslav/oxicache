@@ -297,8 +297,6 @@ dependencies = [
  "oxicache-wire",
  "thiserror",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
