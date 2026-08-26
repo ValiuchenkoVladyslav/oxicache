@@ -72,14 +72,21 @@ impl Table {
         let b1 = self.home(hash);
         let b2 = self.alt(b1, tag);
         for b in [b1, b2] {
-            for (i, s) in self.buckets[b].0.iter().enumerate() {
-                let w = s.load(Acquire);
-                if w != 0 && tag_of_word(w) == tag {
-                    // SAFETY: a nonzero word is a live entry under the guard.
-                    let e = unsafe { entry_at(w) };
-                    if e.key() == key {
-                        return Some((b, i, w));
-                    }
+            // Load the whole bucket and build a match mask without branching
+            // per slot; only candidates with the right tag touch an entry.
+            let words: [u64; SLOTS] = std::array::from_fn(|i| self.buckets[b].0[i].load(Acquire));
+            let mut m = 0u32;
+            for (i, &w) in words.iter().enumerate() {
+                m |= ((w != 0 && tag_of_word(w) == tag) as u32) << i;
+            }
+            while m != 0 {
+                let i = m.trailing_zeros() as usize;
+                m &= m - 1;
+                let w = words[i];
+                // SAFETY: a nonzero word is a live entry under the guard.
+                let e = unsafe { entry_at(w) };
+                if e.key() == key {
+                    return Some((b, i, w));
                 }
             }
         }
