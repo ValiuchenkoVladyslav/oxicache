@@ -67,6 +67,30 @@ impl Table {
         (bucket ^ h) & self.mask
     }
 
+    /// Prefetch the header and first value lines of every entry whose tag
+    /// matches `hash`. The addresses come from the slot words alone, so the
+    /// value lines are requested together with the header rather than after
+    /// it (`Entry::prefetch` needs `len` from the header first), and the
+    /// misses of every key in a batch are in flight at once.
+    #[inline]
+    fn prefetch_entries(&self, hash: u64) {
+        let tag = tag_of(hash);
+        let b1 = self.home(hash);
+        let b2 = self.alt(b1, tag);
+        for b in [b1, b2] {
+            for s in &self.buckets[b].0 {
+                let w = s.load(Relaxed);
+                if w != 0 && tag_of_word(w) == tag {
+                    let p = (w & PTR_MASK) as *const u8;
+                    for i in 0..3 {
+                        // Hints past a short entry's end are harmless.
+                        prefetch_addr(p.wrapping_add(i * 64));
+                    }
+                }
+            }
+        }
+    }
+
     fn find(&self, hash: u64, key: &[u8]) -> Option<(usize, usize, u64)> {
         let tag = tag_of(hash);
         let b1 = self.home(hash);
@@ -205,6 +229,12 @@ impl Index {
         let b2 = t.alt(b1, tag_of(hash));
         prefetch_line(&t.buckets[b1]);
         prefetch_line(&t.buckets[b2]);
+    }
+
+    /// Prefetch the candidate entries for `hash` (buckets must be hot).
+    #[inline]
+    pub fn prefetch_entries(&self, hash: u64, guard: &Guard) {
+        self.load(guard).prefetch_entries(hash);
     }
 
     #[inline]
@@ -367,10 +397,15 @@ fn empty_slot(b: &Bucket) -> Option<usize> {
 
 #[inline]
 fn prefetch_line<T>(p: &T) {
+    prefetch_addr(p as *const T as *const u8);
+}
+
+#[inline]
+fn prefetch_addr(p: *const u8) {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: prefetch is a hint and never faults.
+    // SAFETY: prefetch is a hint; it never faults or dereferences.
     unsafe {
-        std::arch::x86_64::_mm_prefetch(p as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
     }
 }
 

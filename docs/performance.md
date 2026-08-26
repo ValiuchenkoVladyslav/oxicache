@@ -252,3 +252,25 @@ What remains on the write path (4 KiB): the value copy is now DRAM-write-bandwid
 (~6 µs of 64 KiB per request), `Table::find` on insert (~13 %), glibc `_int_malloc` /
 `unlink_chunk` for chunks above the tcache limit (~12 %), and the read buffer's realloc
 copy for frames larger than 64 KiB (~8 %).
+
+## Round 8: entry line fetch on GET (2026-08-26)
+
+`perf` on the read-heavy profile put 51 % of user time in `Table::find`, 84 % of that on
+the first load of the entry header, i.e. the DRAM miss per hit; `perf stat` showed IPC 0.57
+and two dTLB misses per key. The miss itself is inherent (a hit must read the entry), but it
+was paid in two dependent stages: `find` missed on the header, and `Entry::prefetch` read
+`len` from it before it could request the value lines.
+
+| change | 8×16, 128 B, 10 % w (user) | 1 KiB 50/50 | 4 KiB 90 % w | verdict |
+|---|---|---|---|---|
+| second pass prefetching the header of tag-matching entries (from slot words) | noise | — | — | the OoO core already overlaps the header misses |
+| same pass prefetching header + first two value lines | 4.35 → 3.72 (−16 %, every pair) | — | — | kept |
+| + 64-byte-aligned entry allocations (192 B entry: 3 lines instead of 4 in 3 of 4 cases) | → 3.41 (−22 % cumulative) | | +2…+3 % (glibc `memalign`) | kept for values < 1 KiB only; 4 KiB neutral |
+| `touch()` disabled (diagnostic) | no change | | | freq stores cost nothing |
+| `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` | −2 % | | | not adopted (THP pages never materialised) |
+
+Net, same client: read-heavy 4.4 → **3.4 µs** user; 1 KiB 50/50 22–24 → **20.5–21.2**
+(5 of 6 pairs); 4 KiB writes neutral.
+
+Next: a size-class slab for entries backed by an `MADV_HUGEPAGE` region — alignment for
+free at every size, no glibc `malloc`/`free` (~8 %), and the TLB misses gone.

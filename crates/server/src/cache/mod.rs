@@ -74,6 +74,11 @@ impl Cache {
             shard.prefetch(hash, &guard);
             located.push((shard, hash, k));
         }
+        // Buckets are hot now; issue the entry prefetches for every key
+        // before any key's compare stalls on its entry header.
+        for (shard, hash, _) in &located {
+            shard.prefetch_entries(*hash, &guard);
+        }
         let mut found: Vec<Option<EntryRef<'_>>> = Vec::with_capacity(located.len());
         for (shard, hash, k) in located {
             let e = shard.get(hash, k, &guard);

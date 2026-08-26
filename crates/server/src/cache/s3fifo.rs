@@ -98,10 +98,18 @@ impl Drop for Entry {
     }
 }
 
+/// Small entries are cache-line aligned so a header plus a short value spans
+/// the minimum number of lines (a 192-byte entry from a 16-byte-aligned
+/// allocation straddles four lines three times out of four). Large values
+/// pay glibc's aligned-allocation overhead without a proportionate gain.
 #[inline]
 fn layout(len: usize) -> std::alloc::Layout {
-    std::alloc::Layout::from_size_align(HEADER + len, std::mem::align_of::<Header>())
-        .expect("entry size overflow")
+    let align = if len < NT_MIN {
+        64
+    } else {
+        std::mem::align_of::<Header>()
+    };
+    std::alloc::Layout::from_size_align(HEADER + len, align).expect("entry size overflow")
 }
 
 impl Entry {
@@ -329,6 +337,11 @@ impl Shard {
     #[inline]
     pub fn prefetch(&self, hash: u64, guard: &Guard) {
         self.index.prefetch(hash, guard);
+    }
+
+    #[inline]
+    pub fn prefetch_entries(&self, hash: u64, guard: &Guard) {
+        self.index.prefetch_entries(hash, guard);
     }
 
     #[inline]
