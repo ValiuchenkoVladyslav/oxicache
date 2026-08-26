@@ -59,6 +59,8 @@ enum Cmd {
 async fn main() -> Result<()> {
     oxicache_wire::io::tune_allocator();
     let args = Args::parse();
+    warn_if_overridden("addr", "OXICACHE_ADDR", Some(&args.addr.to_string()), true);
+    warn_if_overridden("token", "OXICACHE_TOKEN", args.token.as_deref(), false);
     let token = args.token.as_deref().map(str::as_bytes);
     match args.cmd {
         Cmd::Get { keys } => {
@@ -114,6 +116,21 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Warn when a flag overrides a differing value of its environment variable.
+/// clap prefers the flag silently; a value that differs from a set variable
+/// can only have come from the flag.
+fn warn_if_overridden(flag: &str, var: &str, value: Option<&str>, show_values: bool) {
+    let Ok(env) = std::env::var(var) else { return };
+    let Some(value) = value else { return };
+    if env != value {
+        if show_values {
+            eprintln!("warning: --{flag}={value} overrides {var}={env}");
+        } else {
+            eprintln!("warning: --{flag} overrides a different {var}");
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
