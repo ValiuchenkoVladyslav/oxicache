@@ -11,11 +11,14 @@
 //! and the queues are compacted when they accumulate.
 
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
+use std::ptr::NonNull;
+use std::sync::atomic::{
+    AtomicBool, AtomicU8, AtomicUsize,
+    Ordering::{Acquire, Relaxed, Release},
+};
 
 use crossbeam_epoch::Guard;
 use parking_lot::Mutex;
-use triomphe::ThinArc;
 
 use super::key::Key;
 use super::table::{EntryRef, Index, Writer, retire};
@@ -35,11 +38,31 @@ pub struct Meta {
     live: AtomicBool,
 }
 
+/// Allocation header of an entry: refcount, value length, metadata. The
+/// value bytes follow immediately; the header is 64 bytes, so they start on
+/// a cache line of their own.
+#[repr(C)]
+struct Header {
+    rc: AtomicUsize,
+    len: usize,
+    meta: Meta,
+}
+
+const HEADER: usize = std::mem::size_of::<Header>();
+/// Values at least this long are copied with non-temporal stores: their
+/// destination is a cold, recycled chunk, and streaming past the cache
+/// avoids a read-for-ownership per line (2-3x faster on 1-4 KiB copies).
+const NT_MIN: usize = 1024;
+
 /// A cached item: refcount, metadata, key and value live in one allocation
 /// (plus one more for keys longer than [`super::key::INLINE`]) so a hit
-/// touches one or two adjacent cache lines.
-#[derive(Clone)]
-pub struct Entry(ThinArc<Meta, u8>);
+/// touches one or two adjacent cache lines. Thin (one pointer) so an index
+/// slot can hold it, immutable once built, atomically refcounted.
+pub struct Entry(NonNull<Header>);
+
+// SAFETY: the allocation is immutable after construction apart from atomics.
+unsafe impl Send for Entry {}
+unsafe impl Sync for Entry {}
 
 impl AsRef<[u8]> for Entry {
     #[inline]
@@ -48,20 +71,73 @@ impl AsRef<[u8]> for Entry {
     }
 }
 
+impl Clone for Entry {
+    #[inline]
+    fn clone(&self) -> Self {
+        let old = self.header().rc.fetch_add(1, Relaxed);
+        if old > isize::MAX as usize {
+            std::process::abort();
+        }
+        Self(self.0)
+    }
+}
+
+impl Drop for Entry {
+    #[inline]
+    fn drop(&mut self) {
+        if self.header().rc.fetch_sub(1, Release) != 1 {
+            return;
+        }
+        std::sync::atomic::fence(Acquire);
+        let len = self.header().len;
+        // SAFETY: last handle; nobody else can observe the allocation.
+        unsafe {
+            std::ptr::drop_in_place(self.0.as_ptr());
+            std::alloc::dealloc(self.0.as_ptr() as *mut u8, layout(len));
+        }
+    }
+}
+
+#[inline]
+fn layout(len: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(HEADER + len, std::mem::align_of::<Header>())
+        .expect("entry size overflow")
+}
+
 impl Entry {
     pub(super) fn new(key: Key, value: &[u8], hash: u64) -> Self {
-        let meta = Meta {
-            key,
-            hash,
-            freq: AtomicU8::new(0),
-            live: AtomicBool::new(true),
-        };
-        Self(ThinArc::from_header_and_slice(meta, value))
+        let layout = layout(value.len());
+        // SAFETY: layout is nonzero-sized; the header is written before use
+        // and the value bytes are fully initialised by `copy_value`.
+        unsafe {
+            let p = std::alloc::alloc(layout) as *mut Header;
+            let Some(p) = NonNull::new(p) else {
+                std::alloc::handle_alloc_error(layout)
+            };
+            p.as_ptr().write(Header {
+                rc: AtomicUsize::new(1),
+                len: value.len(),
+                meta: Meta {
+                    key,
+                    hash,
+                    freq: AtomicU8::new(0),
+                    live: AtomicBool::new(true),
+                },
+            });
+            copy_value(p.as_ptr().cast::<u8>().add(HEADER), value);
+            Self(p)
+        }
+    }
+
+    #[inline]
+    fn header(&self) -> &Header {
+        // SAFETY: valid for the life of any handle.
+        unsafe { self.0.as_ref() }
     }
 
     #[inline]
     fn meta(&self) -> &Meta {
-        &self.0.header.header
+        &self.header().meta
     }
 
     #[inline]
@@ -71,7 +147,10 @@ impl Entry {
 
     #[inline]
     pub fn value(&self) -> &[u8] {
-        &self.0.slice
+        // SAFETY: `len` initialised bytes follow the header.
+        unsafe {
+            std::slice::from_raw_parts(self.0.as_ptr().cast::<u8>().add(HEADER), self.header().len)
+        }
     }
 
     /// Hint the CPU to fetch this entry's header and the first few data lines.
@@ -80,8 +159,8 @@ impl Entry {
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            let p = self.0.heap_ptr() as *const i8;
-            let lines = (self.0.slice.len() / 64).min(3) + 1;
+            let p = self.0.as_ptr() as *const i8;
+            let lines = (self.header().len / 64).min(3) + 1;
             // SAFETY: prefetch is a pure hint; it never faults or dereferences.
             unsafe {
                 for i in 0..lines {
@@ -93,7 +172,7 @@ impl Entry {
 
     #[inline]
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-        a.0.heap_ptr() == b.0.heap_ptr()
+        a.0 == b.0
     }
 
     #[inline]
@@ -108,7 +187,9 @@ impl Entry {
 
     #[inline]
     pub(super) fn into_raw(self) -> *const std::ffi::c_void {
-        self.0.into_raw()
+        let p = self.0.as_ptr() as *const std::ffi::c_void;
+        std::mem::forget(self);
+        p
     }
 
     /// # Safety
@@ -117,12 +198,12 @@ impl Entry {
     /// borrowed views).
     #[inline]
     pub(super) unsafe fn from_raw(p: *const std::ffi::c_void) -> Self {
-        Self(unsafe { ThinArc::from_raw(p) })
+        Self(unsafe { NonNull::new_unchecked(p as *mut Header) })
     }
 
     #[inline]
     pub(super) fn as_ptr(&self) -> *const std::ffi::c_void {
-        self.0.heap_ptr()
+        self.0.as_ptr() as *const std::ffi::c_void
     }
 
     #[inline]
@@ -141,6 +222,43 @@ impl Entry {
         if f < FREQ_CAP {
             self.freq().store(f + 1, Relaxed);
         }
+    }
+}
+
+/// Copy `src` to `dst`, streaming large values past the cache.
+///
+/// # Safety
+/// `dst` must be valid for `src.len()` writes.
+#[inline]
+unsafe fn copy_value(dst: *mut u8, src: &[u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if src.len() >= NT_MIN && std::is_x86_feature_detected!("avx") {
+        return unsafe { copy_nontemporal(dst, src) };
+    }
+    unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len()) }
+}
+
+/// # Safety
+/// `dst` must be valid for `src.len()` writes; requires AVX.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn copy_nontemporal(dst: *mut u8, src: &[u8]) {
+    use std::arch::x86_64::{__m256i, _mm_sfence, _mm256_loadu_si256, _mm256_stream_si256};
+    const V: usize = 32;
+    let head = dst.align_offset(V).min(src.len());
+    let body = (src.len() - head) / V * V;
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, head);
+        let (s, d) = (src.as_ptr().add(head), dst.add(head));
+        let mut i = 0;
+        while i < body {
+            let v = _mm256_loadu_si256(s.add(i) as *const __m256i);
+            _mm256_stream_si256(d.add(i) as *mut __m256i, v);
+            i += V;
+        }
+        _mm_sfence();
+        let done = head + body;
+        std::ptr::copy_nonoverlapping(src.as_ptr().add(done), dst.add(done), src.len() - done);
     }
 }
 
@@ -393,6 +511,21 @@ mod tests {
 
     fn del(s: &Shard, k: &[u8]) -> bool {
         s.del(h(k), k, &epoch::pin())
+    }
+
+    #[test]
+    fn entry_layout_and_copies() {
+        assert_eq!(HEADER, 64);
+        for len in [0, 1, 31, 64, 1000, NT_MIN, NT_MIN + 33, 3 * NT_MIN + 7] {
+            let v: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let e = Entry::new(Key::new(b"k"), &v, 7);
+            assert_eq!(e.value(), &v[..]);
+            assert_eq!(e.key(), b"k");
+            let c = e.clone();
+            assert!(Entry::ptr_eq(&e, &c));
+            drop(e);
+            assert_eq!(c.value(), &v[..]);
+        }
     }
 
     #[test]

@@ -17,7 +17,6 @@ foldhash.workspace = true
 parking_lot.workspace = true
 crossbeam-epoch = "0.9"
 socket2 = "0.6"
-triomphe = "0.1"
 smallvec = "1"
 mimalloc = { version = "0.1", optional = true }
 
