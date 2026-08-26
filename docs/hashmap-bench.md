@@ -80,3 +80,7 @@ Why: a lookup is a chain of dependent cache misses (control bytes → bucket →
 of consecutive keys cannot overlap. The two-pass `get_many` resolves all keys first and
 prefetches their entries, then reads them. Papaya removes the atomics but boxes every table
 entry, which costs ~20 % on inserts; dashmap keeps entries inline in the bucket.
+
+
+Update 2026-08-26: the papaya feature was removed; with prefetching batch lookups dashmap led on
+every profile, so there was no deployment where papaya was the better choice.

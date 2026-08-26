@@ -44,7 +44,7 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
 
 ## Design
 
-- One concurrent index (dashmap; `--features papaya` for a lock-free alternative) holds
+- One concurrent index (dashmap) holds
   every key: short keys inline in the bucket, each value a single `ThinArc` allocation
   carrying refcount, metadata and bytes. Batch gets resolve all keys first and prefetch
   their entries so the cache misses of independent keys overlap.
@@ -59,5 +59,5 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
   its own single-threaded runtime.
 - The client pipelines calls from any number of tasks onto one connection (writer task
   coalesces queued frames into one flush; reader task matches responses in order).
-- Build-time options: `--features mimalloc` (allocator), `--features papaya` (map backend);
-  both measured and documented in `docs/`.
+- Build-time option: `--features mimalloc` — ~8 % less CPU on small-value read-heavy loads for
+  ~30 % more RSS (measured in `docs/performance.md`).
