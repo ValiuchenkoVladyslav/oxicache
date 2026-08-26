@@ -13,7 +13,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 #[command(version)]
 struct Args {
     /// Server address.
-    #[arg(long, default_value = "127.0.0.1:4433")]
+    #[arg(long, env = "OXICACHE_ADDR", default_value = "127.0.0.1:4433")]
     addr: SocketAddr,
     /// Shared secret, if the server requires one.
     #[arg(long, env = "OXICACHE_TOKEN", hide_env_values = true)]

@@ -32,7 +32,7 @@ status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized 
 If the server is started with a token (`--token` or `OXICACHE_TOKEN`), AUTH must be the
 first request on every connection; anything else gets status 4 and the connection is closed.
 The client library does this in `Client::connect_with_token`, the CLI via `--token` /
-`OXICACHE_TOKEN`. The token travels in clear text — pair it with a private network or a TLS
+`OXICACHE_TOKEN` (the CLI also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
 tunnel.
 
 ## Run
