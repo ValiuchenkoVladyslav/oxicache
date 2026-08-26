@@ -38,9 +38,11 @@ tunnel.
 ## Run
 
 ```sh
-cargo run --release -p oxicache-server -- --bind 0.0.0.0:4433 --capacity 1G
+cargo run --release -p oxicache-server -- --addr 0.0.0.0:4433 --capacity 1G
 # --shards N      independent S3-FIFO shards (default: CPUs)
 # --token T       require AUTH with this secret (or OXICACHE_TOKEN in the environment)
+# every server flag has an environment variable: OXICACHE_ADDR, OXICACHE_CAPACITY,
+# OXICACHE_SHARDS, OXICACHE_TOKEN; a flag wins over a differing variable, with a warning
 
 cargo run --release -p oxicache-client -- set a 1 b 2
 cargo run --release -p oxicache-client -- get a b c

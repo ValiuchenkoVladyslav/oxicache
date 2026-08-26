@@ -59,8 +59,20 @@ enum Cmd {
 async fn main() -> Result<()> {
     oxicache_wire::io::tune_allocator();
     let args = Args::parse();
-    warn_if_overridden("addr", "OXICACHE_ADDR", Some(&args.addr.to_string()), true);
-    warn_if_overridden("token", "OXICACHE_TOKEN", args.token.as_deref(), false);
+    warn_if_overridden(
+        "addr",
+        "OXICACHE_ADDR",
+        Some(&args.addr),
+        |s| s.parse().ok(),
+        true,
+    );
+    warn_if_overridden(
+        "token",
+        "OXICACHE_TOKEN",
+        args.token.as_ref(),
+        |s| Some(s.to_string()),
+        false,
+    );
     let token = args.token.as_deref().map(str::as_bytes);
     match args.cmd {
         Cmd::Get { keys } => {
@@ -119,13 +131,22 @@ async fn main() -> Result<()> {
 }
 
 /// Warn when a flag overrides a differing value of its environment variable.
-/// clap prefers the flag silently; a value that differs from a set variable
-/// can only have come from the flag.
-fn warn_if_overridden(flag: &str, var: &str, value: Option<&str>, show_values: bool) {
-    let Ok(env) = std::env::var(var) else { return };
-    let Some(value) = value else { return };
-    if env != value {
-        if show_values {
+/// clap prefers the flag silently; a parsed value that differs from a set
+/// variable can only have come from the flag. Values are compared after
+/// parsing, so `1G` and `1024M` agree. `show` controls whether the values are
+/// printed (not for secrets).
+fn warn_if_overridden<T: PartialEq + std::fmt::Display>(
+    flag: &str,
+    var: &str,
+    value: Option<&T>,
+    parse: impl Fn(&str) -> Option<T>,
+    show: bool,
+) {
+    let (Ok(env), Some(value)) = (std::env::var(var), value) else {
+        return;
+    };
+    if parse(&env).as_ref() != Some(value) {
+        if show {
             eprintln!("warning: --{flag}={value} overrides {var}={env}");
         } else {
             eprintln!("warning: --{flag} overrides a different {var}");
