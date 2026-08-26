@@ -2,6 +2,10 @@
 //! answered in order. Request bodies are zero-copy slices of the read buffer;
 //! responses are flushed with one vectored write once the buffered input has
 //! been drained, so pipelined requests share a single syscall each way.
+//!
+//! With a token configured, a connection must authenticate with one `Auth`
+//! frame before anything else; the check is a single well-predicted branch
+//! per frame afterwards.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,17 +28,24 @@ pub struct Options {
     /// Number of listeners sharing the port via `SO_REUSEPORT`, so the kernel
     /// spreads connections over independent accept loops.
     pub endpoints: usize,
+    /// Shared secret every connection must present in an `Auth` frame before
+    /// its first request; `None` disables authentication.
+    pub token: Option<Vec<u8>>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Self { endpoints: 1 }
+        Self {
+            endpoints: 1,
+            token: None,
+        }
     }
 }
 
 pub struct Server {
     listeners: Vec<std::net::TcpListener>,
     cache: Arc<Cache>,
+    token: Option<Arc<[u8]>>,
 }
 
 impl Server {
@@ -57,7 +68,11 @@ impl Server {
             bound = l.local_addr().map_err(bind)?;
             listeners.push(l);
         }
-        Ok(Self { listeners, cache })
+        Ok(Self {
+            listeners,
+            cache,
+            token: opts.token.map(Arc::from),
+        })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -70,7 +85,7 @@ impl Server {
         let mut tasks = tokio::task::JoinSet::new();
         for l in &self.listeners {
             let l = l.try_clone().expect("clone listener");
-            tasks.spawn(accept_loop(l, self.cache.clone()));
+            tasks.spawn(accept_loop(l, self.cache.clone(), self.token.clone()));
         }
         while tasks.join_next().await.is_some() {}
     }
@@ -82,7 +97,11 @@ impl Server {
         info!(addr = %self.local_addr(), endpoints = self.listeners.len(), "listening (tcp, thread-per-core)");
         std::thread::scope(|scope| {
             for (i, l) in self.listeners.iter().enumerate() {
-                let (l, cache) = (l.try_clone().expect("clone listener"), self.cache.clone());
+                let (l, cache, token) = (
+                    l.try_clone().expect("clone listener"),
+                    self.cache.clone(),
+                    self.token.clone(),
+                );
                 std::thread::Builder::new()
                     .name(format!("oxicache-{i}"))
                     .spawn_scoped(scope, move || {
@@ -90,7 +109,7 @@ impl Server {
                             .enable_all()
                             .build()
                             .expect("runtime");
-                        rt.block_on(accept_loop(l, cache));
+                        rt.block_on(accept_loop(l, cache, token));
                     })
                     .expect("spawn listener thread");
             }
@@ -111,15 +130,15 @@ fn tcp_listener(addr: SocketAddr, reuse_port: bool) -> std::io::Result<std::net:
     Ok(socket.into())
 }
 
-async fn accept_loop(listener: std::net::TcpListener, cache: Arc<Cache>) {
+async fn accept_loop(listener: std::net::TcpListener, cache: Arc<Cache>, token: Option<Arc<[u8]>>) {
     let listener = TcpListener::from_std(listener).expect("register listener");
     loop {
         match listener.accept().await {
             Ok((stream, remote)) => {
-                let cache = cache.clone();
+                let (cache, token) = (cache.clone(), token.clone());
                 tokio::spawn(async move {
                     debug!(%remote, "connection open");
-                    if let Err(e) = serve_connection(stream, &cache).await {
+                    if let Err(e) = serve_connection(stream, &cache, token.as_deref()).await {
                         debug!(%remote, error = %e, "connection closed");
                     }
                 });
@@ -129,16 +148,35 @@ async fn accept_loop(listener: std::net::TcpListener, cache: Arc<Cache>) {
     }
 }
 
-async fn serve_connection(stream: TcpStream, cache: &Cache) -> std::io::Result<()> {
+async fn serve_connection(
+    stream: TcpStream,
+    cache: &Cache,
+    token: Option<&[u8]>,
+) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let (mut r, mut w) = stream.into_split();
     let mut reader = FrameReader::new(MAX_FRAME);
     let mut out = FrameWriter::new();
+    let mut authed = token.is_none();
     loop {
         // Serve every complete frame already buffered, then flush once.
         loop {
             match reader.next_buffered() {
-                Ok(Some((op, body))) => dispatch(op, body, cache, &mut out),
+                Ok(Some((op, body))) if authed => dispatch(op, body, cache, &mut out),
+                Ok(Some((op, body))) => {
+                    let ok = op == Op::Auth as u8 && token.is_some_and(|t| ct_eq(t, body));
+                    if ok {
+                        authed = true;
+                        out.header(Status::Ok as u8, 0);
+                    } else {
+                        out.frame(
+                            Status::Unauthorized as u8,
+                            Bytes::from_static(b"auth required"),
+                        );
+                        out.flush(&mut w).await?;
+                        return Ok(());
+                    }
+                }
                 Ok(None) => break,
                 Err(e) => {
                     out.frame(Status::TooLarge as u8, Bytes::from(e.to_string()));
@@ -152,6 +190,12 @@ async fn serve_connection(stream: TcpStream, cache: &Cache) -> std::io::Result<(
             return Ok(());
         }
     }
+}
+
+/// Constant-time byte comparison, so a wrong token's reply time does not
+/// reveal how many leading bytes matched.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Route a request to the cache and append the response frame to `out`.
@@ -192,6 +236,11 @@ pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
             out.put_slice(&(keys.len() as u32).to_le_bytes());
             cache.del_many(keys, |found| out.put_slice(&[found as u8]));
         }),
+        // Already authenticated (or no token configured): a no-op.
+        Some(Op::Auth) => {
+            out.header(Status::Ok as u8, 0);
+            Ok(())
+        }
         None => {
             return out.frame(
                 Status::UnknownOp as u8,

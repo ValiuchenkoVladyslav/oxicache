@@ -15,6 +15,9 @@ struct Args {
     /// Server address.
     #[arg(long, default_value = "127.0.0.1:4433")]
     addr: SocketAddr,
+    /// Shared secret, if the server requires one.
+    #[arg(long, env = "OXICACHE_TOKEN", hide_env_values = true)]
+    token: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -56,9 +59,10 @@ enum Cmd {
 async fn main() -> Result<()> {
     oxicache_wire::io::tune_allocator();
     let args = Args::parse();
+    let token = args.token.as_deref().map(str::as_bytes);
     match args.cmd {
         Cmd::Get { keys } => {
-            let client = Client::connect(args.addr).await?;
+            let client = Client::connect_with_token(args.addr, token).await?;
             let vals = client.get(keys.iter().map(String::as_bytes)).await?;
             for (k, v) in keys.iter().zip(vals) {
                 match v {
@@ -71,7 +75,7 @@ async fn main() -> Result<()> {
             if kv.len() % 2 != 0 {
                 return Err("set expects key value pairs".into());
             }
-            let client = Client::connect(args.addr).await?;
+            let client = Client::connect_with_token(args.addr, token).await?;
             let pairs: Vec<(&[u8], &[u8])> = kv
                 .chunks(2)
                 .map(|c| (c[0].as_bytes(), c[1].as_bytes()))
@@ -80,7 +84,7 @@ async fn main() -> Result<()> {
             println!("OK ({} entries)", pairs.len());
         }
         Cmd::Del { keys } => {
-            let client = Client::connect(args.addr).await?;
+            let client = Client::connect_with_token(args.addr, token).await?;
             let flags = client.del(keys.iter().map(String::as_bytes)).await?;
             for (k, f) in keys.iter().zip(flags) {
                 println!("{k}: {}", if f { "deleted" } else { "(nil)" });
@@ -97,6 +101,7 @@ async fn main() -> Result<()> {
         } => {
             bench(
                 args.addr,
+                token,
                 conns,
                 pipeline,
                 batch,
@@ -114,6 +119,7 @@ async fn main() -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn bench(
     addr: SocketAddr,
+    token: Option<&[u8]>,
     conns: usize,
     pipeline: usize,
     batch: usize,
@@ -137,7 +143,7 @@ async fn bench(
 
     let mut clients = Vec::with_capacity(conns);
     for _ in 0..conns {
-        clients.push(Client::connect(addr).await?);
+        clients.push(Client::connect_with_token(addr, token).await?);
     }
     let start = Instant::now();
     let deadline = start + Duration::from_secs(seconds);

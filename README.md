@@ -25,8 +25,15 @@ entries   := u32 count, count × (u32 klen, key, u32 vlen, value)
 op 1 GET  body: keys     -> u32 count, count × (u8 0 | u8 1, u32 len, value)
 op 2 SET  body: entries  -> empty
 op 3 DEL  body: keys     -> u32 count, count × u8 found
-status    := 0 ok | 1 bad request | 2 unknown op | 3 too large (body = message)
+op 4 AUTH body: token    -> empty
+status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized (body = message)
 ```
+
+If the server is started with a token (`--token` or `OXICACHE_TOKEN`), AUTH must be the
+first request on every connection; anything else gets status 4 and the connection is closed.
+The client library does this in `Client::connect_with_token`, the CLI via `--token` /
+`OXICACHE_TOKEN`. The token travels in clear text — pair it with a private network or a TLS
+tunnel.
 
 ## Run
 
@@ -35,6 +42,7 @@ cargo run --release -p oxicache-server -- --bind 0.0.0.0:4433 --capacity 1G
 # --endpoints N   listeners sharing the port via SO_REUSEPORT (default: CPUs)
 # --per-core      one single-threaded runtime per endpoint (thread-per-core)
 # --shards N      independent S3-FIFO shards (default: CPUs)
+# --token T       require AUTH with this secret (or OXICACHE_TOKEN in the environment)
 
 cargo run --release -p oxicache-client -- set a 1 b 2
 cargo run --release -p oxicache-client -- get a b c

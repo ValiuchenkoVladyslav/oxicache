@@ -15,9 +15,13 @@
 //! op GET(1)   body: keys      -> u32 count, count × (u8 0 | u8 1, u32 len, value)
 //! op SET(2)   body: entries   -> empty
 //! op DEL(3)   body: keys      -> u32 count, count × u8 found
+//! op AUTH(4)  body: token     -> empty
 //! ```
 //!
-//! A non-OK status carries a UTF-8 message as its body.
+//! A non-OK status carries a UTF-8 message as its body. When the server is
+//! started with a token, AUTH must be the first request on a connection;
+//! any other request before a successful AUTH is answered with
+//! `Unauthorized` and the connection is closed.
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -33,6 +37,7 @@ pub enum Op {
     Get = 1,
     Set = 2,
     Del = 3,
+    Auth = 4,
 }
 
 impl Op {
@@ -41,6 +46,7 @@ impl Op {
             1 => Some(Op::Get),
             2 => Some(Op::Set),
             3 => Some(Op::Del),
+            4 => Some(Op::Auth),
             _ => None,
         }
     }
@@ -54,6 +60,7 @@ pub enum Status {
     BadRequest = 1,
     UnknownOp = 2,
     TooLarge = 3,
+    Unauthorized = 4,
 }
 
 impl Status {
@@ -63,6 +70,7 @@ impl Status {
             1 => Some(Status::BadRequest),
             2 => Some(Status::UnknownOp),
             3 => Some(Status::TooLarge),
+            4 => Some(Status::Unauthorized),
             _ => None,
         }
     }

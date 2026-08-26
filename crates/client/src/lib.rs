@@ -53,6 +53,22 @@ impl Drop for Connection {
 }
 
 impl Client {
+    /// Connect and, if `token` is given, authenticate before returning.
+    pub async fn connect_with_token(addr: SocketAddr, token: Option<&[u8]>) -> Result<Self> {
+        let client = Self::connect(addr).await?;
+        if let Some(t) = token {
+            client.auth(t).await?;
+        }
+        Ok(client)
+    }
+
+    /// Present the server's shared secret. Required once per connection when
+    /// the server was started with a token; a no-op otherwise.
+    pub async fn auth(&self, token: &[u8]) -> Result<()> {
+        self.call(Op::Auth, Bytes::copy_from_slice(token)).await?;
+        Ok(())
+    }
+
     pub async fn connect(addr: SocketAddr) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;

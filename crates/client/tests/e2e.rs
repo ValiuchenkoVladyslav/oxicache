@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use oxicache_client::{Client, Error};
-use oxicache_server::{Cache, Server};
+use oxicache_server::{Cache, Options, Server};
 use oxicache_wire::Status;
 
 async fn start() -> (Arc<Server>, Client) {
@@ -84,6 +84,60 @@ async fn bad_frame_reports_status() {
         oxicache_wire::decode_header(&hdr).0,
         Status::UnknownOp as u8
     );
+}
+
+#[tokio::test]
+async fn token_auth() {
+    let cache = Arc::new(Cache::new(64 << 20, 1));
+    let opts = Options {
+        endpoints: 1,
+        token: Some(b"s3cret".to_vec()),
+    };
+    let server = Arc::new(Server::bind_with("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
+    let s = server.clone();
+    tokio::spawn(async move { s.run().await });
+    let addr = server.local_addr();
+
+    // No auth: rejected and disconnected.
+    let c = Client::connect(addr).await.unwrap();
+    let err = c.get([&b"a"[..]]).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Status {
+                status: Status::Unauthorized,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(matches!(
+        c.get([&b"a"[..]]).await,
+        Err(Error::Closed | Error::Io(_))
+    ));
+
+    // Wrong token: rejected.
+    let c = Client::connect(addr).await.unwrap();
+    assert!(matches!(
+        c.auth(b"s3cre").await,
+        Err(Error::Status {
+            status: Status::Unauthorized,
+            ..
+        })
+    ));
+
+    // Right token, once per connection: everything works, including a
+    // redundant second AUTH.
+    let c = Client::connect_with_token(addr, Some(b"s3cret"))
+        .await
+        .unwrap();
+    c.set([(&b"a"[..], &b"1"[..])]).await.unwrap();
+    assert_eq!(
+        c.get([&b"a"[..]]).await.unwrap(),
+        vec![Some(Bytes::from_static(b"1"))]
+    );
+    c.auth(b"s3cret").await.unwrap();
+    assert_eq!(c.del([&b"a"[..]]).await.unwrap(), vec![true]);
 }
 
 #[tokio::test]

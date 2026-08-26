@@ -30,6 +30,10 @@ struct Args {
     /// Run each listener on its own single-threaded runtime (thread-per-core).
     #[arg(long)]
     per_core: bool,
+    /// Shared secret clients must present once per connection (AUTH frame).
+    /// Unset or empty disables authentication.
+    #[arg(long, env = "OXICACHE_TOKEN", hide_env_values = true)]
+    token: Option<String>,
 }
 
 fn parse_size(s: &str) -> Result<usize> {
@@ -58,11 +62,14 @@ async fn main() -> Result<()> {
         .shards
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let cache = Arc::new(Cache::new(args.capacity, shards));
+    let token = args.token.filter(|t| !t.is_empty()).map(String::into_bytes);
+    let auth = token.is_some();
     let opts = Options {
         endpoints: args.endpoints.unwrap_or(shards),
+        token,
     };
     let server = Arc::new(Server::bind_with(args.bind, cache, opts)?);
-    info!(capacity = args.capacity, shards, "cache ready");
+    info!(capacity = args.capacity, shards, auth, "cache ready");
 
     if args.per_core {
         let s = server.clone();
