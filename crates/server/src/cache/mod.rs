@@ -87,8 +87,7 @@ impl Cache {
 
     #[inline]
     pub fn set(&self, key: &[u8], value: &[u8]) {
-        let (shard, hash) = self.locate(key);
-        shard.set(key, value, hash, &epoch::pin());
+        self.set_many([(key, value)]);
     }
 
     /// Store many entries under a single epoch pin.
@@ -97,16 +96,40 @@ impl Cache {
         I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
     {
         let guard = epoch::pin();
+        let mut retired = false;
         for (k, v) in entries {
             let (shard, hash) = self.locate(k);
-            shard.set(k, v, hash, &guard);
+            retired |= shard.set(k, v, hash, &guard);
+        }
+        if retired {
+            collect(&guard);
         }
     }
 
     #[inline]
     pub fn del(&self, key: &[u8]) -> bool {
-        let (shard, hash) = self.locate(key);
-        shard.del(hash, key)
+        let mut found = false;
+        self.del_many([key], |f| found = f);
+        found
+    }
+
+    /// Delete many keys under a single epoch pin, reporting each result to `f`.
+    pub fn del_many<'a, I, F>(&self, keys: I, mut f: F)
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+        F: FnMut(bool),
+    {
+        let guard = epoch::pin();
+        let mut retired = false;
+        for k in keys {
+            let (shard, hash) = self.locate(k);
+            let found = shard.del(hash, k, &guard);
+            retired |= found;
+            f(found);
+        }
+        if retired {
+            collect(&guard);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -120,6 +143,15 @@ impl Cache {
     pub fn used_bytes(&self) -> usize {
         self.shards.iter().map(Shard::used_bytes).sum()
     }
+}
+
+/// Hand this thread's retired entries to the collector and reclaim what is
+/// already safe. The collector otherwise runs only every 128 pins and frees
+/// at most 8 bags then, which a batch of replacements outpaces many times
+/// over; without this a write-heavy load grows without bound.
+#[inline]
+fn collect(guard: &epoch::Guard) {
+    guard.flush();
 }
 
 #[cfg(test)]

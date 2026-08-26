@@ -190,9 +190,7 @@ pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
         Some(Op::Del) => wire::keys(body).map(|keys| {
             out.header(Status::Ok as u8, 4 + keys.len());
             out.put_slice(&(keys.len() as u32).to_le_bytes());
-            for k in keys {
-                out.put_slice(&[cache.del(k) as u8]);
-            }
+            cache.del_many(keys, |found| out.put_slice(&[found as u8]));
         }),
         None => {
             return out.frame(

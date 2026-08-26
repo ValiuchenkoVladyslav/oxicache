@@ -13,7 +13,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 
-use crossbeam_epoch::{self as epoch, Guard};
+use crossbeam_epoch::Guard;
 use parking_lot::Mutex;
 use triomphe::ThinArc;
 
@@ -222,9 +222,12 @@ impl Shard {
         self.index.len()
     }
 
-    pub fn set(&self, key: &[u8], value: &[u8], hash: u64, guard: &Guard) {
+    /// Insert or replace. Returns whether any entry was retired (replaced or
+    /// evicted) under `guard`.
+    pub fn set(&self, key: &[u8], value: &[u8], hash: u64, guard: &Guard) -> bool {
         let entry = Entry::new(Key::new(key), value, hash);
         let cost = entry.cost();
+        let mut retired = false;
 
         let mut q = self.q.lock();
         while q.used + cost > self.capacity {
@@ -238,10 +241,12 @@ impl Shard {
             if !evicted {
                 break;
             }
+            retired = true;
         }
         if let Some(old) = self.index.insert(&mut q.w, hash, entry.clone(), guard) {
             self.kill(&mut q, &old);
             retire(old, guard);
+            retired = true;
         }
         q.used += cost;
         if q.ghost.take(hash) {
@@ -251,16 +256,16 @@ impl Shard {
             q.small.push_back(entry);
         }
         self.maybe_compact(&mut q);
+        retired
     }
 
-    pub fn del(&self, hash: u64, key: &[u8]) -> bool {
-        let guard = epoch::pin();
+    pub fn del(&self, hash: u64, key: &[u8], guard: &Guard) -> bool {
         let mut q = self.q.lock();
-        let Some(e) = self.index.remove(&mut q.w, hash, key, &guard) else {
+        let Some(e) = self.index.remove(&mut q.w, hash, key, guard) else {
             return false;
         };
         self.kill(&mut q, &e);
-        retire(e, &guard);
+        retire(e, guard);
         self.maybe_compact(&mut q);
         true
     }
@@ -331,16 +336,36 @@ impl Shard {
         if q.dead_bytes <= self.capacity / 4 {
             return;
         }
-        q.small.retain(|e| e.live().load(Relaxed));
-        q.main.retain(|e| e.live().load(Relaxed));
+        compact(&mut q.small);
+        compact(&mut q.main);
         q.small_bytes = q.small.iter().map(|e| e.cost()).sum();
         q.dead_bytes = 0;
     }
 }
 
+/// Stable in-place removal of dead entries. Each liveness check dereferences
+/// an entry, so the walk prefetches a few entries ahead to overlap the misses.
+fn compact(q: &mut VecDeque<Entry>) {
+    const AHEAD: usize = 8;
+    let s = q.make_contiguous();
+    let n = s.len();
+    let mut w = 0;
+    for i in 0..n {
+        if let Some(e) = s.get(i + AHEAD) {
+            e.prefetch();
+        }
+        if s[i].live().load(Relaxed) {
+            s.swap(w, i);
+            w += 1;
+        }
+    }
+    q.truncate(w);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossbeam_epoch as epoch;
 
     fn shard(cap: usize) -> Shard {
         Shard::new(cap)
@@ -367,7 +392,7 @@ mod tests {
     }
 
     fn del(s: &Shard, k: &[u8]) -> bool {
-        s.del(h(k), k)
+        s.del(h(k), k, &epoch::pin())
     }
 
     #[test]
