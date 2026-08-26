@@ -1,6 +1,6 @@
-//! One S3-FIFO shard: the FIFO queues (small, main, ghost) for a slice of
-//! the key space, guarded by a mutex. The index itself is the cache-wide
-//! [`Map`]; this module only decides what stays in it.
+//! One S3-FIFO shard: the cuckoo [`Index`] for a slice of the key space plus
+//! the FIFO queues (small, main, ghost) that decide what stays in it. The
+//! queues and the index's single writer are guarded by one mutex.
 //!
 //! Reads never take the mutex: they hit the index and bump a relaxed atomic
 //! frequency counter (capped at 3). Writes take a short critical section to
@@ -13,11 +13,12 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 
+use crossbeam_epoch::{self as epoch, Guard};
 use parking_lot::Mutex;
 use triomphe::ThinArc;
 
 use super::key::Key;
-use super::map::Map;
+use super::table::{EntryRef, Index, Writer, retire};
 
 /// Maximum frequency value tracked per entry.
 const FREQ_CAP: u8 = 3;
@@ -48,7 +49,7 @@ impl AsRef<[u8]> for Entry {
 }
 
 impl Entry {
-    fn new(key: Key, value: &[u8], hash: u64) -> Self {
+    pub(super) fn new(key: Key, value: &[u8], hash: u64) -> Self {
         let meta = Meta {
             key,
             hash,
@@ -101,8 +102,27 @@ impl Entry {
     }
 
     #[inline]
-    fn hash(&self) -> u64 {
+    pub(super) fn hash(&self) -> u64 {
         self.meta().hash
+    }
+
+    #[inline]
+    pub(super) fn into_raw(self) -> *const std::ffi::c_void {
+        self.0.into_raw()
+    }
+
+    /// # Safety
+    /// `p` must come from [`Entry::into_raw`] and the handle must not be
+    /// reconstructed more times than it was leaked (use `ManuallyDrop` for
+    /// borrowed views).
+    #[inline]
+    pub(super) unsafe fn from_raw(p: *const std::ffi::c_void) -> Self {
+        Self(unsafe { ThinArc::from_raw(p) })
+    }
+
+    #[inline]
+    pub(super) fn as_ptr(&self) -> *const std::ffi::c_void {
+        self.0.heap_ptr()
     }
 
     #[inline]
@@ -146,6 +166,8 @@ impl Ghost {
 }
 
 struct Queues {
+    /// Proof of exclusive index write access; lives inside the mutex.
+    w: Writer,
     small: VecDeque<Entry>,
     main: VecDeque<Entry>,
     ghost: Ghost,
@@ -158,6 +180,7 @@ struct Queues {
 }
 
 pub struct Shard {
+    index: Index,
     q: Mutex<Queues>,
     capacity: usize,
     small_capacity: usize,
@@ -167,7 +190,9 @@ impl Shard {
     /// `capacity` is the byte budget of live entries; the small queue gets 10%.
     pub fn new(capacity: usize) -> Self {
         Self {
+            index: Index::new(),
             q: Mutex::new(Queues {
+                w: Writer::new(),
                 small: VecDeque::new(),
                 main: VecDeque::new(),
                 ghost: Ghost {
@@ -183,9 +208,22 @@ impl Shard {
         }
     }
 
-    pub fn set(&self, map: &Map, key: &[u8], value: &[u8], hash: u64) {
-        let key = Key::new(key);
-        let entry = Entry::new(key.clone(), value, hash);
+    #[inline]
+    pub fn prefetch(&self, hash: u64, guard: &Guard) {
+        self.index.prefetch(hash, guard);
+    }
+
+    #[inline]
+    pub fn get<'g>(&self, hash: u64, key: &[u8], guard: &'g Guard) -> Option<EntryRef<'g>> {
+        self.index.get(hash, key, guard)
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn set(&self, key: &[u8], value: &[u8], hash: u64, guard: &Guard) {
+        let entry = Entry::new(Key::new(key), value, hash);
         let cost = entry.cost();
 
         let mut q = self.q.lock();
@@ -193,16 +231,17 @@ impl Shard {
             // Not identical: eviction order differs, which is the whole point of S3-FIFO.
             #[allow(clippy::if_same_then_else)]
             let evicted = if q.small_bytes >= self.small_capacity {
-                self.evict_small(map, &mut q) || self.evict_main(map, &mut q)
+                self.evict_small(&mut q, guard) || self.evict_main(&mut q, guard)
             } else {
-                self.evict_main(map, &mut q) || self.evict_small(map, &mut q)
+                self.evict_main(&mut q, guard) || self.evict_small(&mut q, guard)
             };
             if !evicted {
                 break;
             }
         }
-        if let Some(old) = map.insert(key, entry.clone()) {
+        if let Some(old) = self.index.insert(&mut q.w, hash, entry.clone(), guard) {
             self.kill(&mut q, &old);
+            retire(old, guard);
         }
         q.used += cost;
         if q.ghost.take(hash) {
@@ -214,12 +253,14 @@ impl Shard {
         self.maybe_compact(&mut q);
     }
 
-    pub fn del(&self, map: &Map, key: &[u8]) -> bool {
-        let Some(e) = map.remove(key) else {
+    pub fn del(&self, hash: u64, key: &[u8]) -> bool {
+        let guard = epoch::pin();
+        let mut q = self.q.lock();
+        let Some(e) = self.index.remove(&mut q.w, hash, key, &guard) else {
             return false;
         };
-        let mut q = self.q.lock();
         self.kill(&mut q, &e);
+        retire(e, &guard);
         self.maybe_compact(&mut q);
         true
     }
@@ -237,7 +278,7 @@ impl Shard {
         }
     }
 
-    fn evict_small(&self, map: &Map, q: &mut Queues) -> bool {
+    fn evict_small(&self, q: &mut Queues, guard: &Guard) -> bool {
         let Some(e) = q.small.pop_front() else {
             return false;
         };
@@ -249,7 +290,9 @@ impl Shard {
             e.freq().store(0, Relaxed);
             q.main.push_back(e);
         } else {
-            map.remove_if_same(e.key(), &e);
+            if let Some(h) = self.index.remove_if_same(&mut q.w, e.hash(), &e, guard) {
+                retire(h, guard);
+            }
             e.live().store(false, Relaxed);
             q.used -= cost;
             let limit = q.main.len();
@@ -258,7 +301,7 @@ impl Shard {
         true
     }
 
-    fn evict_main(&self, map: &Map, q: &mut Queues) -> bool {
+    fn evict_main(&self, q: &mut Queues, guard: &Guard) -> bool {
         loop {
             let Some(e) = q.main.pop_front() else {
                 return false;
@@ -274,7 +317,9 @@ impl Shard {
                 q.main.push_back(e);
                 continue;
             }
-            map.remove_if_same(e.key(), &e);
+            if let Some(h) = self.index.remove_if_same(&mut q.w, e.hash(), &e, guard) {
+                retire(h, guard);
+            }
             e.live().store(false, Relaxed);
             q.used -= cost;
             return true;
@@ -297,53 +342,46 @@ impl Shard {
 mod tests {
     use super::*;
 
-    struct T {
-        map: Map,
-        s: Shard,
+    fn shard(cap: usize) -> Shard {
+        Shard::new(cap)
     }
 
-    impl T {
-        fn get(&self, k: &[u8]) -> Option<Vec<u8>> {
-            self.map.get(k).map(|e| e.value().to_vec())
-        }
-        fn set(&self, k: &[u8], v: &[u8], hash: u64) {
-            self.s.set(&self.map, k, v, hash)
-        }
-        fn del(&self, k: &[u8]) -> bool {
-            self.s.del(&self.map, k)
-        }
-        fn len(&self) -> usize {
-            self.map.len()
-        }
-    }
-
-    fn shard(cap: usize) -> T {
-        T {
-            map: Map::new(),
-            s: Shard::new(cap),
-        }
+    fn h(k: &[u8]) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut s = foldhash::fast::FixedState::default().build_hasher();
+        s.write(k);
+        s.finish()
     }
 
     fn key(i: usize) -> Vec<u8> {
         format!("key-{i:06}").into_bytes()
     }
 
-    fn set(t: &T, i: usize, vlen: usize) {
-        t.set(&key(i), &vec![0u8; vlen], i as u64);
+    fn set(s: &Shard, i: usize, vlen: usize) {
+        s.set(&key(i), &vec![0u8; vlen], h(&key(i)), &epoch::pin());
+    }
+
+    fn get(s: &Shard, k: &[u8]) -> Option<Vec<u8>> {
+        let g = epoch::pin();
+        s.get(h(k), k, &g).map(|e| e.value().to_vec())
+    }
+
+    fn del(s: &Shard, k: &[u8]) -> bool {
+        s.del(h(k), k)
     }
 
     #[test]
     fn get_set_del() {
         let s = shard(1 << 20);
-        assert!(s.get(b"a").is_none());
-        s.set(b"a", b"1", 1);
-        assert_eq!(s.get(b"a").as_deref(), Some(&b"1"[..]));
-        s.set(b"a", b"2", 1);
-        assert_eq!(s.get(b"a").as_deref(), Some(&b"2"[..]));
-        assert!(s.del(b"a"));
-        assert!(!s.del(b"a"));
-        assert!(s.get(b"a").is_none());
-        assert_eq!(s.s.used_bytes(), 0);
+        assert!(get(&s, b"a").is_none());
+        s.set(b"a", b"1", h(b"a"), &epoch::pin());
+        assert_eq!(get(&s, b"a").as_deref(), Some(&b"1"[..]));
+        s.set(b"a", b"2", h(b"a"), &epoch::pin());
+        assert_eq!(get(&s, b"a").as_deref(), Some(&b"2"[..]));
+        assert!(del(&s, b"a"));
+        assert!(!del(&s, b"a"));
+        assert!(get(&s, b"a").is_none());
+        assert_eq!(s.used_bytes(), 0);
     }
 
     #[test]
@@ -353,10 +391,10 @@ mod tests {
         for i in 0..1000 {
             set(&s, i, 100);
         }
-        assert!(s.s.used_bytes() <= cap);
+        assert!(s.used_bytes() <= cap);
         assert!(s.len() <= 100 && s.len() >= 90);
-        assert!(s.get(&key(999)).is_some());
-        assert!(s.get(&key(0)).is_none());
+        assert!(get(&s, &key(999)).is_some());
+        assert!(get(&s, &key(0)).is_none());
     }
 
     #[test]
@@ -368,13 +406,14 @@ mod tests {
         }
         for _ in 0..3 {
             for i in 0..10 {
-                s.map.get(&key(i)).unwrap().touch();
+                let g = epoch::pin();
+                s.get(h(&key(i)), &key(i), &g).unwrap().touch();
             }
         }
         for i in 10..2000 {
             set(&s, i, 100);
         }
-        let survivors = (0..10).filter(|&i| s.get(&key(i)).is_some()).count();
+        let survivors = (0..10).filter(|&i| get(&s, &key(i)).is_some()).count();
         assert_eq!(
             survivors, 10,
             "hot keys should be promoted to main and survive a scan"
@@ -389,10 +428,10 @@ mod tests {
         for i in 1..150 {
             set(&s, i, 100);
         }
-        assert!(s.get(&key(0)).is_none());
+        assert!(get(&s, &key(0)).is_none());
         set(&s, 0, 100);
         assert!(
-            s.s.q.lock().main.iter().any(|e| e.key() == key(0)),
+            s.q.lock().main.iter().any(|e| e.key() == key(0)),
             "ghost hit should insert into main"
         );
     }
@@ -405,10 +444,10 @@ mod tests {
             set(&s, i, 100);
         }
         for i in 0..100 {
-            assert!(s.del(&key(i)));
+            assert!(del(&s, &key(i)));
         }
-        assert_eq!(s.s.used_bytes(), 0);
-        let q = s.s.q.lock();
+        assert_eq!(s.used_bytes(), 0);
+        let q = s.q.lock();
         assert!(
             q.dead_bytes <= cap / 4,
             "compaction should bound dead bytes"
@@ -421,8 +460,8 @@ mod tests {
         let s = shard(1000);
         set(&s, 0, 100);
         set(&s, 1, 5000);
-        assert!(s.get(&key(0)).is_none());
-        assert!(s.get(&key(1)).is_some());
+        assert!(get(&s, &key(0)).is_none());
+        assert!(get(&s, &key(1)).is_some());
         assert_eq!(s.len(), 1);
     }
 
@@ -437,11 +476,11 @@ mod tests {
                         let k = (i * 7 + t) % 2000;
                         match i % 10 {
                             0..=6 => {
-                                s.get(&key(k));
+                                get(&s, &key(k));
                             }
                             7 | 8 => set(&s, k, 64),
                             _ => {
-                                s.del(&key(k));
+                                del(&s, &key(k));
                             }
                         }
                     }
@@ -451,8 +490,8 @@ mod tests {
         for t in threads {
             t.join().unwrap();
         }
-        assert!(s.s.used_bytes() <= 200 * 1024);
-        let q = s.s.q.lock();
+        assert!(s.used_bytes() <= 200 * 1024);
+        let q = s.q.lock();
         let live: usize = q
             .small
             .iter()

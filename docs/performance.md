@@ -179,3 +179,30 @@ chunks over 1032 bytes (`unlink_chunk` + `_int_malloc` ≈ 20 % of user time on 
 alternating min-of-3: 7.2 vs 7.2 µs/req (497k vs 496k req/s) read-heavy, 38.2 vs 38.4 µs on
 1 KiB 50/50 — identical. Hashing a 14-byte key is a few nanoseconds either way; the lookup
 cost is the memory latency after the hash. foldhash stays (seeded, HashDoS-resistant).
+
+## Round 6: cuckoo index (2026-08-26)
+
+Replaced dashmap with a per-shard cuckoo hash index (`crates/server/src/cache/table.rs`):
+eight 8-byte slots per 64-byte bucket, slot = 16-bit tag | 48-bit entry pointer, two
+candidate buckets per key computable from the hash, lock-free readers under a
+crossbeam-epoch pin taken once per batch, single writer under the existing shard mutex,
+copy-before-clear displacement. The lookup chain shrinks from control bytes → bucket → entry
+to bucket → entry, and a batch prefetches every key's two buckets up front.
+
+Server CPU per request, user / sys, min of 3 alternating runs, same client binary:
+
+| profile | dashmap (user / sys) | cuckoo (user / sys) | user delta |
+|---|---|---|---|
+| 8×16, 128 B, 10 % writes | 7.1 total | 6.1 total | **−14 %** (498k → 508k req/s) |
+| 8×16, 1 KiB, 50 % writes | 23.8 / 14.2 | 19.8 / 20.0 | **−17 %** (132k → 144k req/s) |
+| 12×32, 4 KiB, 90 % writes | 67.6 / 61.9 | 50.4 / 91.0 | **−25 %** (41k → 42k req/s) |
+| 64×2, 128 B, 10 % writes | 10.8 total | 10.1 total | −6 % |
+
+The sys-time increase on the write profiles is the loopback batching effect (a faster
+server receives smaller pipelined bursts, so more syscalls per request); user time, which
+is what the index change affects, fell on every profile. `set` pins the epoch once per
+request (`Cache::set_many`). Memory is unchanged (±2 % RSS).
+
+What remains on the write path (perf, 4 KiB writes): memmove of values 39 %, `Table::find`
+18 % (the existence check on insert dereferences the entry to compare keys), dead-entry
+compaction 8 %, glibc large-chunk malloc/free ~15 %.

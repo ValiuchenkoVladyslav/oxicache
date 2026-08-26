@@ -1,19 +1,20 @@
-//! S3-FIFO cache: one lock-free index for all keys, and eviction state
-//! sharded by key hash. Keys are hashed once; the top bits pick a shard and
-//! the full hash feeds that shard's ghost queue.
+//! S3-FIFO cache. Keys are hashed once; the top bits pick a shard, which owns
+//! both the cuckoo index for its keys and the S3-FIFO queues that decide what
+//! stays in it. Batch reads pin an epoch once and prefetch every key's
+//! candidate buckets before reading any of them.
 
 mod key;
-mod map;
 mod s3fifo;
+mod table;
 
 use std::hash::{BuildHasher, Hasher};
 
-use map::Map;
+use crossbeam_epoch as epoch;
 pub use s3fifo::Entry;
 use s3fifo::Shard;
+pub use table::EntryRef;
 
 pub struct Cache {
-    map: Map,
     shards: Box<[Shard]>,
     shift: u32,
     hasher: foldhash::fast::RandomState,
@@ -21,12 +22,11 @@ pub struct Cache {
 
 impl Cache {
     /// Build a cache with `capacity` bytes split across `shards` (rounded up
-    /// to a power of two) independent S3-FIFO eviction shards.
+    /// to a power of two) independent S3-FIFO shards.
     pub fn new(capacity: usize, shards: usize) -> Self {
         let n = shards.max(1).next_power_of_two();
         let per = capacity / n;
         Self {
-            map: Map::new(),
             shards: (0..n).map(|_| Shard::new(per)).collect(),
             shift: 64 - n.trailing_zeros(),
             hasher: foldhash::fast::RandomState::default(),
@@ -46,30 +46,36 @@ impl Cache {
         (&self.shards[idx], hash)
     }
 
-    /// Look up one key. The returned entry keeps the value alive; read it
-    /// with [`Entry::value`].
+    /// Look up one key. The returned handle keeps the value alive.
     #[inline]
     pub fn get(&self, key: &[u8]) -> Option<Entry> {
-        let e = self.map.get(key)?;
+        let (shard, hash) = self.locate(key);
+        let guard = epoch::pin();
+        let e = shard.get(hash, key, &guard)?;
         e.touch();
-        Some(e)
+        Some(Entry::clone(&e))
     }
 
     /// Look up many keys and hand the resolved entries (in key order) to `f`.
-    /// Lookups run in two passes so the cache misses of independent keys
-    /// overlap: the first resolves entries and prefetches them, the second
-    /// (inside `f`) reads them. The entries stay valid until `f` returns.
+    /// One epoch pin covers the batch; no refcounts are touched. Candidate
+    /// buckets for every key are prefetched first, then the entries, so the
+    /// memory accesses of independent keys overlap.
     #[inline]
     pub fn get_many<'a, I, F, R>(&self, keys: I, f: F) -> R
     where
         I: IntoIterator<Item = &'a [u8]>,
-        F: FnOnce(&[Option<map::EntryRef<'_>>]) -> R,
+        F: FnOnce(&[Option<EntryRef<'_>>]) -> R,
     {
-        let reader = self.map.read();
-        let mut found: smallvec::SmallVec<[Option<map::EntryRef<'_>>; 32]> =
-            smallvec::SmallVec::new();
+        let guard = epoch::pin();
+        let mut located: smallvec::SmallVec<[(&Shard, u64, &[u8]); 32]> = smallvec::SmallVec::new();
         for k in keys {
-            let e = reader.get(k);
+            let (shard, hash) = self.locate(k);
+            shard.prefetch(hash, &guard);
+            located.push((shard, hash, k));
+        }
+        let mut found: smallvec::SmallVec<[Option<EntryRef<'_>>; 32]> = smallvec::SmallVec::new();
+        for (shard, hash, k) in located {
+            let e = shard.get(hash, k, &guard);
             if let Some(e) = &e {
                 e.prefetch();
                 e.touch();
@@ -82,16 +88,29 @@ impl Cache {
     #[inline]
     pub fn set(&self, key: &[u8], value: &[u8]) {
         let (shard, hash) = self.locate(key);
-        shard.set(&self.map, key, value, hash);
+        shard.set(key, value, hash, &epoch::pin());
+    }
+
+    /// Store many entries under a single epoch pin.
+    pub fn set_many<'a, I>(&self, entries: I)
+    where
+        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    {
+        let guard = epoch::pin();
+        for (k, v) in entries {
+            let (shard, hash) = self.locate(k);
+            shard.set(k, v, hash, &guard);
+        }
     }
 
     #[inline]
     pub fn del(&self, key: &[u8]) -> bool {
-        self.locate(key).0.del(&self.map, key)
+        let (shard, hash) = self.locate(key);
+        shard.del(hash, key)
     }
 
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.shards.iter().map(Shard::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -116,8 +135,8 @@ mod tests {
         }
         assert_eq!(c.len(), 10_000);
         assert!(
-            c.shards.iter().all(|s| s.used_bytes() > 0),
-            "hash should distribute keys over shards"
+            c.shards.iter().all(|s| s.len() > 300),
+            "hash should distribute keys evenly"
         );
         assert_eq!(
             c.get(b"42").map(|e| e.value().to_vec()).as_deref(),

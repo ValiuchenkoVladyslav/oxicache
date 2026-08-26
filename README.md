@@ -44,10 +44,14 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
 
 ## Design
 
-- One concurrent index (dashmap) holds
-  every key: short keys inline in the bucket, each value a single `ThinArc` allocation
-  carrying refcount, metadata and bytes. Batch gets resolve all keys first and prefetch
-  their entries so the cache misses of independent keys overlap.
+- Per-shard cuckoo hash index: buckets are one cache line of eight slots, each slot a
+  16-bit hash tag plus the 48-bit address of a `ThinArc` entry (refcount, metadata, key,
+  value in one allocation). A lookup is bucket → entry, two dependent memory accesses; both
+  candidate buckets derive from the hash alone, so a batch get prefetches all of them
+  before touching any, then all entries. Tags reject absent keys without an entry access.
+- Readers pin an epoch (crossbeam-epoch) once per batch and borrow entries under it — no
+  locks and no refcount traffic per key. The shard mutex is the single writer; cuckoo
+  displacement copies before it clears, so a present key is never invisible.
 - Keys hash once (foldhash); top bits pick one of N S3-FIFO shards (default: CPU count),
   each a mutex over its small/main/ghost queues, used only by writes and eviction. Reads
   never lock; they bump a relaxed atomic frequency counter capped at 3.

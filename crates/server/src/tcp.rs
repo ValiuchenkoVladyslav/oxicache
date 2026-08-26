@@ -182,11 +182,9 @@ pub fn dispatch(op: u8, body: Bytes, cache: &Cache, out: &mut FrameWriter) {
             })
         }),
         Some(Op::Set) => wire::decode_entries(body).map(|entries| {
-            for (k, v) in entries {
-                // The cache copies key and value into its own allocation, so the
-                // request body is released as soon as this returns.
-                cache.set(&k, &v);
-            }
+            // The cache copies key and value into its own allocation, so the
+            // request body is released as soon as this returns.
+            cache.set_many(entries.iter().map(|(k, v)| (&k[..], &v[..])));
             out.header(Status::Ok as u8, 0);
         }),
         Some(Op::Del) => wire::decode_keys(body).map(|keys| {

@@ -84,3 +84,6 @@ entry, which costs ~20 % on inserts; dashmap keeps entries inline in the bucket.
 
 Update 2026-08-26: the papaya feature was removed; with prefetching batch lookups dashmap led on
 every profile, so there was no deployment where papaya was the better choice.
+
+Update 2026-08-26: dashmap itself was replaced by a custom per-shard cuckoo index (see
+docs/performance.md, round 6): −14 % user CPU on reads, −17…−25 % on writes.
