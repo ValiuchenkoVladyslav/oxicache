@@ -27,9 +27,6 @@ struct Args {
     /// Listeners sharing the port via SO_REUSEPORT (default: available CPUs).
     #[arg(long)]
     endpoints: Option<usize>,
-    /// Run each listener on its own single-threaded runtime (thread-per-core).
-    #[arg(long)]
-    per_core: bool,
     /// Shared secret clients must present once per connection (AUTH frame).
     /// Unset or empty disables authentication.
     #[arg(long, env = "OXICACHE_TOKEN", hide_env_values = true)]
@@ -71,15 +68,9 @@ async fn main() -> Result<()> {
     let server = Arc::new(Server::bind_with(args.bind, cache, opts)?);
     info!(capacity = args.capacity, shards, auth, "cache ready");
 
-    if args.per_core {
-        let s = server.clone();
-        std::thread::spawn(move || s.run_per_core());
-        tokio::signal::ctrl_c().await?;
-    } else {
-        tokio::select! {
-            _ = server.run() => {}
-            _ = tokio::signal::ctrl_c() => {}
-        }
+    tokio::select! {
+        _ = server.run() => {}
+        _ = tokio::signal::ctrl_c() => {}
     }
     info!("shutting down");
     Ok(())

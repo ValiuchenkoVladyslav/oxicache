@@ -89,32 +89,6 @@ impl Server {
         }
         while tasks.join_next().await.is_some() {}
     }
-
-    /// Thread-per-core mode: every listener gets its own OS thread running a
-    /// single-threaded tokio runtime, so a connection never crosses threads.
-    /// Blocks the calling thread.
-    pub fn run_per_core(&self) {
-        info!(addr = %self.local_addr(), endpoints = self.listeners.len(), "listening (tcp, thread-per-core)");
-        std::thread::scope(|scope| {
-            for (i, l) in self.listeners.iter().enumerate() {
-                let (l, cache, token) = (
-                    l.try_clone().expect("clone listener"),
-                    self.cache.clone(),
-                    self.token.clone(),
-                );
-                std::thread::Builder::new()
-                    .name(format!("oxicache-{i}"))
-                    .spawn_scoped(scope, move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("runtime");
-                        rt.block_on(accept_loop(l, cache, token));
-                    })
-                    .expect("spawn listener thread");
-            }
-        });
-    }
 }
 
 fn tcp_listener(addr: SocketAddr, reuse_port: bool) -> std::io::Result<std::net::TcpListener> {
