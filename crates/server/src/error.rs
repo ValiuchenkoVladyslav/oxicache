@@ -7,8 +7,6 @@ pub enum Error {
         addr: SocketAddr,
         source: std::io::Error,
     },
-    #[error("endpoint count must be at least 1")]
-    NoEndpoints,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

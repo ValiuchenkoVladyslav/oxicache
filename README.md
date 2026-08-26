@@ -39,7 +39,6 @@ tunnel.
 
 ```sh
 cargo run --release -p oxicache-server -- --bind 0.0.0.0:4433 --capacity 1G
-# --endpoints N   listeners sharing the port via SO_REUSEPORT (default: CPUs)
 # --shards N      independent S3-FIFO shards (default: CPUs)
 # --token T       require AUTH with this secret (or OXICACHE_TOKEN in the environment)
 
@@ -69,7 +68,7 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
   the queue head, with compaction once dead bytes exceed 25 % of the shard budget.
 - One tokio task per TCP connection; requests are handled inline and answered in order,
   responses are flushed once no more input is buffered (one write per pipelined batch).
-  `--endpoints` binds one listener per CPU with `SO_REUSEPORT`.
+  One listener; accepted connections are spread over the runtime's worker threads.
 - The client pipelines calls from any number of tasks onto one connection (writer task
   coalesces queued frames into one flush; reader task matches responses in order).
 - Build-time option: `--features mimalloc` — ~8 % less CPU on small-value read-heavy loads for

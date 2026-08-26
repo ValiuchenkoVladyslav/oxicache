@@ -90,7 +90,6 @@ async fn bad_frame_reports_status() {
 async fn token_auth() {
     let cache = Arc::new(Cache::new(64 << 20, 1));
     let opts = Options {
-        endpoints: 1,
         token: Some(b"s3cret".to_vec()),
     };
     let server = Arc::new(Server::bind_with("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());

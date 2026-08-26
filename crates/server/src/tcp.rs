@@ -22,82 +22,52 @@ use crate::error::{Error, Result};
 /// Largest request body accepted.
 pub const MAX_FRAME: usize = 64 << 20;
 
-/// Transport tuning for [`Server::bind_with`].
-#[derive(Clone, Debug)]
+/// Settings for [`Server::bind_with`].
+#[derive(Clone, Debug, Default)]
 pub struct Options {
-    /// Number of listeners sharing the port via `SO_REUSEPORT`, so the kernel
-    /// spreads connections over independent accept loops.
-    pub endpoints: usize,
     /// Shared secret every connection must present in an `Auth` frame before
     /// its first request; `None` disables authentication.
     pub token: Option<Vec<u8>>,
 }
 
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            endpoints: 1,
-            token: None,
-        }
-    }
-}
-
 pub struct Server {
-    listeners: Vec<std::net::TcpListener>,
+    listener: std::net::TcpListener,
     cache: Arc<Cache>,
     token: Option<Arc<[u8]>>,
 }
 
 impl Server {
-    /// Bind a single listener on `addr` serving `cache`.
+    /// Bind `addr` serving `cache`, without authentication.
     pub fn bind(addr: SocketAddr, cache: Arc<Cache>) -> Result<Self> {
         Self::bind_with(addr, cache, Options::default())
     }
 
     /// Bind with explicit [`Options`].
     pub fn bind_with(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
-        if opts.endpoints == 0 {
-            return Err(Error::NoEndpoints);
-        }
-        let bind = |source| Error::Bind { addr, source };
-        let mut listeners = Vec::with_capacity(opts.endpoints);
-        let mut bound = addr;
-        for _ in 0..opts.endpoints {
-            let l = tcp_listener(bound, opts.endpoints > 1).map_err(bind)?;
-            // Port 0 must resolve once so every listener shares the same port.
-            bound = l.local_addr().map_err(bind)?;
-            listeners.push(l);
-        }
+        let listener = tcp_listener(addr).map_err(|source| Error::Bind { addr, source })?;
         Ok(Self {
-            listeners,
+            listener,
             cache,
             token: opts.token.map(Arc::from),
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
-        self.listeners[0].local_addr().expect("bound listener")
+        self.listener.local_addr().expect("bound listener")
     }
 
     /// Accept connections on the current runtime until the task is dropped.
     pub async fn run(&self) {
-        info!(addr = %self.local_addr(), endpoints = self.listeners.len(), "listening (tcp)");
-        let mut tasks = tokio::task::JoinSet::new();
-        for l in &self.listeners {
-            let l = l.try_clone().expect("clone listener");
-            tasks.spawn(accept_loop(l, self.cache.clone(), self.token.clone()));
-        }
-        while tasks.join_next().await.is_some() {}
+        info!(addr = %self.local_addr(), "listening (tcp)");
+        let l = self.listener.try_clone().expect("clone listener");
+        accept_loop(l, self.cache.clone(), self.token.clone()).await;
     }
 }
 
-fn tcp_listener(addr: SocketAddr, reuse_port: bool) -> std::io::Result<std::net::TcpListener> {
+fn tcp_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
-    if reuse_port {
-        socket.set_reuse_port(true)?;
-    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
