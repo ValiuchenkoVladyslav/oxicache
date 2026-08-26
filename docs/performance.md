@@ -206,3 +206,41 @@ request (`Cache::set_many`). Memory is unchanged (±2 % RSS).
 What remains on the write path (perf, 4 KiB writes): memmove of values 39 %, `Table::find`
 18 % (the existence check on insert dereferences the entry to compare keys), dead-entry
 compaction 8 %, glibc large-chunk malloc/free ~15 %.
+
+## Round 7: data-structure and code review (2026-08-26)
+
+A pass over every hot path looking for better-fitting structures and plain code waste.
+Harness change: each run is preceded by a 2 s warm-up, so on the write profiles every set
+is a replacement (the earlier numbers included the cheap cache-filling phase). Baselines
+below are the round-6 binary under this harness.
+
+| change | measurement (user / sys µs per request, min of 3 alternating) | verdict |
+|---|---|---|
+| **fix:** reclaim retired entries after each write batch (`Guard::flush`). crossbeam-epoch collects only every 128 pins and at most 8 bags then; a SET batch retires 16 entries per pin, so garbage was produced ~4× faster than freed | 4 KiB writes: RSS 0.9 → **6 GB** in 8 s with a 1 GB budget before; 0.7 GB flat after. Page faults 650k → 8k per 3 s. Total CPU/req −9 %; user rises (82 → 150) because frees now actually happen | kept (bug) |
+| own thin entry allocation (header: refcount, len, meta = 64 B; value follows) instead of `triomphe::ThinArc`, values ≥ 1 KiB copied with AVX non-temporal stores | 4 KiB writes: user 154 → 101, sys 127 → 100, +22 % req/s; 1 KiB 50/50: user 27.3 → 22.0, +20 % req/s; 128 B profiles unchanged. Microbench: memcpy into cold scattered 4 KiB chunks 3.6 GB/s vs 11 GB/s streaming | kept |
+| borrow request bodies from the read buffer; validated borrowed `Keys`/`Entries` iterators in `oxicache-wire` (no `Vec<Bytes>`, no refcount inc/dec per key) | read-heavy: user 4.26 → 4.08 (−4 %, every pair); 1 KiB neutral | kept |
+| branchless tag-match mask over the whole bucket in `Table::find` | read-heavy: 4.31 → 4.19 (−3 %, 7/7 pairs); 1 KiB: 21.9 → 20.5 (−6 %) | kept |
+| dead-entry compaction with software prefetch lookahead instead of `VecDeque::retain` | 1 KiB: 27.0 → 25.8 (−5 %, every pair); eviction profile neutral | kept |
+| DEL: one epoch pin per request (`Cache::del_many`), flags written straight into the frame | not separately measured (DEL is absent from the bench profiles); removes a pin, a lock cycle and a `Vec` per request | kept |
+| 256 KiB read buffer (retried now that bodies are borrowed) | worse on all three profiles (+5…+10 % user) | rejected |
+| mimalloc (re-measured now that frees actually run) | 4 KiB writes: user −8 %, sys +11 %, total equal | rejected (stays opt-in) |
+| `GLIBC_TUNABLES` non-temporal threshold 2 KiB / `malloc.hugetlb=1` | no change (glibc only streams copies ≥ 2 pages; THP no effect) | rejected |
+| identity hasher for the ghost set, `hash` compare before key compare, merging small `put_slice`s | not pursued: ghost ops happen only on eviction of a DRAM-resident set and cost ~1 ns each; the others are single-cycle work next to a 100 ns miss | — |
+
+Net, round-6 binary vs now, same client, warm cache (user / sys µs per request, req/s):
+
+| profile | before | after |
+|---|---|---|
+| 8×16, 128 B, 10 % writes | 4.50 / 2.06, 467k | **4.25 / 1.99**, 476k |
+| 8×16, 1 KiB, 50 % writes | 22.4 / 22.1, 126k | **20.6 / 12.0**, 142k (total −27 %) |
+| 12×32, 4 KiB, 90 % writes | 82.8 / 223.6, 19.8k (leaking) | **101.7 / 102.3**, 22.6k (total −33 %, memory bounded) |
+| 64×2, 128 B, 10 % writes | 5.16 / 5.57, 277k | 4.95 / 5.52, 284k |
+| 8×16, 128 B, 50 % writes, 1M keys, `--capacity 32M` (evicting) | 9.60 / 5.04, 325k | 10.04 / 3.81, 328k |
+
+The eviction profile pays ~0.4 µs user per write request for the per-batch collection
+(`try_advance` scans every registered thread); that is the price of bounded memory.
+
+What remains on the write path (4 KiB): the value copy is now DRAM-write-bandwidth bound
+(~6 µs of 64 KiB per request), `Table::find` on insert (~13 %), glibc `_int_malloc` /
+`unlink_chunk` for chunks above the tcache limit (~12 %), and the read buffer's realloc
+copy for frames larger than 64 KiB (~8 %).
