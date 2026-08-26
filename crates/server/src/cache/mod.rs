@@ -67,13 +67,14 @@ impl Cache {
         F: FnOnce(&[Option<EntryRef<'_>>]) -> R,
     {
         let guard = epoch::pin();
-        let mut located: smallvec::SmallVec<[(&Shard, u64, &[u8]); 32]> = smallvec::SmallVec::new();
+        let keys = keys.into_iter();
+        let mut located: Vec<(&Shard, u64, &[u8])> = Vec::with_capacity(keys.size_hint().0);
         for k in keys {
             let (shard, hash) = self.locate(k);
             shard.prefetch(hash, &guard);
             located.push((shard, hash, k));
         }
-        let mut found: smallvec::SmallVec<[Option<EntryRef<'_>>; 32]> = smallvec::SmallVec::new();
+        let mut found: Vec<Option<EntryRef<'_>>> = Vec::with_capacity(located.len());
         for (shard, hash, k) in located {
             let e = shard.get(hash, k, &guard);
             if let Some(e) = &e {

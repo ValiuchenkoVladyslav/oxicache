@@ -232,7 +232,7 @@ below are the round-6 binary under this harness.
 | 256 KiB read buffer (retried now that bodies are borrowed) | worse on all three profiles (+5…+10 % user) | rejected |
 | mimalloc (re-measured now that frees actually run) | 4 KiB writes: user −8 %, sys +11 %, total equal | rejected (stays opt-in) |
 | `GLIBC_TUNABLES` non-temporal threshold 2 KiB / `malloc.hugetlb=1` | no change (glibc only streams copies ≥ 2 pages; THP no effect) | rejected |
-| `get_many` scratch lists: smallvec (current) vs plain `Vec::with_capacity` vs `tinyvec::TinyVec` | read-heavy user: 4.38 vs 4.36 (Vec, equal) vs 4.40 (tinyvec, +5 % in every pair: it zero-initialises the whole inline array and needs `Default` elements); arrayvec has no spill and batches are unbounded | smallvec stays (Vec is an equal-cost no-dependency option) |
+| `get_many` scratch lists: smallvec (current) vs plain `Vec::with_capacity` vs `tinyvec::TinyVec` | read-heavy user: 4.38 vs 4.36 (Vec, equal) vs 4.40 (tinyvec, +5 % in every pair: it zero-initialises the whole inline array and needs `Default` elements); arrayvec has no spill and batches are unbounded | switched to `Vec` (equal cost — +366 instructions/req for two tcache malloc/free pairs, ~25 ns — one dependency fewer) |
 | identity hasher for the ghost set, `hash` compare before key compare, merging small `put_slice`s | not pursued: ghost ops happen only on eviction of a DRAM-resident set and cost ~1 ns each; the others are single-cycle work next to a 100 ns miss | — |
 
 Net, round-6 binary vs now, same client, warm cache (user / sys µs per request, req/s):
