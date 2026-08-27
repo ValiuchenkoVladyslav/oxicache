@@ -26,9 +26,9 @@ not the bottleneck, so there is little for a different allocator to win.
 
 ## Decision
 
-Keep the system allocator. mimalloc stays available as an opt-in
-(`cargo build --release -p oxicache-server --features mimalloc`) for small-value, read-heavy
-deployments that can spend memory for ~5 % throughput.
+Keep the system allocator. mimalloc was carried as an opt-in feature for a while and has
+since been removed: ~5 % throughput on small-value, read-heavy loads did not justify the
++30 % RSS and the extra build configuration.
 
 ## Arenas
 
@@ -118,7 +118,7 @@ profiles (server CPU/req, req/s):
 | 64×2, 128 B, 10 % writes | 15 µs, 242k | **10 µs, 280k** |
 
 mimalloc re-measured here: −8 % CPU on the first two profiles and at 64 connections, but
-+17 % on the 4 KiB write-heavy profile and +30 % RSS on all of them; still opt-in.
++17 % on the 4 KiB write-heavy profile and +30 % RSS on all of them; since removed.
 
 ## Round 4: copies, allocator behaviour, client (2026-08-25)
 
@@ -230,7 +230,7 @@ below are the round-6 binary under this harness.
 | dead-entry compaction with software prefetch lookahead instead of `VecDeque::retain` | 1 KiB: 27.0 → 25.8 (−5 %, every pair); eviction profile neutral | kept |
 | DEL: one epoch pin per request (`Cache::del_many`), flags written straight into the frame | not separately measured (DEL is absent from the bench profiles); removes a pin, a lock cycle and a `Vec` per request | kept |
 | 256 KiB read buffer (retried now that bodies are borrowed) | worse on all three profiles (+5…+10 % user) | rejected |
-| mimalloc (re-measured now that frees actually run) | 4 KiB writes: user −8 %, sys +11 %, total equal | rejected (stays opt-in) |
+| mimalloc (re-measured now that frees actually run) | 4 KiB writes: user −8 %, sys +11 %, total equal | rejected (feature since removed) |
 | `GLIBC_TUNABLES` non-temporal threshold 2 KiB / `malloc.hugetlb=1` | no change (glibc only streams copies ≥ 2 pages; THP no effect) | rejected |
 | `get_many` scratch lists: smallvec (current) vs plain `Vec::with_capacity` vs `tinyvec::TinyVec` | read-heavy user: 4.38 vs 4.36 (Vec, equal) vs 4.40 (tinyvec, +5 % in every pair: it zero-initialises the whole inline array and needs `Default` elements); arrayvec has no spill and batches are unbounded | switched to `Vec` (equal cost — +366 instructions/req for two tcache malloc/free pairs, ~25 ns — one dependency fewer) |
 | identity hasher for the ghost set, `hash` compare before key compare, merging small `put_slice`s | not pursued: ghost ops happen only on eviction of a DRAM-resident set and cost ~1 ns each; the others are single-cycle work next to a 100 ns miss | — |

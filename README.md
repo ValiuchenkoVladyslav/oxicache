@@ -77,5 +77,3 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
 - 64-bit targets only: index slots pack a 48-bit entry address next to a 16-bit tag.
 - The client pipelines calls from any number of tasks onto one connection (writer task
   coalesces queued frames into one flush; reader task matches responses in order).
-- Build-time option: `--features mimalloc` — ~8 % less CPU on small-value read-heavy loads for
-  ~30 % more RSS (measured in `docs/performance.md`).

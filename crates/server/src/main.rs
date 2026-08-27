@@ -6,10 +6,6 @@ use oxicache_server::{Cache, Options, Server};
 use oxicache_wire::cli::warn_if_overridden;
 use tracing::info;
 
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// TCP in-memory cache server with S3-FIFO eviction.
