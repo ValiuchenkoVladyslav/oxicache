@@ -25,6 +25,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+pub mod cli;
 pub mod io;
 
 /// Size of a request or response frame header.
@@ -79,6 +80,10 @@ impl Status {
 /// Encode a frame header (request `op` or response `status` as the tag byte).
 #[inline]
 pub fn encode_header(tag: u8, len: usize) -> [u8; HEADER_LEN] {
+    debug_assert!(
+        len <= u32::MAX as usize,
+        "frame body length must fit in u32"
+    );
     let mut h = [0u8; HEADER_LEN];
     h[0] = tag;
     h[1..].copy_from_slice(&(len as u32).to_le_bytes());

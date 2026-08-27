@@ -142,11 +142,9 @@ async fn token_auth() {
 #[tokio::test]
 async fn closed_connection_errors() {
     let (server, client) = start().await;
-    let addr = server.local_addr();
     drop(server);
     // Existing connection still works because the accept loop task owns the listener clone.
     client.set([(&b"x"[..], &b"y"[..])]).await.unwrap();
     let dead = Client::connect("127.0.0.1:1".parse().unwrap()).await;
     assert!(matches!(dead, Err(Error::Io(_))));
-    let _ = addr;
 }

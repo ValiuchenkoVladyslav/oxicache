@@ -92,6 +92,11 @@ impl FrameReader {
     /// Read more input. Returns `false` at EOF.
     pub async fn fill<R: AsyncRead + Unpin>(&mut self, r: &mut R) -> io::Result<bool> {
         self.release();
+        // A buffer grown for one large frame would otherwise stay pinned to
+        // an idle connection for its lifetime.
+        if self.buf.is_empty() && self.buf.capacity() > 4 * BUF {
+            self.buf = BytesMut::with_capacity(BUF);
+        }
         // One reservation covers both the pending frame and a healthy read
         // size, so a large frame never triggers two reallocations.
         let want = self.need.saturating_sub(self.buf.len()).max(BUF / 4);

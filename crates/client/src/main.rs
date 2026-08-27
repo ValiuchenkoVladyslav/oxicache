@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use oxicache_client::Client;
+use oxicache_wire::cli::warn_if_overridden;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -128,30 +129,6 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Warn when a flag overrides a differing value of its environment variable.
-/// clap prefers the flag silently; a parsed value that differs from a set
-/// variable can only have come from the flag. Values are compared after
-/// parsing, so `1G` and `1024M` agree. `show` controls whether the values are
-/// printed (not for secrets).
-fn warn_if_overridden<T: PartialEq + std::fmt::Display>(
-    flag: &str,
-    var: &str,
-    value: Option<&T>,
-    parse: impl Fn(&str) -> Option<T>,
-    show: bool,
-) {
-    let (Ok(env), Some(value)) = (std::env::var(var), value) else {
-        return;
-    };
-    if parse(&env).as_ref() != Some(value) {
-        if show {
-            eprintln!("warning: --{flag}={value} overrides {var}={env}");
-        } else {
-            eprintln!("warning: --{flag} overrides a different {var}");
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

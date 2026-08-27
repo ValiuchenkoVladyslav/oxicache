@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use oxicache_server::{Cache, Options, Server};
+use oxicache_wire::cli::warn_if_overridden;
 use tracing::info;
 
 #[cfg(feature = "mimalloc")]
@@ -39,31 +40,10 @@ fn parse_size(s: &str) -> Result<usize> {
         Some('G' | 'g') => (&s[..s.len() - 1], 1 << 30),
         _ => return Err(format!("unknown size suffix in {s:?}").into()),
     };
-    Ok(num.trim().parse::<usize>()? * mul)
-}
-
-/// Warn when a flag overrides a differing value of its environment variable.
-/// clap prefers the flag silently; a parsed value that differs from a set
-/// variable can only have come from the flag. Values are compared after
-/// parsing, so `1G` and `1024M` agree. `show` controls whether the values are
-/// printed (not for secrets).
-fn warn_if_overridden<T: PartialEq + std::fmt::Display>(
-    flag: &str,
-    var: &str,
-    value: Option<&T>,
-    parse: impl Fn(&str) -> Option<T>,
-    show: bool,
-) {
-    let (Ok(env), Some(value)) = (std::env::var(var), value) else {
-        return;
-    };
-    if parse(&env).as_ref() != Some(value) {
-        if show {
-            eprintln!("warning: --{flag}={value} overrides {var}={env}");
-        } else {
-            eprintln!("warning: --{flag} overrides a different {var}");
-        }
-    }
+    num.trim()
+        .parse::<usize>()?
+        .checked_mul(mul)
+        .ok_or_else(|| format!("size {s:?} is too large").into())
 }
 
 #[tokio::main]

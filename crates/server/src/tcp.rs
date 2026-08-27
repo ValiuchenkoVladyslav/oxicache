@@ -21,6 +21,9 @@ use crate::error::{Error, Result};
 
 /// Largest request body accepted.
 pub const MAX_FRAME: usize = 64 << 20;
+/// Largest response body produced. A `GET` may name the same large key many
+/// times, so the total is bounded here rather than by the request size.
+pub const MAX_RESPONSE: usize = u32::MAX as usize;
 
 /// Settings for [`Server::bind_with`].
 #[derive(Clone, Debug, Default)]
@@ -137,7 +140,8 @@ async fn serve_connection(
 }
 
 /// Constant-time byte comparison, so a wrong token's reply time does not
-/// reveal how many leading bytes matched.
+/// reveal how many leading bytes matched. The length check short-circuits
+/// on purpose: it reveals only the token's length, which is not secret.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -151,6 +155,12 @@ pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
                     .iter()
                     .map(|e| 1 + e.as_ref().map_or(0, |e| 4 + e.value().len()))
                     .sum::<usize>();
+                if total > MAX_RESPONSE {
+                    return out.frame(
+                        Status::TooLarge as u8,
+                        Bytes::from(format!("response of {total} bytes exceeds the limit")),
+                    );
+                }
                 out.header(Status::Ok as u8, total);
                 out.put_slice(&(entries.len() as u32).to_le_bytes());
                 for e in entries {

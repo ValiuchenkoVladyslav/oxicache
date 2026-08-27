@@ -12,12 +12,13 @@
 //! [`Writer`] token; writers publish slot words with release stores and
 //! retire replaced entries and tables through the epoch collector. Cuckoo
 //! displacement copies an item to its new slot before clearing the old one,
+//! and a seqlock around each displacement lets a reader that missed retry,
 //! so a present key is never invisible to a concurrent reader.
 
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*, fence};
 
 use crossbeam_epoch::{self as epoch, Atomic, Guard, Owned};
 
@@ -30,6 +31,16 @@ const MAX_LOAD_EIGHTHS: usize = 7;
 const MAX_KICKS: usize = 256;
 const PTR_BITS: u32 = 48;
 const PTR_MASK: u64 = (1 << PTR_BITS) - 1;
+/// Retries of the displacement walk (with a fresh seed) before growing.
+const MAX_WALKS: usize = 4;
+
+/// A `(bucket, slot)` position in a table.
+type Slot = (usize, usize);
+
+const _: () = assert!(
+    std::mem::size_of::<usize>() == 8,
+    "oxicache-server supports 64-bit targets only (48-bit pointer packing)"
+);
 
 #[repr(C, align(64))]
 struct Bucket([AtomicU64; SLOTS]);
@@ -38,8 +49,9 @@ struct Table {
     buckets: Box<[Bucket]>,
     mask: usize,
     /// Whether dropping this table drops the entry handles in its slots.
-    /// False for tables retired by a resize, whose handles moved on.
-    owns: bool,
+    /// Cleared for tables retired by a resize, whose handles moved on;
+    /// atomic because readers may still borrow the table at that point.
+    owns: AtomicBool,
 }
 
 impl Table {
@@ -50,7 +62,7 @@ impl Table {
                 .map(|_| Bucket(std::array::from_fn(|_| AtomicU64::new(0))))
                 .collect(),
             mask: buckets - 1,
-            owns: true,
+            owns: AtomicBool::new(true),
         }
     }
 
@@ -120,7 +132,7 @@ impl Table {
 
 impl Drop for Table {
     fn drop(&mut self) {
-        if !self.owns {
+        if !*self.owns.get_mut() {
             return;
         }
         for b in self.buckets.iter_mut() {
@@ -148,7 +160,7 @@ fn tag_of_word(w: u64) -> u16 {
 #[inline]
 fn word(tag: u16, ptr: *const std::ffi::c_void) -> u64 {
     let p = ptr as u64;
-    debug_assert_eq!(p & !PTR_MASK, 0, "entry pointer must fit in 48 bits");
+    assert_eq!(p & !PTR_MASK, 0, "entry pointer must fit in 48 bits");
     ((tag as u64) << PTR_BITS) | p
 }
 
@@ -180,6 +192,10 @@ pub struct Index {
     table: Atomic<Table>,
     len: AtomicUsize,
     kick_seed: AtomicUsize,
+    /// Seqlock over cuckoo displacement in the live table: odd while a path
+    /// is being applied. A reader that misses re-checks it and retries, so
+    /// an entry in flight between its two buckets is never reported absent.
+    moving: AtomicU64,
 }
 
 /// A borrowed entry, valid for the lifetime of the epoch guard it came from.
@@ -208,6 +224,7 @@ impl Index {
             table: Atomic::new(Table::new(MIN_BUCKETS)),
             len: AtomicUsize::new(0),
             kick_seed: AtomicUsize::new(1),
+            moving: AtomicU64::new(0),
         }
     }
 
@@ -239,13 +256,23 @@ impl Index {
 
     #[inline]
     pub fn get<'g>(&self, hash: u64, key: &[u8], guard: &'g Guard) -> Option<EntryRef<'g>> {
-        let t = self.load(guard);
-        let (_, _, w) = t.find(hash, key)?;
-        // SAFETY: found under the guard; the entry outlives it.
-        Some(EntryRef {
-            inner: unsafe { entry_at(w) },
-            _guard: PhantomData,
-        })
+        loop {
+            let seq = self.moving.load(Acquire);
+            let t = self.load(guard);
+            if let Some((_, _, w)) = t.find(hash, key) {
+                // SAFETY: found under the guard; the entry outlives it.
+                return Some(EntryRef {
+                    inner: unsafe { entry_at(w) },
+                    _guard: PhantomData,
+                });
+            }
+            fence(Acquire);
+            if seq & 1 == 0 && self.moving.load(Relaxed) == seq {
+                return None;
+            }
+            // A displacement overlapped the lookup; the key may have moved
+            // from the bucket we read second to the one we read first.
+        }
     }
 
     /// Insert or replace. Returns the previous handle for `key`, if any.
@@ -263,7 +290,7 @@ impl Index {
         }
         loop {
             let t = self.load(guard);
-            if self.place(t, hash, new_word) {
+            if self.place(t, hash, new_word, true) {
                 self.len.fetch_add(1, Relaxed);
                 return None;
             }
@@ -301,8 +328,10 @@ impl Index {
     }
 
     /// Cuckoo placement of a fresh word. Every move copies to the destination
-    /// before the source is overwritten, so readers never miss a present key.
-    fn place(&self, t: &Table, hash: u64, new_word: u64) -> bool {
+    /// before the source is overwritten, and `live` tables bracket the moves
+    /// with the [`moving`](Self::moving) seqlock, so readers never miss a
+    /// present key.
+    fn place(&self, t: &Table, hash: u64, new_word: u64, live: bool) -> bool {
         let tag = tag_of(hash);
         let b1 = t.home(hash);
         let b2 = t.alt(b1, tag);
@@ -312,36 +341,60 @@ impl Index {
                 return true;
             }
         }
-        // Random walk to find a displacement path, then apply it backwards.
-        let mut path: Vec<(usize, usize)> = Vec::with_capacity(16);
-        let mut seed = self.kick_seed.load(Relaxed);
-        let mut b = if seed & 1 == 0 { b1 } else { b2 };
-        let mut dest = None;
-        for _ in 0..MAX_KICKS {
-            seed = seed
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let i = (seed >> 33) % SLOTS;
-            let w = t.buckets[b].0[i].load(Relaxed);
-            path.push((b, i));
-            let next = t.alt(b, tag_of_word(w));
-            if let Some(j) = empty_slot(&t.buckets[next]) {
-                dest = Some((next, j));
-                break;
-            }
-            b = next;
-        }
-        self.kick_seed.store(seed, Relaxed);
-        let Some((mut db, mut di)) = dest else {
+        let Some((path, dest)) = self.find_path(t, b1, b2) else {
             return false;
         };
+        // Apply the path backwards, last hop first, so every slot is copied
+        // out before it is overwritten.
+        if live {
+            self.moving.fetch_add(1, Relaxed);
+            fence(Release);
+        }
+        let (mut db, mut di) = dest;
         for &(sb, si) in path.iter().rev() {
             let w = t.buckets[sb].0[si].load(Relaxed);
             t.buckets[db].0[di].store(w, Release);
             (db, di) = (sb, si);
         }
         t.buckets[db].0[di].store(new_word, Release);
+        if live {
+            self.moving.fetch_add(1, Release);
+        }
         true
+    }
+
+    /// Random walk from one of the candidate buckets to a bucket with an
+    /// empty slot. The path must not revisit a slot: applying it backwards
+    /// would then read a slot already overwritten by a later hop and file
+    /// that entry under a bucket it does not hash to, losing it. A walk that
+    /// loops is abandoned and retried with a fresh seed.
+    fn find_path(&self, t: &Table, b1: usize, b2: usize) -> Option<(Vec<Slot>, Slot)> {
+        let mut seed = self.kick_seed.load(Relaxed);
+        let mut path: Vec<Slot> = Vec::with_capacity(16);
+        let mut found = None;
+        'walk: for _ in 0..MAX_WALKS {
+            path.clear();
+            let mut b = if seed & 1 == 0 { b1 } else { b2 };
+            for _ in 0..MAX_KICKS {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let i = (seed >> 33) % SLOTS;
+                if path.contains(&(b, i)) {
+                    continue 'walk;
+                }
+                let w = t.buckets[b].0[i].load(Relaxed);
+                path.push((b, i));
+                let next = t.alt(b, tag_of_word(w));
+                if let Some(j) = empty_slot(&t.buckets[next]) {
+                    found = Some((next, j));
+                    break 'walk;
+                }
+                b = next;
+            }
+        }
+        self.kick_seed.store(seed, Relaxed);
+        found.map(|dest| (path, dest))
     }
 
     fn grow(&self, guard: &Guard) {
@@ -357,7 +410,7 @@ impl Index {
                     if w != 0 {
                         // SAFETY: entry alive; we only read its hash.
                         let e = unsafe { entry_at(w) };
-                        if !self.place(&fresh, e.hash(), w) {
+                        if !self.place(&fresh, e.hash(), w, false) {
                             n *= 2;
                             continue 'retry;
                         }
@@ -366,11 +419,13 @@ impl Index {
             }
             let fresh = Owned::new(fresh).into_shared(guard);
             self.table.store(fresh, Release);
-            // SAFETY: readers may still hold `old`; its handles moved to
-            // `fresh`, so retire it without dropping them.
+            // Readers may still borrow `old`, so disown it through the atomic
+            // rather than a `&mut` that would alias them.
+            old_t.owns.store(false, Relaxed);
+            // SAFETY: unlinked above; its handles moved to `fresh`, so
+            // dropping it later only frees the bucket array.
             unsafe {
-                let mut retired: Owned<Table> = old.into_owned();
-                retired.owns = false;
+                let retired: Owned<Table> = old.into_owned();
                 guard.defer_unchecked(move || drop(retired));
             }
             return;
@@ -465,6 +520,48 @@ mod tests {
         }
         assert_eq!(idx.len(), 0);
         assert!(idx.remove(&mut w, h(b"key1"), b"key1", &g).is_none());
+    }
+
+    /// A small table at maximum load makes the displacement walk long
+    /// enough to revisit slots; every key inserted must stay reachable.
+    #[test]
+    fn churn_at_full_load_loses_nothing() {
+        let idx = Index::new();
+        let mut w = Writer::new();
+        let g = epoch::pin();
+        let live = MIN_BUCKETS * SLOTS * MAX_LOAD_EIGHTHS / 8 - 8;
+        let mut next = 0usize;
+        let mut keys: Vec<usize> = (0..live)
+            .map(|_| {
+                next += 1;
+                next - 1
+            })
+            .collect();
+        for &id in &keys {
+            let k = format!("c{id}");
+            assert!(
+                idx.insert(&mut w, h(k.as_bytes()), e(&k, "v"), &g)
+                    .is_none()
+            );
+        }
+        let mut seed = 12345u64;
+        for _ in 0..1_000_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let i = seed as usize % keys.len();
+            let k = format!("c{}", keys[i]);
+            let old = idx.remove(&mut w, h(k.as_bytes()), k.as_bytes(), &g);
+            assert!(old.is_some(), "lost {k}");
+            keys[i] = next;
+            next += 1;
+            let k = format!("c{}", keys[i]);
+            assert!(
+                idx.insert(&mut w, h(k.as_bytes()), e(&k, "v"), &g)
+                    .is_none()
+            );
+        }
+        assert_eq!(idx.len(), keys.len());
     }
 
     #[test]

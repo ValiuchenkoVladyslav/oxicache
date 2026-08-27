@@ -60,7 +60,8 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
   before touching any, then all entries. Tags reject absent keys without an entry access.
 - Readers pin an epoch (crossbeam-epoch) once per batch and borrow entries under it — no
   locks and no refcount traffic per key. The shard mutex is the single writer; cuckoo
-  displacement copies before it clears, so a present key is never invisible. Replaced and
+  displacement copies before it clears and is bracketed by a seqlock that a missing
+  lookup re-checks, so a present key is never invisible. Replaced and
   evicted entries are retired through the epoch collector and reclaimed after every write
   batch, so memory stays bounded under sustained writes.
 - Keys hash once (`rapidhash::fast`, randomly seeded); top bits pick one of N S3-FIFO shards (default: CPU count),
@@ -71,6 +72,9 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
 - One tokio task per TCP connection; requests are handled inline and answered in order,
   responses are flushed once no more input is buffered (one write per pipelined batch).
   One listener; accepted connections are spread over the runtime's worker threads.
+  Frames are capped at 64 MiB each way; there is no connection limit or idle timeout,
+  so put the server on a private network.
+- 64-bit targets only: index slots pack a 48-bit entry address next to a 16-bit tag.
 - The client pipelines calls from any number of tasks onto one connection (writer task
   coalesces queued frames into one flush; reader task matches responses in order).
 - Build-time option: `--features mimalloc` — ~8 % less CPU on small-value read-heavy loads for
