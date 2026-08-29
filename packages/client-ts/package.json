@@ -13,7 +13,10 @@
       "default": "./dist/index.js"
     }
   },
-  "files": ["dist", "src"],
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
     "check": "tsc --noEmit",
     "build": "bun build ./src/index.ts --outdir ./dist --target bun --sourcemap=linked && tsc -p tsconfig.build.json",
@@ -21,5 +24,8 @@
   },
   "dependencies": {
     "msgpackr": "^2.1.0"
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.0"
   }
 }

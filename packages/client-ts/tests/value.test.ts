@@ -78,7 +78,10 @@ describe("value codec", () => {
     expect(records.encode(many).length).toBeLessThan(plain.encode(many).length);
     // Each value decodes on a fresh codec, and the plain encoding differs.
     expect(new Codec().decode<typeof shape>(first)).toEqual(shape);
-    expect(new Codec().decode<typeof shape>(second)).toEqual({ id: 2, name: "b" });
+    expect(new Codec().decode<typeof shape>(second)).toEqual({
+      id: 2,
+      name: "b",
+    });
     expect([...plain.encode(shape)]).not.toEqual([...first]);
     // The record extension is not plain msgpack: a records codec reads both,
     // a plain codec only its own.
@@ -88,9 +91,15 @@ describe("value codec", () => {
 
   test("useRecords: false emits standard msgpack", () => {
     // msgpackr emits map16 for objects; still plain msgpack.
-    expect([...encodeValue({ a: 1 })]).toEqual([0xde, 0x00, 0x01, 0xa1, 0x61, 0x01]);
-    expect([...encodeValue([1, "b", null])]).toEqual([0x93, 0x01, 0xa1, 0x62, 0xc0]);
-    expect([...encodeValue(new Uint8Array([1, 2]))]).toEqual([0xc4, 0x02, 0x01, 0x02]);
+    expect([...encodeValue({ a: 1 })]).toEqual([
+      0xde, 0x00, 0x01, 0xa1, 0x61, 0x01,
+    ]);
+    expect([...encodeValue([1, "b", null])]).toEqual([
+      0x93, 0x01, 0xa1, 0x62, 0xc0,
+    ]);
+    expect([...encodeValue(new Uint8Array([1, 2]))]).toEqual([
+      0xc4, 0x02, 0x01, 0x02,
+    ]);
   });
 
   test("decoding garbage throws", () => {

@@ -17,7 +17,7 @@ export const MAX_FRAME = 64 << 20;
 /** Most keys or entries one request may name. */
 export const MAX_ITEMS = 1 << 16;
 
-export const enum Op {
+export enum Op {
   Get = 1,
   Set = 2,
   Del = 3,
@@ -80,7 +80,9 @@ class Reader {
   }
   need(n: number): void {
     if (this.remaining < n) {
-      throw new DecodeError(`unexpected end of frame: needed ${n - this.remaining} more bytes`);
+      throw new DecodeError(
+        `unexpected end of frame: needed ${n - this.remaining} more bytes`,
+      );
     }
   }
   u8(): number {
@@ -109,7 +111,9 @@ class Reader {
 
 function checkCount(n: number): void {
   if (n > MAX_ITEMS) {
-    throw new RangeError(`${n} items in one request exceeds the limit of ${MAX_ITEMS}`);
+    throw new RangeError(
+      `${n} items in one request exceeds the limit of ${MAX_ITEMS}`,
+    );
   }
 }
 
@@ -128,7 +132,9 @@ export function encodeKeysFrame(op: Op, keys: readonly Bin[]): Uint8Array {
 }
 
 /** Encode a whole SET frame: header followed by key/value entries. */
-export function encodeEntriesFrame(entries: readonly (readonly [Bin, Bin])[]): Uint8Array {
+export function encodeEntriesFrame(
+  entries: readonly (readonly [Bin, Bin])[],
+): Uint8Array {
   checkCount(entries.length);
   const es = entries.map(([k, v]) => [toBytes(k), toBytes(v)] as const);
   let size = HEADER_LEN + U32;
@@ -204,7 +210,9 @@ export class FrameReader {
       if (live + chunk.length <= this.buf.length) {
         this.buf.copyWithin(0, this.start, this.end);
       } else {
-        const grown = new Uint8Array(Math.max(this.buf.length * 2, live + chunk.length));
+        const grown = new Uint8Array(
+          Math.max(this.buf.length * 2, live + chunk.length),
+        );
         grown.set(this.buf.subarray(this.start, this.end));
         this.buf = grown;
       }
@@ -221,9 +229,15 @@ export class FrameReader {
     if (avail < HEADER_LEN) return null;
     const b = this.buf;
     const s = this.start;
-    const len = b[s + 1]! | (b[s + 2]! << 8) | (b[s + 3]! << 16) | ((b[s + 4]! << 24) >>> 0);
+    const len =
+      b[s + 1]! |
+      (b[s + 2]! << 8) |
+      (b[s + 3]! << 16) |
+      ((b[s + 4]! << 24) >>> 0);
     if (len > this.maxFrame) {
-      throw new DecodeError(`response of ${len} bytes exceeds the client limit of ${this.maxFrame}`);
+      throw new DecodeError(
+        `response of ${len} bytes exceeds the client limit of ${this.maxFrame}`,
+      );
     }
     if (avail < HEADER_LEN + len) return null;
     const body = b.slice(s + HEADER_LEN, s + HEADER_LEN + len);

@@ -1,5 +1,5 @@
-import type { Subprocess } from "bun";
 import { resolve } from "node:path";
+import type { Subprocess } from "bun";
 
 const root = resolve(import.meta.dir, "../../..");
 const bin = resolve(root, "target/debug/oxicache-server");
@@ -8,29 +8,43 @@ let built: Promise<void> | undefined;
 
 /** Build the server once per test process. */
 function build(): Promise<void> {
-  return (built ??= (async () => {
+  built ??= (async () => {
     const p = Bun.spawn(["cargo", "build", "-p", "oxicache-server"], {
       cwd: root,
       stdout: "inherit",
       stderr: "inherit",
     });
     if ((await p.exited) !== 0) throw new Error("cargo build failed");
-  })());
+  })();
+  return built;
 }
 
 /** A loopback port that was free a moment ago. */
 function freePort(): number {
-  const l = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const l = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      data() {
+        // never receives anything
+      },
+    },
+  });
   const port = l.port;
   l.stop(true);
   return port;
 }
 
 /** Resolves once something accepts on `port`, rejects after `timeoutMs`. */
-async function waitForListen(port: number, alive: () => boolean, timeoutMs = 10_000): Promise<void> {
+async function waitForListen(
+  port: number,
+  alive: () => boolean,
+  timeoutMs = 10_000,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (!alive()) throw new Error("server exited before listening");
+    // biome-ignore lint/performance/noAwaitInLoops: polling is sequential by nature
     const ok = await new Promise<boolean>((resolve) => {
       Bun.connect({
         hostname: "127.0.0.1",
@@ -40,7 +54,9 @@ async function waitForListen(port: number, alive: () => boolean, timeoutMs = 10_
             s.end();
             resolve(true);
           },
-          data() {},
+          data() {
+            // never receives anything
+          },
           error() {
             resolve(false);
           },
@@ -67,7 +83,16 @@ export async function startServer(args: string[] = []): Promise<TestServer> {
   await build();
   const port = freePort();
   const proc = Bun.spawn(
-    [bin, "--addr", `127.0.0.1:${port}`, "--capacity", "64M", "--shards", "2", ...args],
+    [
+      bin,
+      "--addr",
+      `127.0.0.1:${port}`,
+      "--capacity",
+      "64M",
+      "--shards",
+      "2",
+      ...args,
+    ],
     { cwd: root, stdout: "ignore", stderr: "ignore" },
   );
   const stop = () => proc.kill();

@@ -6,8 +6,13 @@
 import { expect, test } from "bun:test";
 import type { Client, Fill, Value } from "../src/index";
 
-type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
-const assertType = <_T extends true>(): void => {};
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
+    ? true
+    : false;
+const assertType = <_T extends true>(): void => {
+  // type-level only
+};
 
 interface User {
   id: number;
@@ -46,7 +51,9 @@ async function _shapes() {
   assertType<Equal<typeof mu, User | null>>();
   assertType<Equal<typeof mn, number | null>>();
   const mixed3 = await c.get<[string, User[], Uint8Array]>("a", "b", "c");
-  assertType<Equal<typeof mixed3, [string | null, User[] | null, Uint8Array | null]>>();
+  assertType<
+    Equal<typeof mixed3, [string | null, User[] | null, Uint8Array | null]>
+  >();
   const dm = await c.get<[User, number]>(...(["a", "b"] as const));
   assertType<Equal<typeof dm, [User | null, number | null]>>();
   // @ts-expect-error too few types for two keys
@@ -60,9 +67,26 @@ async function _shapes() {
   await c.get<User>("a", "b");
   // @ts-expect-error one primitive type for two keys
   await c.get<string>("a", "b");
-  const sixteen = await c.get<Fill<16, number>>("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16");
-  assertType<Equal<typeof sixteen["length"], 16>>();
-  assertType<Equal<typeof sixteen[0], number | null>>();
+  const sixteen = await c.get<Fill<16, number>>(
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12",
+    "13",
+    "14",
+    "15",
+    "16",
+  );
+  assertType<Equal<(typeof sixteen)["length"], 16>>();
+  assertType<Equal<(typeof sixteen)[0], number | null>>();
   const dyn: string[] = ["a", "b"];
   const fromArray = await c.get<User>(dyn);
   assertType<Equal<typeof fromArray, (User | null)[]>>();
@@ -77,10 +101,10 @@ async function _shapes() {
   const dArr = await c.del(dyn);
   assertType<Equal<typeof dArr, boolean[]>>();
   // @ts-expect-error several keys in must not be assignable to single out
-  const wrong: User | null = await c.get<[User, User]>("k", "j");
-  void wrong;
+  const _wrong: User | null = await c.get<[User, User]>("k", "j");
   // @ts-expect-error a spread of unknown length must use the array form
   await c.get<[User, User]>(...dyn);
+  // biome-ignore format: the error must land on the line under @ts-expect-error
   // @ts-expect-error more than 16 literal keys must use the array form
   await c.get<Fill<17, number>>("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17");
 
@@ -92,13 +116,17 @@ async function _shapes() {
   await c.set("bin", new Uint8Array(2));
   await c.set(new Uint8Array([1]), null);
   await c.set(["a", 1], ["b", "two"], ["c", user]);
-  await c.set([["a", 1], ["b", "two"], ["c", user]]);
+  await c.set([
+    ["a", 1],
+    ["b", "two"],
+    ["c", user],
+  ]);
   const dynEntries: [string, number][] = [["a", 1]];
   await c.set(dynEntries);
 
   // Rejected values.
   // @ts-expect-error functions
-  await c.set("f", { id: 1, fn: () => {} });
+  await c.set("f", { id: 1, fn: () => 0 });
   // @ts-expect-error symbols
   await c.set("s", Symbol("s"));
   // @ts-expect-error undefined

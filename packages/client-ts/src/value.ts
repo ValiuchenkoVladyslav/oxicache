@@ -1,10 +1,20 @@
 import { Packr } from "msgpackr";
 
 /** Leaf types a value may contain. */
-export type Primitive = null | boolean | number | bigint | string | Uint8Array | Date;
+export type Primitive =
+  | null
+  | boolean
+  | number
+  | bigint
+  | string
+  | Uint8Array
+  | Date;
 
 /** Anything the client can store: msgpack-representable data. */
-export type Value = Primitive | readonly Value[] | { readonly [key: string]: Value };
+export type Value =
+  | Primitive
+  | readonly Value[]
+  | { readonly [key: string]: Value };
 
 /**
  * `T` if every part of it is msgpack-representable, otherwise a type nothing
@@ -41,7 +51,10 @@ export class Codec {
     // mapsAsObjects is explicit because msgpackr flips its default to Map
     // when records are on, and plain msgpack maps must still come back as
     // objects whichever mode wrote them.
-    this.packr = new Packr({ useRecords: opts.useRecords ?? true, mapsAsObjects: true });
+    this.packr = new Packr({
+      useRecords: opts.useRecords ?? true,
+      mapsAsObjects: true,
+    });
   }
 
   encode(value: unknown): Uint8Array {

@@ -1,38 +1,63 @@
 import { describe, expect, test } from "bun:test";
 import {
   DecodeError,
-  FrameReader,
-  HEADER_LEN,
-  MAX_ITEMS,
-  Op,
   decodeFlags,
   decodeValues,
   encodeEntriesFrame,
   encodeKeysFrame,
   encodeRawFrame,
+  FrameReader,
+  HEADER_LEN,
+  MAX_ITEMS,
+  Op,
 } from "../src/wire";
 
-const le32 = (n: number) => [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255];
+const INVALID_TAG = /invalid tag byte 7/;
+const NEEDED_100 = /needed 100/;
+const TRAILING_1 = /trailing 1 bytes/;
+const EXCEEDS_16 = /exceeds the client limit of 16/;
+
+const le32 = (n: number) => [
+  n & 255,
+  (n >>> 8) & 255,
+  (n >>> 16) & 255,
+  (n >>> 24) & 255,
+];
 
 describe("encode", () => {
   test("keys frame", () => {
     const f = encodeKeysFrame(Op.Get, ["a", new Uint8Array([0, 255]), ""]);
     expect([...f]).toEqual([
-      1, ...le32(4 + (4 + 1) + (4 + 2) + 4),
+      1,
+      ...le32(4 + (4 + 1) + (4 + 2) + 4),
       ...le32(3),
-      ...le32(1), 0x61,
-      ...le32(2), 0, 255,
+      ...le32(1),
+      0x61,
+      ...le32(2),
+      0,
+      255,
       ...le32(0),
     ]);
   });
 
   test("entries frame", () => {
-    const f = encodeEntriesFrame([["k", "v"], [new Uint8Array([1]), new Uint8Array([2, 3])]]);
+    const f = encodeEntriesFrame([
+      ["k", "v"],
+      [new Uint8Array([1]), new Uint8Array([2, 3])],
+    ]);
     expect([...f]).toEqual([
-      2, ...le32(4 + (4 + 1 + 4 + 1) + (4 + 1 + 4 + 2)),
+      2,
+      ...le32(4 + (4 + 1 + 4 + 1) + (4 + 1 + 4 + 2)),
       ...le32(2),
-      ...le32(1), 0x6b, ...le32(1), 0x76,
-      ...le32(1), 1, ...le32(2), 2, 3,
+      ...le32(1),
+      0x6b,
+      ...le32(1),
+      0x76,
+      ...le32(1),
+      1,
+      ...le32(2),
+      2,
+      3,
     ]);
   });
 
@@ -43,13 +68,23 @@ describe("encode", () => {
   });
 
   test("rejects too many items", () => {
-    expect(() => encodeKeysFrame(Op.Get, new Array(MAX_ITEMS + 1).fill(""))).toThrow(RangeError);
+    expect(() =>
+      encodeKeysFrame(Op.Get, new Array(MAX_ITEMS + 1).fill("")),
+    ).toThrow(RangeError);
   });
 });
 
 describe("decode", () => {
   test("values", () => {
-    const body = new Uint8Array([...le32(3), 1, ...le32(1), 0x78, 0, 1, ...le32(0)]);
+    const body = new Uint8Array([
+      ...le32(3),
+      1,
+      ...le32(1),
+      0x78,
+      0,
+      1,
+      ...le32(0),
+    ]);
     const v = decodeValues(body);
     expect(v.length).toBe(3);
     expect([...v[0]!]).toEqual([0x78]);
@@ -58,15 +93,25 @@ describe("decode", () => {
   });
 
   test("flags", () => {
-    expect(decodeFlags(new Uint8Array([...le32(3), 1, 0, 1]))).toEqual([true, false, true]);
+    expect(decodeFlags(new Uint8Array([...le32(3), 1, 0, 1]))).toEqual([
+      true,
+      false,
+      true,
+    ]);
     expect(decodeFlags(new Uint8Array(le32(0)))).toEqual([]);
   });
 
   test("rejects malformed", () => {
     expect(() => decodeValues(new Uint8Array([1, 0]))).toThrow(DecodeError);
-    expect(() => decodeValues(new Uint8Array([...le32(1), 7]))).toThrow(/invalid tag byte 7/);
-    expect(() => decodeValues(new Uint8Array([...le32(1), 1, ...le32(100)]))).toThrow(/needed 100/);
-    expect(() => decodeFlags(new Uint8Array([...le32(0), 9]))).toThrow(/trailing 1 bytes/);
+    expect(() => decodeValues(new Uint8Array([...le32(1), 7]))).toThrow(
+      INVALID_TAG,
+    );
+    expect(() =>
+      decodeValues(new Uint8Array([...le32(1), 1, ...le32(100)])),
+    ).toThrow(NEEDED_100);
+    expect(() => decodeFlags(new Uint8Array([...le32(0), 9]))).toThrow(
+      TRAILING_1,
+    );
   });
 });
 
@@ -97,7 +142,8 @@ describe("FrameReader", () => {
     const big = new Uint8Array(1 << 20).fill(5);
     r.push(new Uint8Array([0, ...le32(big.length)]));
     expect(r.next()).toBeNull();
-    for (let off = 0; off < big.length; off += 100_000) r.push(big.subarray(off, off + 100_000));
+    for (let off = 0; off < big.length; off += 100_000)
+      r.push(big.subarray(off, off + 100_000));
     const f = r.next()!;
     expect(f.body.length).toBe(big.length);
     expect(f.body[big.length - 1]).toBe(5);
@@ -106,6 +152,6 @@ describe("FrameReader", () => {
   test("rejects oversized frames", () => {
     const r = new FrameReader(16);
     r.push(new Uint8Array([0, ...le32(17)]));
-    expect(() => r.next()).toThrow(/exceeds the client limit of 16/);
+    expect(() => r.next()).toThrow(EXCEEDS_16);
   });
 });

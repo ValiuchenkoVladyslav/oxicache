@@ -1,0 +1,73 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.8/schema.json",
+
+  "files": {
+    "includes": ["**"]
+  },
+
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineEnding": "lf"
+  },
+
+  "linter": {
+    "rules": {
+      "style": {
+        "useImportType": "error",
+        "useConsistentEnumValueType": "error"
+      },
+      "complexity": {
+        "noForEach": "error",
+        "noImplicitCoercions": "error",
+        "noUselessCatchBinding": "error",
+        "noUselessStringConcat": "error",
+        "noUselessUndefined": "error",
+        "noUselessReturn": "error",
+        "noVoid": "error",
+        "noDivRegex": "error",
+        "useWhile": "error"
+      },
+      "suspicious": {
+        "noDeprecatedImports": "error",
+        "noEmptyBlockStatements": "error",
+        "noEmptySource": "error",
+        "noEvolvingTypes": "error",
+        "noUnassignedVariables": "error",
+        "noUnusedExpressions": "error",
+        "noUnnecessaryConditions": "error",
+        "noVar": "error",
+        "useErrorMessage": "error",
+        "useArraySortCompare": "error"
+      },
+      "correctness": {
+        "noUndeclaredDependencies": "error"
+      },
+      "nursery": {
+        "noConditionalExpect": "error",
+        "noImpliedEval": "error",
+        "noMisleadingReturnType": "error",
+        "noUnnecessaryTemplateExpression": "error",
+        "noUselessTypeConversion": "error",
+        "useAwaitThenable": "error",
+        "useIframeSandbox": "error",
+        "useImportsFirst": "error",
+        "useNullishCoalescing": "error"
+      },
+      "performance": {
+        "noAwaitInLoops": "error",
+        "noDelete": "error",
+        "useTopLevelRegex": "error"
+      },
+      "security": {
+        "noScriptUrl": "error"
+      }
+    }
+  }
+}

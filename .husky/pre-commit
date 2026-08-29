@@ -5,7 +5,8 @@ cargo build --workspace
 cargo test --workspace --all-features
 cargo test -p oxicache-client  # byte API without the serde feature
 
-# TypeScript: type check, build the package, then unit + e2e tests.
+# TypeScript: type check, build the package, lint, then unit + e2e tests.
 bun run --cwd packages/client-ts check
 bun run --cwd packages/client-ts build
+bunx biome check
 bun test

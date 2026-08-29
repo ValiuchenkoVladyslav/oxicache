@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Client, ClosedError, Status, StatusError } from "../src/index";
-import { type TestServer, startServer } from "./server";
+import { startServer, type TestServer } from "./server";
 
 interface User {
   id: number;
@@ -39,7 +39,11 @@ describe("client-ts e2e", () => {
     expect(await c.del("a", "zz")).toEqual([true, false]);
     expect(await c.get("a", "b")).toEqual([null, [0, 1, 2]]);
     await c.set(["n", 5], ["s", "five"]);
-    const [n, str, none] = await c.get<[number, string, User]>("n", "s", "nope");
+    const [n, str, none] = await c.get<[number, string, User]>(
+      "n",
+      "s",
+      "nope",
+    );
     expect(n! + 1).toBe(6);
     expect(str!.toUpperCase()).toBe("FIVE");
     expect(none).toBeNull();
@@ -52,7 +56,10 @@ describe("client-ts e2e", () => {
     await c.set(keys.map((k, i) => [k, i] as const));
     expect(await c.get<number>(keys)).toEqual(keys.map((_, i) => i));
     expect(await c.get(["arr-0"])).toEqual([0]); // one-element array stays an array
-    expect(await c.del([...keys, "zz"])).toEqual([...keys.map(() => true), false]);
+    expect(await c.del([...keys, "zz"])).toEqual([
+      ...keys.map(() => true),
+      false,
+    ]);
     expect(await c.get(keys)).toEqual(keys.map(() => null));
     c.close();
   });
@@ -81,19 +88,29 @@ describe("client-ts e2e", () => {
   test("useRecords is on by default and can be turned off", async () => {
     const shape = { id: 1, name: "alice", tags: ["x"] };
     for (const useRecords of [undefined, true, false]) {
-      const c = await Client.connect({ port: server.port, ...(useRecords === undefined ? {} : { useRecords }) });
+      // biome-ignore lint/performance/noAwaitInLoops: the settings share keys, so they must run one after another
+      const c = await Client.connect({
+        port: server.port,
+        ...(useRecords === undefined ? {} : { useRecords }),
+      });
       await c.set(["r1", shape], ["r2", { ...shape, id: 2 }]);
       const [a, b] = await c.get<[typeof shape, typeof shape]>("r1", "r2");
       expect(a).toEqual(shape);
       expect(b!.id).toBe(2);
       // A fresh client with the same setting reads it back too.
-      const c2 = await Client.connect({ port: server.port, ...(useRecords === undefined ? {} : { useRecords }) });
+      const c2 = await Client.connect({
+        port: server.port,
+        ...(useRecords === undefined ? {} : { useRecords }),
+      });
       expect(await c2.get<typeof shape>("r2")).toEqual({ ...shape, id: 2 });
       c.close();
       c2.close();
     }
     // Plain msgpack written by a no-records client is readable by a records client.
-    const plain = await Client.connect({ port: server.port, useRecords: false });
+    const plain = await Client.connect({
+      port: server.port,
+      useRecords: false,
+    });
     await plain.set("plain", shape);
     const rec = await Client.connect({ port: server.port });
     expect(await rec.get<typeof shape>("plain")).toEqual(shape);
@@ -116,7 +133,16 @@ describe("client-ts e2e", () => {
       ["obj", { nested: { deep: true } }],
     );
     const [n, b, i, f, bi, s, bin, d, arr, obj] = await c.get(
-      "null", "bool", "int", "float", "bigint", "str", "bin", "date", "arr", "obj",
+      "null",
+      "bool",
+      "int",
+      "float",
+      "bigint",
+      "str",
+      "bin",
+      "date",
+      "arr",
+      "obj",
     );
     expect(n).toBeNull();
     expect(b).toBe(false);
@@ -139,7 +165,12 @@ describe("client-ts e2e", () => {
       ["ключ", "значение"],
       ["", "empty key"],
     ]);
-    expect(await c.get(key, "ключ", "", "ключ2")).toEqual(["bin", "значение", "empty key", null]);
+    expect(await c.get(key, "ключ", "", "ключ2")).toEqual([
+      "bin",
+      "значение",
+      "empty key",
+      null,
+    ]);
     c.close();
   });
 
@@ -163,6 +194,7 @@ describe("client-ts e2e", () => {
       Array.from({ length: 16 }, async (_, t) => {
         for (let i = 0; i < 50; i++) {
           const k = `t${t}-${i}`;
+          // biome-ignore lint/performance/noAwaitInLoops: each task is deliberately sequential; the tasks run concurrently
           await c.set(k, { k, i });
           expect(await c.get<{ k: string; i: number }>(k)).toEqual({ k, i });
         }
@@ -171,9 +203,13 @@ describe("client-ts e2e", () => {
     // Many calls issued in one tick are coalesced into one write and
     // answered in order.
     const results = await Promise.all(
-      Array.from({ length: 200 }, (_, i) => c.get<{ k: string }>(`t${i % 16}-${i % 50}`)),
+      Array.from({ length: 200 }, (_, i) =>
+        c.get<{ k: string }>(`t${i % 16}-${i % 50}`),
+      ),
     );
-    results.forEach((r, i) => expect(r!.k).toBe(`t${i % 16}-${i % 50}`));
+    for (const [i, r] of results.entries()) {
+      expect(r?.k).toBe(`t${i % 16}-${i % 50}`);
+    }
     c.close();
   });
 
@@ -211,7 +247,10 @@ describe("token auth", () => {
   });
 
   test("wrong token", async () => {
-    const err = await Client.connect({ port: server.port, token: "s3cre" }).catch((e) => e);
+    const err = await Client.connect({
+      port: server.port,
+      token: "s3cre",
+    }).catch((e) => e);
     expect(err).toBeInstanceOf(StatusError);
     expect((err as StatusError).status).toBe(Status.Unauthorized);
   });
