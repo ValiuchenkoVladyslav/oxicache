@@ -42,7 +42,10 @@ export function toBytes(b: Bin): Uint8Array {
 }
 
 export class DecodeError extends Error {
-  override name = "DecodeError";
+  constructor(message: string) {
+    super(message);
+    this.name = "DecodeError";
+  }
 }
 
 const U32 = 4;

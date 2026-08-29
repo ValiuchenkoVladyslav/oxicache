@@ -6,6 +6,11 @@ const bin = resolve(root, "target/debug/oxicache-server");
 
 let built: Promise<void> | undefined;
 
+/** Bun insists on a `data` handler even for sockets that never receive. */
+const ignore = () => {
+  // nothing to read
+};
+
 /** Build the server once per test process. */
 function build(): Promise<void> {
   built ??= (async () => {
@@ -24,11 +29,7 @@ function freePort(): number {
   const l = Bun.listen({
     hostname: "127.0.0.1",
     port: 0,
-    socket: {
-      data() {
-        // never receives anything
-      },
-    },
+    socket: { data: ignore },
   });
   const port = l.port;
   l.stop(true);
@@ -46,6 +47,7 @@ async function waitForListen(
     if (!alive()) throw new Error("server exited before listening");
     // biome-ignore lint/performance/noAwaitInLoops: polling is sequential by nature
     const ok = await new Promise<boolean>((resolve) => {
+      const fail = () => resolve(false);
       Bun.connect({
         hostname: "127.0.0.1",
         port,
@@ -54,17 +56,11 @@ async function waitForListen(
             s.end();
             resolve(true);
           },
-          data() {
-            // never receives anything
-          },
-          error() {
-            resolve(false);
-          },
-          connectError() {
-            resolve(false);
-          },
+          data: ignore,
+          error: fail,
+          connectError: fail,
         },
-      }).catch(() => resolve(false));
+      }).catch(fail);
     });
     if (ok) return;
     await Bun.sleep(20);

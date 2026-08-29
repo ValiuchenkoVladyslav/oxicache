@@ -1,0 +1,5 @@
+[test]
+coverage = true
+coverageThreshold = 1.0
+# Coverage is about the library; test helpers are exercised by the tests themselves.
+coveragePathIgnorePatterns = ["tests/**"]

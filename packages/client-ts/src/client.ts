@@ -103,16 +103,18 @@ export class Client {
 
   static async connect(opts: ConnectOptions): Promise<Client> {
     const client = new Client(opts);
+    // Any way the socket goes away ends with the same bookkeeping.
+    const gone = (_s: unknown, err?: unknown) => client.onClose(err);
     client.socket = await Bun.connect({
       hostname: opts.hostname ?? "127.0.0.1",
       port: opts.port,
       socket: {
         data: (_s, chunk) => client.onData(chunk),
         drain: () => client.flush(),
-        close: (_s, err) => client.onClose(err),
-        error: (_s, err) => client.onClose(err),
-        connectError: (_s, err) => client.onClose(err),
-        end: () => client.onClose(),
+        close: gone,
+        error: gone,
+        connectError: gone,
+        end: gone,
       },
     });
     if (client.closed) throw client.closed;

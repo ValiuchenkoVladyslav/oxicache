@@ -231,6 +231,12 @@ describe("client-ts e2e", () => {
   });
 });
 
+test("a server that exits before listening is reported", async () => {
+  await expect(startServer(["--no-such-flag"])).rejects.toThrow(
+    "server exited before listening",
+  );
+});
+
 describe("token auth", () => {
   let server: TestServer;
   beforeAll(async () => {
