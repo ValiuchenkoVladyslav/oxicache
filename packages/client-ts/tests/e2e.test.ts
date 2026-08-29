@@ -29,15 +29,26 @@ describe("client-ts e2e", () => {
     expect(c.isOpen).toBe(false);
   });
 
+  test("several keys in, tuple out", async () => {
+    const c = await Client.connect({ port: server.port });
+    await c.set(["a", "1"], ["b", [0, 1, 2]]);
+    const [a, b, missing] = await c.get("a", "b", "c");
+    expect(a).toBe("1");
+    expect(b).toEqual([0, 1, 2]);
+    expect(missing).toBeNull();
+    expect(await c.del("a", "zz")).toEqual([true, false]);
+    expect(await c.get("a", "b")).toEqual([null, [0, 1, 2]]);
+    c.close();
+  });
+
   test("array in, array out", async () => {
     const c = await Client.connect({ port: server.port });
-    await c.set([
-      ["a", "1"],
-      ["b", [0, 1, 2]],
-    ]);
-    expect(await c.get(["a", "b", "c"])).toEqual(["1", [0, 1, 2], null]);
-    expect(await c.del(["a", "zz"])).toEqual([true, false]);
-    expect(await c.get(["a"])).toEqual([null]);
+    const keys = Array.from({ length: 20 }, (_, i) => `arr-${i}`);
+    await c.set(keys.map((k, i) => [k, i] as const));
+    expect(await c.get<number>(keys)).toEqual(keys.map((_, i) => i));
+    expect(await c.get(["arr-0"])).toEqual([0]); // one-element array stays an array
+    expect(await c.del([...keys, "zz"])).toEqual([...keys.map(() => true), false]);
+    expect(await c.get(keys)).toEqual(keys.map(() => null));
     c.close();
   });
 
@@ -64,7 +75,7 @@ describe("client-ts e2e", () => {
 
   test("every primitive kind", async () => {
     const c = await Client.connect({ port: server.port });
-    await c.set([
+    await c.set(
       ["null", null],
       ["bool", false],
       ["int", -42],
@@ -75,10 +86,10 @@ describe("client-ts e2e", () => {
       ["date", new Date(1234567890123)],
       ["arr", [1, "a", null]],
       ["obj", { nested: { deep: true } }],
-    ]);
-    const [n, b, i, f, bi, s, bin, d, arr, obj] = await c.get([
+    );
+    const [n, b, i, f, bi, s, bin, d, arr, obj] = await c.get(
       "null", "bool", "int", "float", "bigint", "str", "bin", "date", "arr", "obj",
-    ]);
+    );
     expect(n).toBeNull();
     expect(b).toBe(false);
     expect(i).toBe(-42);
@@ -100,7 +111,7 @@ describe("client-ts e2e", () => {
       ["ключ", "значение"],
       ["", "empty key"],
     ]);
-    expect(await c.get([key, "ключ", "", "ключ2"])).toEqual(["bin", "значение", "empty key", null]);
+    expect(await c.get(key, "ключ", "", "ключ2")).toEqual(["bin", "значение", "empty key", null]);
     c.close();
   });
 

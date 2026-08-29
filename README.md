@@ -81,18 +81,20 @@ import { Client } from "@oxicache/client";
 const c = await Client.connect({ hostname: "127.0.0.1", port: 4433, token: "s3cret" });
 
 await c.set("user:7", { id: 7, name: "alice", joined: new Date() });  // one
-await c.set([["a", 1], ["b", ["x", null]]]);                           // many
+await c.set(["a", 1], ["b", ["x", null]]);                             // several
+await c.set(entries);                                                  // Entry[] of any length
 
-const u = await c.get<User>("user:7");      // User | null
-const [a, z] = await c.get<number>(["a", "z"]); // [number | null, number | null]
-const vs = await c.get<number>(someKeys);       // (number | null)[] for a plain array
+const u = await c.get<User>("user:7");          // User | null
+const [a, z] = await c.get<number>("a", "z");   // [number | null, number | null]
+const vs = await c.get<number>(someKeys);       // (number | null)[] for a runtime-length array
 const d = await c.del("a");                     // boolean
-const ds = await c.del(["a", "b"]);             // [boolean, boolean]
+const ds = await c.del("a", "b");               // [boolean, boolean]
 c.close();
 ```
 
-One key in, one result out; an array in, an array out — enforced by overloads, and a key
-tuple of known length (up to 16) yields a result tuple of the same length. The return
+One key in, one result out; several keys in, a tuple of that length out (up to 16 literal
+keys); an array in, an array out for lengths only known at runtime — all enforced by
+overloads, so `...spread` of a plain array is a compile error (pass the array). The return
 type parameter says what a stored value decodes to and is not checked at runtime. Calls
 issued in the same tick are coalesced into one write; a non-OK status rejects with
 `StatusError` (`.status` is the `Status` enum), a dropped connection with `ClosedError`.

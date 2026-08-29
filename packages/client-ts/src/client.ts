@@ -53,6 +53,13 @@ export type Fill<N extends number, R, A extends R[] = []> = A["length"] extends 
   ? A
   : Fill<N, R, [...A, R]>;
 
+/** Normalise `(key)`, `(k1, k2, …)` and `(keys[])` into a key list plus whether the result is a list. */
+function keyArgs(args: Bin[] | [readonly Bin[]]): [readonly Bin[], boolean] {
+  const first = args[0];
+  if (args.length === 1 && Array.isArray(first)) return [first, true];
+  return [args as Bin[], args.length !== 1];
+}
+
 interface Pending {
   resolve: (body: Uint8Array) => void;
   reject: (err: Error) => void;
@@ -110,73 +117,78 @@ export class Client {
   }
 
   /**
-   * Fetch one key or many. Single key in, single value out; array in, array
-   * out (one slot per key, in request order). `null` marks an absent key.
-   * `T` is what the stored value decodes to; it is not checked at runtime.
+   * Fetch one key or many. One key in, one value out; several keys in, a
+   * tuple of values out, one per key in argument order (up to 16 literal
+   * keys); an array in, an array out, for lists whose length is only known
+   * at runtime. `null` marks an absent key. `T` is what a stored value
+   * decodes to; it is not checked at runtime.
    */
   get<T = Value>(key: Bin): Promise<T | null>;
-  // A key tuple of known length (up to 16) yields a result tuple of the same
-  // length; generated per arity because `T` is given explicitly, which stops
-  // TypeScript inferring a second type parameter for the keys.
-  get<T = Value>(keys: readonly [Bin]): Promise<Fill<1, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin]): Promise<Fill<2, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin]): Promise<Fill<3, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin]): Promise<Fill<4, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin]): Promise<Fill<5, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<6, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<7, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<8, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<9, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<10, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<11, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<12, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<13, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<14, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<15, T | null>>;
-  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<16, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin): Promise<Fill<2, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin): Promise<Fill<3, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin): Promise<Fill<4, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin): Promise<Fill<5, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin): Promise<Fill<6, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin): Promise<Fill<7, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin): Promise<Fill<8, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin): Promise<Fill<9, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin): Promise<Fill<10, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin): Promise<Fill<11, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin): Promise<Fill<12, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin): Promise<Fill<13, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin): Promise<Fill<14, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin, k15: Bin): Promise<Fill<15, T | null>>;
+  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin, k15: Bin, k16: Bin): Promise<Fill<16, T | null>>;
   get<T = Value>(keys: readonly Bin[]): Promise<(T | null)[]>;
-  async get<T = Value>(keys: Bin | readonly Bin[]): Promise<(T | null) | (T | null)[]> {
-    const many = Array.isArray(keys);
-    const body = await this.call(encodeKeysFrame(Op.Get, many ? keys : [keys as Bin]));
+  async get<T = Value>(...args: Bin[] | [readonly Bin[]]): Promise<(T | null) | (T | null)[]> {
+    const [keys, many] = keyArgs(args);
+    const body = await this.call(encodeKeysFrame(Op.Get, keys));
     const values = decodeValues(body).map((v) => (v === null ? null : decodeValue<T>(v)));
     return many ? values : (values[0] ?? null);
   }
 
   /**
-   * Store one key/value pair or many. Values are msgpack-encoded; anything
-   * that fails `Encodable` (functions, symbols, `undefined`, `Map`, …) is
-   * rejected at compile time.
+   * Store one key/value pair, several, or an array of them. Values are
+   * msgpack-encoded; anything that fails `Encodable` (functions, symbols,
+   * `undefined`, `Map`, …) is rejected at compile time, entry by entry.
    */
   set<V>(key: Bin, value: V & Encodable<V>): Promise<void>;
+  set<E extends readonly Entry<unknown>[]>(...entries: Entries<E>): Promise<void>;
   set<E extends readonly Entry<unknown>[]>(entries: Entries<E>): Promise<void>;
-  async set(a: Bin | readonly Entry<unknown>[], ...rest: [unknown?]): Promise<void> {
-    const entries: readonly Entry<unknown>[] =
-      rest.length === 1 ? [[a as Bin, rest[0]]] : (a as readonly Entry<unknown>[]);
+  async set(...args: [Bin, unknown] | Entry<unknown>[] | [readonly Entry<unknown>[]]): Promise<void> {
+    let entries: readonly Entry<unknown>[];
+    const first = args[0];
+    if (!Array.isArray(first)) {
+      entries = [[first as Bin, args[1]]]; // set(key, value)
+    } else if (first.length === 0 || Array.isArray(first[0])) {
+      entries = first as readonly Entry<unknown>[]; // set(entries)
+    } else {
+      entries = args as Entry<unknown>[]; // set([k, v], [k2, v2], ...)
+    }
     await this.call(encodeEntriesFrame(entries.map(([k, v]) => [k, encodeValue(v)] as const)));
   }
 
-  /** Delete one key or many; returns whether each one existed. */
+  /** Delete one key or many; returns whether each one existed. Same shapes as `get`. */
   del(key: Bin): Promise<boolean>;
-  del(keys: readonly [Bin]): Promise<Fill<1, boolean>>;
-  del(keys: readonly [Bin, Bin]): Promise<Fill<2, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin]): Promise<Fill<3, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin]): Promise<Fill<4, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin]): Promise<Fill<5, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<6, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<7, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<8, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<9, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<10, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<11, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<12, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<13, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<14, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<15, boolean>>;
-  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<16, boolean>>;
+  del(k1: Bin, k2: Bin): Promise<Fill<2, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin): Promise<Fill<3, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin): Promise<Fill<4, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin): Promise<Fill<5, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin): Promise<Fill<6, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin): Promise<Fill<7, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin): Promise<Fill<8, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin): Promise<Fill<9, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin): Promise<Fill<10, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin): Promise<Fill<11, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin): Promise<Fill<12, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin): Promise<Fill<13, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin): Promise<Fill<14, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin, k15: Bin): Promise<Fill<15, boolean>>;
+  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin, k15: Bin, k16: Bin): Promise<Fill<16, boolean>>;
   del(keys: readonly Bin[]): Promise<boolean[]>;
-  async del(keys: Bin | readonly Bin[]): Promise<boolean | boolean[]> {
-    const many = Array.isArray(keys);
-    const flags = decodeFlags(await this.call(encodeKeysFrame(Op.Del, many ? keys : [keys as Bin])));
+  async del(...args: Bin[] | [readonly Bin[]]): Promise<boolean | boolean[]> {
+    const [keys, many] = keyArgs(args);
+    const flags = decodeFlags(await this.call(encodeKeysFrame(Op.Del, keys)));
     return many ? flags : (flags[0] ?? false);
   }
 

@@ -29,38 +29,38 @@ declare const user: User;
 
 // Single in, single out; array in, array out; return generic first.
 async function _shapes() {
+  // One key: one value. Several keys: a tuple of that length. Array: a list.
   const one = await c.get<User>("k");
   assertType<Equal<typeof one, User | null>>();
-  const many = await c.get<User>(["a", new Uint8Array(1)]);
-  assertType<Equal<typeof many, [User | null, User | null]>>();
-  // Key tuples of known length give result tuples of that length.
-  const two = await c.get<User>(["a", "b"]);
+  const two = await c.get<User>("a", new Uint8Array(1));
   assertType<Equal<typeof two, [User | null, User | null]>>();
   const [x, y] = two;
   assertType<Equal<typeof x, User | null>>();
   assertType<Equal<typeof y, User | null>>();
-  const ks = ["a", "b", "c"] as const;
-  const three = await c.get<number>(ks);
+  const three = await c.get<number>("a", "b", "c");
   assertType<Equal<typeof three, [number | null, number | null, number | null]>>();
-  const sixteen = await c.get<number>(["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]);
+  const sixteen = await c.get<number>("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16");
   assertType<Equal<typeof sixteen["length"], 16>>();
-  // Past 16, or from a plain array, the length is unknown.
-  const seventeen = await c.get<number>(["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17"]);
-  assertType<Equal<typeof seventeen, (number | null)[]>>();
   const dyn: string[] = ["a", "b"];
   const fromArray = await c.get<User>(dyn);
   assertType<Equal<typeof fromArray, (User | null)[]>>();
+  const fromTuple = await c.get<User>(["a", "b"]);
+  assertType<Equal<typeof fromTuple, (User | null)[]>>();
   const dflt = await c.get("k");
   assertType<Equal<typeof dflt, Value | null>>();
   const d1 = await c.del("k");
   assertType<Equal<typeof d1, boolean>>();
-  const dn = await c.del(["k", "j"]);
+  const dn = await c.del("k", "j");
   assertType<Equal<typeof dn, [boolean, boolean]>>();
   const dArr = await c.del(dyn);
   assertType<Equal<typeof dArr, boolean[]>>();
-  // @ts-expect-error array in must not be assignable to single out
-  const wrong: User | null = await c.get<User>(["k"]);
+  // @ts-expect-error several keys in must not be assignable to single out
+  const wrong: User | null = await c.get<User>("k", "j");
   void wrong;
+  // @ts-expect-error a spread of unknown length must use the array form
+  await c.get<User>(...dyn);
+  // @ts-expect-error more than 16 literal keys must use the array form
+  await c.get<number>("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17");
 
   // Accepted values: literals, interfaces, classes, primitives, mixed batches.
   await c.set("u", user);
@@ -69,11 +69,10 @@ async function _shapes() {
   await c.set("big", 10n);
   await c.set("bin", new Uint8Array(2));
   await c.set(new Uint8Array([1]), null);
-  await c.set([
-    ["a", 1],
-    ["b", "two"],
-    ["c", user],
-  ]);
+  await c.set(["a", 1], ["b", "two"], ["c", user]);
+  await c.set([["a", 1], ["b", "two"], ["c", user]]);
+  const dynEntries: [string, number][] = [["a", 1]];
+  await c.set(dynEntries);
 
   // Rejected values.
   // @ts-expect-error functions
@@ -88,6 +87,8 @@ async function _shapes() {
   await c.set("m", new Map<string, number>());
   // @ts-expect-error Set
   await c.set("st", new Set<number>());
+  // @ts-expect-error function-valued property in a variadic batch
+  await c.set(["a", 1], ["b", { fn: () => 1 }]);
   // @ts-expect-error function-valued property in an array batch
   await c.set([["a", { fn: () => 1 }]]);
   // @ts-expect-error keys are Bin, not arbitrary values
