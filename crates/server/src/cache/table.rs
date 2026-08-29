@@ -45,6 +45,9 @@ const _: () = assert!(
 #[repr(C, align(64))]
 struct Bucket([AtomicU64; SLOTS]);
 
+/// Line-aligned so the header every lookup reads (`buckets`, `mask`) never
+/// shares a line with a neighbouring allocation another thread writes.
+#[repr(align(64))]
 struct Table {
     buckets: Box<[Bucket]>,
     mask: usize,
@@ -188,14 +191,28 @@ impl Writer {
     }
 }
 
-pub struct Index {
+/// What every lookup reads, on a line of its own: a writer's bookkeeping
+/// stores must not invalidate the line readers need to find the table.
+#[repr(align(128))]
+struct ReadHot {
     table: Atomic<Table>,
-    len: AtomicUsize,
-    kick_seed: AtomicUsize,
     /// Seqlock over cuckoo displacement in the live table: odd while a path
     /// is being applied. A reader that misses re-checks it and retries, so
     /// an entry in flight between its two buckets is never reported absent.
     moving: AtomicU64,
+}
+
+/// Written on every insert/remove; only the shard's single writer touches
+/// it, apart from `len` being read unlocked.
+#[repr(align(128))]
+struct WriteHot {
+    len: AtomicUsize,
+    kick_seed: AtomicUsize,
+}
+
+pub struct Index {
+    r: ReadHot,
+    w: WriteHot,
 }
 
 /// A borrowed entry, valid for the lifetime of the epoch guard it came from.
@@ -221,21 +238,25 @@ impl Default for Index {
 impl Index {
     pub fn new() -> Self {
         Self {
-            table: Atomic::new(Table::new(MIN_BUCKETS)),
-            len: AtomicUsize::new(0),
-            kick_seed: AtomicUsize::new(1),
-            moving: AtomicU64::new(0),
+            r: ReadHot {
+                table: Atomic::new(Table::new(MIN_BUCKETS)),
+                moving: AtomicU64::new(0),
+            },
+            w: WriteHot {
+                len: AtomicUsize::new(0),
+                kick_seed: AtomicUsize::new(1),
+            },
         }
     }
 
     pub fn len(&self) -> usize {
-        self.len.load(Relaxed)
+        self.w.len.load(Relaxed)
     }
 
     #[inline]
     fn load<'g>(&self, guard: &'g Guard) -> &'g Table {
         // SAFETY: the table pointer is always valid and retired via the guard.
-        unsafe { self.table.load(Acquire, guard).deref() }
+        unsafe { self.r.table.load(Acquire, guard).deref() }
     }
 
     /// Prefetch both candidate buckets for `hash`.
@@ -257,7 +278,7 @@ impl Index {
     #[inline]
     pub fn get<'g>(&self, hash: u64, key: &[u8], guard: &'g Guard) -> Option<EntryRef<'g>> {
         loop {
-            let seq = self.moving.load(Acquire);
+            let seq = self.r.moving.load(Acquire);
             let t = self.load(guard);
             if let Some((_, _, w)) = t.find(hash, key) {
                 // SAFETY: found under the guard; the entry outlives it.
@@ -267,7 +288,7 @@ impl Index {
                 });
             }
             fence(Acquire);
-            if seq & 1 == 0 && self.moving.load(Relaxed) == seq {
+            if seq & 1 == 0 && self.r.moving.load(Relaxed) == seq {
                 return None;
             }
             // A displacement overlapped the lookup; the key may have moved
@@ -285,13 +306,13 @@ impl Index {
             return Some(unsafe { entry_from_word(old) });
         }
         let new_word = word(tag, entry.into_raw());
-        if self.len.load(Relaxed) * 8 >= t.buckets.len() * SLOTS * MAX_LOAD_EIGHTHS {
+        if self.w.len.load(Relaxed) * 8 >= t.buckets.len() * SLOTS * MAX_LOAD_EIGHTHS {
             self.grow(guard);
         }
         loop {
             let t = self.load(guard);
             if self.place(t, hash, new_word, true) {
-                self.len.fetch_add(1, Relaxed);
+                self.w.len.fetch_add(1, Relaxed);
                 return None;
             }
             self.grow(guard);
@@ -303,7 +324,7 @@ impl Index {
         let t = self.load(guard);
         let (b, i, w) = t.find(hash, key)?;
         t.buckets[b].0[i].store(0, Release);
-        self.len.fetch_sub(1, Relaxed);
+        self.w.len.fetch_sub(1, Relaxed);
         // SAFETY: unlinked; caller retires or keeps the handle.
         Some(unsafe { entry_from_word(w) })
     }
@@ -322,7 +343,7 @@ impl Index {
             return None;
         }
         t.buckets[b].0[i].store(0, Release);
-        self.len.fetch_sub(1, Relaxed);
+        self.w.len.fetch_sub(1, Relaxed);
         // SAFETY: unlinked; caller retires or keeps the handle.
         Some(unsafe { entry_from_word(w) })
     }
@@ -347,7 +368,7 @@ impl Index {
         // Apply the path backwards, last hop first, so every slot is copied
         // out before it is overwritten.
         if live {
-            self.moving.fetch_add(1, Relaxed);
+            self.r.moving.fetch_add(1, Relaxed);
             fence(Release);
         }
         let (mut db, mut di) = dest;
@@ -358,7 +379,7 @@ impl Index {
         }
         t.buckets[db].0[di].store(new_word, Release);
         if live {
-            self.moving.fetch_add(1, Release);
+            self.r.moving.fetch_add(1, Release);
         }
         true
     }
@@ -369,7 +390,7 @@ impl Index {
     /// that entry under a bucket it does not hash to, losing it. A walk that
     /// loops is abandoned and retried with a fresh seed.
     fn find_path(&self, t: &Table, b1: usize, b2: usize) -> Option<(Vec<Slot>, Slot)> {
-        let mut seed = self.kick_seed.load(Relaxed);
+        let mut seed = self.w.kick_seed.load(Relaxed);
         let mut path: Vec<Slot> = Vec::with_capacity(16);
         let mut found = None;
         'walk: for _ in 0..MAX_WALKS {
@@ -393,12 +414,12 @@ impl Index {
                 b = next;
             }
         }
-        self.kick_seed.store(seed, Relaxed);
+        self.w.kick_seed.store(seed, Relaxed);
         found.map(|dest| (path, dest))
     }
 
     fn grow(&self, guard: &Guard) {
-        let old = self.table.load(Acquire, guard);
+        let old = self.r.table.load(Acquire, guard);
         // SAFETY: valid under the guard; single writer.
         let old_t = unsafe { old.deref() };
         let mut n = old_t.buckets.len() * 2;
@@ -418,7 +439,7 @@ impl Index {
                 }
             }
             let fresh = Owned::new(fresh).into_shared(guard);
-            self.table.store(fresh, Release);
+            self.r.table.store(fresh, Release);
             // Readers may still borrow `old`, so disown it through the atomic
             // rather than a `&mut` that would alias them.
             old_t.owns.store(false, Relaxed);
@@ -437,7 +458,7 @@ impl Drop for Index {
     fn drop(&mut self) {
         // SAFETY: no readers can exist while we hold `&mut self`.
         unsafe {
-            let t = self.table.load(Relaxed, epoch::unprotected());
+            let t = self.r.table.load(Relaxed, epoch::unprotected());
             if !t.is_null() {
                 drop(t.into_owned());
             }

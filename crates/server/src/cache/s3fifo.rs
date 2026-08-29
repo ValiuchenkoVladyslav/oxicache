@@ -314,6 +314,12 @@ struct Queues {
     dead_bytes: usize,
 }
 
+/// Aligned so consecutive shards in the cache's slice never share a cache
+/// line (at 128 bytes, also not an adjacent-line prefetch pair): one shard's
+/// writer counters must not evict the line another shard's readers need.
+/// Field order keeps the index's reader-hot line first and the mutex, queues
+/// and budgets (writer-only) after it.
+#[repr(C, align(128))]
 pub struct Shard {
     index: Index,
     q: Mutex<Queues>,
@@ -667,6 +673,14 @@ mod tests {
         for i in 0..10 {
             assert!(get(&s, &key(i)).is_some(), "lost key {i}");
         }
+    }
+
+    #[test]
+    fn shard_layout_separates_reader_and_writer_lines() {
+        assert_eq!(std::mem::align_of::<Shard>(), 128);
+        assert_eq!(std::mem::size_of::<Shard>() % 128, 0);
+        assert_eq!(std::mem::offset_of!(Shard, index), 0);
+        assert!(std::mem::offset_of!(Shard, q) >= 256);
     }
 
     #[test]
