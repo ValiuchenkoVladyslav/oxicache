@@ -30,6 +30,14 @@ const ENTRY_OVERHEAD: usize = 128;
 /// Minimum number of ghost hashes retained regardless of main queue length.
 const GHOST_MIN: usize = 64;
 
+/// An entry whose cost exceeds the byte budget of the shard it hashes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("entry of {cost} bytes exceeds the per-shard capacity of {capacity} bytes")]
+pub struct TooLarge {
+    pub cost: usize,
+    pub capacity: usize,
+}
+
 /// Per-entry metadata stored in front of the key and value bytes.
 pub struct Meta {
     key: Key,
@@ -354,14 +362,38 @@ impl Shard {
         self.index.len()
     }
 
+    /// Whether an entry for `key`/`value` can ever be resident here. Every
+    /// shard has the same capacity, so one shard answers for all.
+    pub fn check_fits(&self, key: &[u8], value: &[u8]) -> Result<(), TooLarge> {
+        let cost = key.len() + value.len() + ENTRY_OVERHEAD;
+        if cost > self.capacity {
+            return Err(TooLarge {
+                cost,
+                capacity: self.capacity,
+            });
+        }
+        Ok(())
+    }
+
     /// Insert or replace. Returns whether any entry was retired (replaced or
-    /// evicted) under `guard`.
+    /// evicted) under `guard`. Callers are expected to have run
+    /// [`check_fits`](Self::check_fits); an oversized entry is stored anyway
+    /// and simply evicts everything else.
     pub fn set(&self, key: &[u8], value: &[u8], hash: u64, guard: &Guard) -> bool {
         let entry = Entry::new(Key::new(key), value, hash);
         let cost = entry.cost();
         let mut retired = false;
 
         let mut q = self.q.lock();
+        // Replace first: the old entry's budget is released before deciding
+        // how much to evict, so overwriting a key at full capacity does not
+        // evict `cost` bytes of neighbours on top of the entry it replaces.
+        // The new entry is not in any queue yet, so eviction cannot reach it.
+        if let Some(old) = self.index.insert(&mut q.w, hash, entry.clone(), guard) {
+            self.kill(&mut q, &old);
+            retire(old, guard);
+            retired = true;
+        }
         while q.used + cost > self.capacity {
             // Not identical: eviction order differs, which is the whole point of S3-FIFO.
             #[allow(clippy::if_same_then_else)]
@@ -373,11 +405,6 @@ impl Shard {
             if !evicted {
                 break;
             }
-            retired = true;
-        }
-        if let Some(old) = self.index.insert(&mut q.w, hash, entry.clone(), guard) {
-            self.kill(&mut q, &old);
-            retire(old, guard);
             retired = true;
         }
         q.used += cost;
@@ -624,6 +651,29 @@ mod tests {
             "compaction should bound dead bytes"
         );
         assert!(q.small.len() + q.main.len() <= 25);
+    }
+
+    #[test]
+    fn replacing_at_full_capacity_evicts_only_the_old_entry() {
+        // Ten equal entries fill the shard exactly; overwriting one with a
+        // same-sized value must keep the other nine.
+        let s = shard(10 * (key(0).len() + 100 + ENTRY_OVERHEAD));
+        for i in 0..10 {
+            set(&s, i, 100);
+        }
+        assert_eq!(s.len(), 10);
+        set(&s, 3, 100);
+        assert_eq!(s.len(), 10, "replacement must not evict neighbours");
+        for i in 0..10 {
+            assert!(get(&s, &key(i)).is_some(), "lost key {i}");
+        }
+    }
+
+    #[test]
+    fn check_fits_rejects_oversized() {
+        let s = shard(1000);
+        assert!(s.check_fits(b"k", &[0; 100]).is_ok());
+        assert!(s.check_fits(b"k", &[0; 5000]).is_err());
     }
 
     #[test]

@@ -10,7 +10,7 @@ mod table;
 use std::hash::{BuildHasher, Hasher};
 
 use crossbeam_epoch as epoch;
-pub use s3fifo::Entry;
+pub use s3fifo::{Entry, TooLarge};
 use s3fifo::Shard;
 pub use table::EntryRef;
 
@@ -92,15 +92,22 @@ impl Cache {
     }
 
     #[inline]
-    pub fn set(&self, key: &[u8], value: &[u8]) {
-        self.set_many([(key, value)]);
+    pub fn set(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), TooLarge> {
+        self.set_many([(key, value)])
     }
 
-    /// Store many entries under a single epoch pin.
-    pub fn set_many<'a, I>(&self, entries: I)
+    /// Store many entries under a single epoch pin. An entry that could
+    /// never fit its shard fails the whole batch before anything is written,
+    /// rather than flushing every resident entry of that shard to make room.
+    pub fn set_many<'a, I>(&self, entries: I) -> std::result::Result<(), TooLarge>
     where
         I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+        I::IntoIter: Clone,
     {
+        let entries = entries.into_iter();
+        for (k, v) in entries.clone() {
+            self.shards[0].check_fits(k, v)?;
+        }
         let guard = epoch::pin();
         let mut retired = false;
         for (k, v) in entries {
@@ -110,6 +117,7 @@ impl Cache {
         if retired {
             collect(&guard);
         }
+        Ok(())
     }
 
     #[inline]
@@ -169,7 +177,7 @@ mod tests {
         let c = Cache::new(64 << 20, 12);
         assert_eq!(c.shards.len(), 16);
         for i in 0..10_000u32 {
-            c.set(i.to_string().as_bytes(), b"v");
+            c.set(i.to_string().as_bytes(), b"v").unwrap();
         }
         assert_eq!(c.len(), 10_000);
         assert!(
@@ -187,7 +195,7 @@ mod tests {
     #[test]
     fn get_many_in_order() {
         let c = Cache::new(1 << 20, 1);
-        c.set(b"k", b"v");
+        c.set(b"k", b"v").unwrap();
         let seen: Vec<Option<Vec<u8>>> = c.get_many([&b"k"[..], &b"x"[..], &b"k"[..]], |es| {
             es.iter()
                 .map(|e| e.as_ref().map(|e| e.value().to_vec()))

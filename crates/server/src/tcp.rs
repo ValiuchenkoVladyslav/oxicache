@@ -7,23 +7,34 @@
 //! frame before anything else; the check is a single well-predicted branch
 //! per frame afterwards.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use oxicache_wire::io::{FrameReader, FrameWriter};
 use oxicache_wire::{self as wire, Op, Status};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{debug, info};
+use tokio::task::JoinSet;
+use tracing::{debug, info, warn};
 
 use crate::cache::{Cache, Entry};
 use crate::error::{Error, Result};
 
-/// Largest request body accepted.
-pub const MAX_FRAME: usize = 64 << 20;
+/// Largest request body accepted from an authenticated peer.
+pub const MAX_FRAME: usize = wire::MAX_FRAME;
+/// Largest frame accepted before authentication: room for a token, nothing
+/// more, so an unauthenticated peer cannot make the server buffer much.
+pub const MAX_AUTH_FRAME: usize = 4 << 10;
 /// Largest response body produced. A `GET` may name the same large key many
-/// times, so the total is bounded here rather than by the request size.
-pub const MAX_RESPONSE: usize = u32::MAX as usize;
+/// times, so the total is bounded here rather than by the request size; it
+/// matches what the client accepts.
+pub const MAX_RESPONSE: usize = wire::MAX_FRAME;
+/// How long in-flight connections get to finish their current batch at shutdown.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Pause after a failed `accept`, so fd exhaustion does not spin a worker.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Settings for [`Server::bind_with`].
 #[derive(Clone, Debug, Default)]
@@ -61,9 +72,28 @@ impl Server {
 
     /// Accept connections on the current runtime until the task is dropped.
     pub async fn run(&self) {
+        self.run_until(std::future::pending::<()>()).await;
+    }
+
+    /// Accept connections until `shutdown` resolves, then stop accepting and
+    /// give open connections a moment to flush the batch they are serving.
+    pub async fn run_until(&self, shutdown: impl Future<Output = ()>) {
         info!(addr = %self.local_addr(), "listening (tcp)");
         let l = self.listener.try_clone().expect("clone listener");
-        accept_loop(l, self.cache.clone(), self.token.clone()).await;
+        let mut conns = JoinSet::new();
+        tokio::select! {
+            _ = accept_loop(l, self.cache.clone(), self.token.clone(), &mut conns) => {}
+            _ = shutdown => {}
+        }
+        if conns.is_empty() {
+            return;
+        }
+        info!(open = conns.len(), "draining connections");
+        let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+            while conns.join_next().await.is_some() {}
+        })
+        .await;
+        conns.shutdown().await;
     }
 }
 
@@ -77,20 +107,30 @@ fn tcp_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     Ok(socket.into())
 }
 
-async fn accept_loop(listener: std::net::TcpListener, cache: Arc<Cache>, token: Option<Arc<[u8]>>) {
+async fn accept_loop(
+    listener: std::net::TcpListener,
+    cache: Arc<Cache>,
+    token: Option<Arc<[u8]>>,
+    conns: &mut JoinSet<()>,
+) {
     let listener = TcpListener::from_std(listener).expect("register listener");
     loop {
+        // Reap finished tasks so the set does not grow with every connection.
+        while conns.try_join_next().is_some() {}
         match listener.accept().await {
             Ok((stream, remote)) => {
                 let (cache, token) = (cache.clone(), token.clone());
-                tokio::spawn(async move {
+                conns.spawn(async move {
                     debug!(%remote, "connection open");
                     if let Err(e) = serve_connection(stream, &cache, token.as_deref()).await {
                         debug!(%remote, error = %e, "connection closed");
                     }
                 });
             }
-            Err(e) => debug!(error = %e, "accept failed"),
+            Err(e) => {
+                warn!(error = %e, "accept failed");
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+            }
         }
     }
 }
@@ -102,9 +142,9 @@ async fn serve_connection(
 ) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let (mut r, mut w) = stream.into_split();
-    let mut reader = FrameReader::new(MAX_FRAME);
-    let mut out = FrameWriter::new();
     let mut authed = token.is_none();
+    let mut reader = FrameReader::new(if authed { MAX_FRAME } else { MAX_AUTH_FRAME });
+    let mut out = FrameWriter::new();
     loop {
         // Serve every complete frame already buffered, then flush once.
         loop {
@@ -114,6 +154,7 @@ async fn serve_connection(
                     let ok = op == Op::Auth as u8 && token.is_some_and(|t| ct_eq(t, body));
                     if ok {
                         authed = true;
+                        reader.set_max_frame(MAX_FRAME);
                         out.header(Status::Ok as u8, 0);
                     } else {
                         out.frame(
@@ -182,8 +223,10 @@ pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
         Some(Op::Set) => wire::entries(body).map(|entries| {
             // The cache copies key and value into its own allocation, so the
             // request body is released as soon as this returns.
-            cache.set_many(entries);
-            out.header(Status::Ok as u8, 0);
+            match cache.set_many(entries) {
+                Ok(()) => out.header(Status::Ok as u8, 0),
+                Err(e) => out.frame(Status::TooLarge as u8, Bytes::from(e.to_string())),
+            }
         }),
         Some(Op::Del) => wire::keys(body).map(|keys| {
             out.header(Status::Ok as u8, 4 + keys.len());
@@ -264,5 +307,26 @@ mod tests {
             call(&cache, Op::Get as u8, Bytes::from_static(&[9, 0])).0,
             Status::BadRequest
         );
+        // A count beyond the item limit is rejected before any work is done.
+        let mut huge = Vec::new();
+        huge.extend_from_slice(&((wire::MAX_ITEMS + 1) as u32).to_le_bytes());
+        huge.resize(4 + 4 * (wire::MAX_ITEMS + 1), 0);
+        let (st, msg) = call(&cache, Op::Get as u8, Bytes::from(huge));
+        assert_eq!(st, Status::BadRequest);
+        assert!(std::str::from_utf8(&msg).unwrap().contains("exceeds the limit"));
+    }
+
+    #[test]
+    fn oversized_set_is_rejected_whole() {
+        let cache = Cache::new(1 << 20, 1);
+        let big = vec![0u8; 1 << 20];
+        let (st, _) = call(
+            &cache,
+            Op::Set as u8,
+            wire::encode_entries([(&b"small"[..], &b"v"[..]), (&b"big"[..], &big[..])]),
+        );
+        assert_eq!(st, Status::TooLarge);
+        assert!(cache.get(b"small").is_none(), "nothing from the batch is stored");
+        assert!(cache.get(b"big").is_none());
     }
 }

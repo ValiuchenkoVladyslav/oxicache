@@ -90,10 +90,11 @@ async fn main() -> Result<()> {
     let server = Arc::new(Server::bind_with(args.addr, cache, opts)?);
     info!(capacity = args.capacity, shards, auth, "cache ready");
 
-    tokio::select! {
-        _ = server.run() => {}
-        _ = tokio::signal::ctrl_c() => {}
-    }
-    info!("shutting down");
+    server
+        .run_until(async {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("shutting down");
+        })
+        .await;
     Ok(())
 }

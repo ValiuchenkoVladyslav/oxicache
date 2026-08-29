@@ -24,12 +24,14 @@ pub enum Error {
     InvalidStatus(u8),
     #[error("decode: {0}")]
     Decode(#[from] wire::DecodeError),
+    #[error("response of {0} bytes exceeds the client limit of {MAX_FRAME}")]
+    ResponseTooLarge(usize),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Largest response body accepted from the server.
-const MAX_FRAME: usize = 64 << 20;
+const MAX_FRAME: usize = wire::MAX_FRAME;
 
 type Reply = oneshot::Sender<Result<Bytes>>;
 
@@ -177,7 +179,14 @@ async fn read_loop<R: AsyncRead + Unpin>(mut r: R, mut pending: mpsc::UnboundedR
                     }
                 }
                 Ok(None) => break,
-                Err(_) => return,
+                Err(wire::io::FrameTooLarge(n)) => {
+                    // Tell the caller why instead of a bare `Closed`; the
+                    // stream is desynchronised past this point, so stop.
+                    if let Some(reply) = pending.recv().await {
+                        let _ = reply.send(Err(Error::ResponseTooLarge(n)));
+                    }
+                    return;
+                }
             }
         }
         match reader.fill(&mut r).await {

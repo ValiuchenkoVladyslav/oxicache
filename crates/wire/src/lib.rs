@@ -105,11 +105,20 @@ pub enum DecodeError {
     InvalidTag(u8),
     #[error("trailing {0} bytes after frame")]
     Trailing(usize),
+    #[error("{0} items in one request exceeds the limit of {MAX_ITEMS}")]
+    TooMany(usize),
 }
 
 type Result<T> = std::result::Result<T, DecodeError>;
 
 const U32: usize = 4;
+
+/// Largest frame body either side accepts.
+pub const MAX_FRAME: usize = 64 << 20;
+/// Most keys or entries one request may name. Without a bound a 64 MiB body
+/// of empty keys encodes ~16.7 M of them, and the server's per-request
+/// scratch space grows with that count.
+pub const MAX_ITEMS: usize = 1 << 16;
 
 #[inline]
 fn need(buf: &Bytes, n: usize) -> Result<()> {
@@ -225,6 +234,9 @@ pub struct Keys<'a> {
 /// Validate and borrow a key list (body of `GET` and `DEL`).
 pub fn keys(body: &[u8]) -> Result<Keys<'_>> {
     let (n, mut rest) = split_count(body)?;
+    if n > MAX_ITEMS {
+        return Err(DecodeError::TooMany(n));
+    }
     for _ in 0..n {
         rest = skip_blob(rest)?.1;
     }
@@ -265,6 +277,9 @@ pub struct Entries<'a> {
 /// Validate and borrow an entry list (body of `SET`).
 pub fn entries(body: &[u8]) -> Result<Entries<'_>> {
     let (n, mut rest) = split_count(body)?;
+    if n > MAX_ITEMS {
+        return Err(DecodeError::TooMany(n));
+    }
     for _ in 0..n {
         rest = skip_blob(skip_blob(rest)?.1)?.1;
     }

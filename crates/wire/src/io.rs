@@ -39,6 +39,12 @@ impl FrameReader {
         }
     }
 
+    /// Change the accepted body length, e.g. to lift a small pre-authentication
+    /// limit once the peer has proven itself.
+    pub fn set_max_frame(&mut self, max_frame: usize) {
+        self.max_frame = max_frame;
+    }
+
     /// Next complete frame already in the buffer, as `(tag, body)`. The body
     /// borrows the read buffer and is released by the next call on the reader.
     /// `Ok(None)` means more input is needed.
@@ -97,9 +103,11 @@ impl FrameReader {
         if self.buf.is_empty() && self.buf.capacity() > 4 * BUF {
             self.buf = BytesMut::with_capacity(BUF);
         }
-        // One reservation covers both the pending frame and a healthy read
-        // size, so a large frame never triggers two reallocations.
-        let want = self.need.saturating_sub(self.buf.len()).max(BUF / 4);
+        // Grow towards a pending large frame geometrically rather than
+        // reserving its full claimed length up front: a peer that announces
+        // a maximal frame and sends nothing must not pin that much memory.
+        let pending = self.need.saturating_sub(self.buf.len());
+        let want = pending.min(self.buf.capacity().max(BUF)).max(BUF / 4);
         if self.buf.capacity() - self.buf.len() < want {
             self.buf.reserve(want.max(BUF));
         }
@@ -236,7 +244,9 @@ pub fn tune_allocator() {
     // SAFETY: mallopt only adjusts allocator parameters.
     unsafe {
         libc::mallopt(libc::M_TRIM_THRESHOLD, 256 << 20);
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 64 << 20);
+        // glibc rejects thresholds above HEAP_MAX_SIZE / 2 (32 MiB on 64-bit)
+        // and silently keeps its dynamic default.
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 32 << 20);
         libc::mallopt(libc::M_TOP_PAD, 16 << 20);
     }
 }
@@ -286,6 +296,24 @@ mod tests {
         let _ = tokio::io::AsyncReadExt::read(&mut b, &mut sink)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn claimed_large_frame_reserves_incrementally() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 20);
+        let mut r = FrameReader::new(64 << 20);
+        tokio::io::AsyncWriteExt::write_all(&mut a, &encode_header(1, 64 << 20))
+            .await
+            .unwrap();
+        assert!(r.fill(&mut b).await.unwrap());
+        assert_eq!(r.next_buffered().unwrap(), None);
+        tokio::io::AsyncWriteExt::write_all(&mut a, &[0u8; 16]).await.unwrap();
+        assert!(r.fill(&mut b).await.unwrap());
+        assert!(
+            r.buf.capacity() <= 4 * BUF,
+            "an unsent frame must not reserve its claimed size: {}",
+            r.buf.capacity()
+        );
     }
 
     #[test]
