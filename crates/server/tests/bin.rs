@@ -21,6 +21,7 @@ fn cmd(args: &[&str], env: &[(&str, &str)]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_oxicache-server"));
     c.args(args)
         .env_remove("OXICACHE_ADDR")
+        .env_remove("OXICACHE_HTTP_ADDR")
         .env_remove("OXICACHE_CAPACITY")
         .env_remove("OXICACHE_SHARDS")
         .env_remove("OXICACHE_TOKEN")
@@ -87,6 +88,22 @@ impl Drop for Running {
 }
 
 impl Running {
+    /// The HTTP listener's address, read from the log once it appears.
+    fn http_addr(&mut self) -> SocketAddr {
+        loop {
+            if let Some(rest) = self.log.split("listening (http) addr=").nth(1) {
+                return rest.split_whitespace().next().unwrap().parse().unwrap();
+            }
+            let mut raw = String::new();
+            assert!(
+                self.stdout.read_line(&mut raw).unwrap() > 0,
+                "exited: {}",
+                self.log
+            );
+            self.log.push_str(&plain(&raw));
+        }
+    }
+
     /// SIGINT, then wait; returns whether it exited cleanly and the whole
     /// output, log and warnings together.
     fn interrupt(mut self) -> (bool, String) {
@@ -183,4 +200,102 @@ fn token_and_env_overrides() {
     let (ok, log) = r.interrupt();
     assert!(ok, "{log}");
     assert!(log.contains("auth=false"), "{log}");
+}
+
+/// One HTTP/1.1 request; returns the status code and body.
+fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let mut s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n");
+    if let Some(a) = auth {
+        req.push_str(&format!("Authorization: Bearer {a}\r\n"));
+    }
+    req.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    s.write_all(req.as_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, raw[split + 4..].to_vec())
+}
+
+#[test]
+fn http_front_end_serves_alongside_tcp() {
+    let mut r = start(
+        &[
+            "--capacity",
+            "1M",
+            "--shards",
+            "1",
+            "--http-addr",
+            "127.0.0.1:0",
+            "--token",
+            "t0k",
+        ],
+        &[("OXICACHE_HTTP_ADDR", "127.0.0.1:1")],
+    );
+    let h = r.http_addr();
+    assert_ne!(h, r.addr);
+    assert_eq!(http(h, "GET", "/health", None, b""), (204, vec![]));
+    let entries = wire::encode_entries([(&b"k"[..], &b"v"[..])]);
+    assert_eq!(http(h, "POST", "/set", None, &entries).0, 401);
+    assert_eq!(
+        http(h, "POST", "/set", Some("t0k"), &entries),
+        (200, vec![])
+    );
+    // The same cache is behind both front ends.
+    let mut s = TcpStream::connect(r.addr).unwrap();
+    let auth = b"t0k";
+    s.write_all(&wire::encode_header(Op::Auth as u8, auth.len()))
+        .unwrap();
+    s.write_all(auth).unwrap();
+    let mut hdr = [0u8; wire::HEADER_LEN];
+    s.read_exact(&mut hdr).unwrap();
+    assert_eq!(wire::decode_header(&hdr).0, Status::Ok as u8);
+    let keys = wire::encode_keys([&b"k"[..]]);
+    s.write_all(&wire::encode_header(Op::Get as u8, keys.len()))
+        .unwrap();
+    s.write_all(&keys).unwrap();
+    s.read_exact(&mut hdr).unwrap();
+    let (st, len) = wire::decode_header(&hdr);
+    let mut body = vec![0u8; len];
+    s.read_exact(&mut body).unwrap();
+    assert_eq!(st, Status::Ok as u8);
+    assert_eq!(
+        wire::decode_values(body.into()).unwrap(),
+        vec![Some(b"v".as_slice().into())]
+    );
+    let (ok, log) = r.interrupt();
+    assert!(ok, "{log}");
+    assert!(log.contains("--http-addr="), "{log}");
+    assert!(log.contains("listening (http)"), "{log}");
+}
+
+#[test]
+fn http_bind_failure_is_fatal() {
+    let r = start(&["--capacity", "1M"], &[]);
+    let out = cmd(
+        &[
+            "--addr",
+            "127.0.0.1:0",
+            "--capacity",
+            "1M",
+            "--http-addr",
+            &r.addr.to_string(),
+        ],
+        &[],
+    )
+    .output()
+    .unwrap();
+    assert!(!out.status.success());
+    let err = plain(&String::from_utf8_lossy(&out.stderr));
+    assert!(err.contains("Bind") && err.contains("AddrInUse"), "{err}");
 }

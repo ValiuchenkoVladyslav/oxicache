@@ -2,6 +2,9 @@
 //!
 //! Transport is a plain TCP stream carrying length-prefixed frames. Requests
 //! on one connection are answered in order, so clients may pipeline freely.
+//! The server also serves the same bodies over HTTP/1.1 (`POST /get`, `/set`,
+//! `/del`; see `oxicache_server::http`), where the op is the path and the
+//! status is the HTTP status.
 //! All integers are little-endian. Values are opaque byte strings; the format
 //! never inspects them.
 //!

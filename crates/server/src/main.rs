@@ -2,19 +2,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use oxicache_server::{Cache, Options, Server};
+use oxicache_server::{Cache, HttpServer, Options, Server};
 use oxicache_wire::cli::warn_if_overridden;
 use tracing::info;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// TCP in-memory cache server with S3-FIFO eviction.
+/// In-memory cache server with S3-FIFO eviction; binary protocol over TCP and, optionally, HTTP.
 #[derive(Parser)]
 #[command(version)]
 struct Args {
     /// Address to listen on.
     #[arg(long, env = "OXICACHE_ADDR", default_value = "0.0.0.0:4433")]
     addr: SocketAddr,
+    /// Address for the HTTP front end (same binary protocol over HTTP plus
+    /// `/health`); unset disables it.
+    #[arg(long, env = "OXICACHE_HTTP_ADDR")]
+    http_addr: Option<SocketAddr>,
     /// Memory budget for cached entries, e.g. 512M, 4G.
     #[arg(long, env = "OXICACHE_CAPACITY", default_value = "1G", value_parser = parse_size)]
     capacity: usize,
@@ -59,6 +63,13 @@ async fn main() -> Result<()> {
         true,
     );
     warn_if_overridden(
+        "http-addr",
+        "OXICACHE_HTTP_ADDR",
+        args.http_addr.as_ref(),
+        |s| s.parse().ok(),
+        true,
+    );
+    warn_if_overridden(
         "capacity",
         "OXICACHE_CAPACITY",
         Some(&args.capacity),
@@ -87,14 +98,33 @@ async fn main() -> Result<()> {
     let token = args.token.filter(|t| !t.is_empty()).map(String::into_bytes);
     let auth = token.is_some();
     let opts = Options { token };
-    let server = Arc::new(Server::bind_with(args.addr, cache, opts)?);
-    info!(addr = %server.local_addr(), capacity = args.capacity, shards, auth, "cache ready");
+    let server = Server::bind_with(args.addr, cache.clone(), opts.clone())?;
+    let http = args
+        .http_addr
+        .map(|a| HttpServer::bind_with(a, cache, opts))
+        .transpose()?;
+    info!(
+        addr = %server.local_addr(),
+        http = http.as_ref().map(|h| h.local_addr().to_string()),
+        capacity = args.capacity,
+        shards,
+        auth,
+        "cache ready"
+    );
 
-    server
-        .run_until(async {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("shutting down");
-        })
-        .await;
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let stop = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = rx.changed().await;
+    };
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("shutting down");
+        let _ = stop_tx.send(true);
+    };
+    tokio::join!(ctrl_c, server.run_until(stop(stop_rx.clone())), async {
+        if let Some(h) = http {
+            h.run_until(stop(stop_rx)).await;
+        }
+    });
     Ok(())
 }

@@ -58,7 +58,7 @@ impl Server {
 
     /// Bind with explicit [`Options`].
     pub fn bind_with(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
-        let listener = tcp_listener(addr).map_err(|source| Error::Bind { addr, source })?;
+        let listener = listener(addr).map_err(|source| Error::Bind { addr, source })?;
         Ok(Self {
             listener,
             cache,
@@ -97,7 +97,8 @@ impl Server {
     }
 }
 
-fn tcp_listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
+/// A non-blocking listening socket with `SO_REUSEADDR`, shared by both front ends.
+pub(crate) fn listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
@@ -183,7 +184,7 @@ async fn serve_connection(
 /// Constant-time byte comparison, so a wrong token's reply time does not
 /// reveal how many leading bytes matched. The length check short-circuits
 /// on purpose: it reveals only the token's length, which is not secret.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 

@@ -3,7 +3,7 @@ name = "oxicache-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "TCP in-memory cache server using S3-FIFO eviction"
+description = "In-memory cache server (TCP and HTTP front ends) using S3-FIFO eviction"
 
 [dependencies]
 oxicache-wire.workspace = true
@@ -17,3 +17,6 @@ rapidhash.workspace = true
 parking_lot.workspace = true
 crossbeam-epoch = "0.9"
 socket2 = "0.6"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
