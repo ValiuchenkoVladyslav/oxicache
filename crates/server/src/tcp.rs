@@ -336,4 +336,104 @@ mod tests {
         );
         assert!(cache.get(b"big").is_none());
     }
+
+    fn server(token: Option<&[u8]>) -> Arc<Server> {
+        let cache = Arc::new(Cache::new(1 << 20, 1));
+        let opts = Options {
+            token: token.map(<[u8]>::to_vec),
+        };
+        Arc::new(Server::bind_with("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap())
+    }
+
+    #[test]
+    fn bind_failure_is_reported() {
+        let first = server(None);
+        let cache = Arc::new(Cache::new(1 << 20, 1));
+        let err = Server::bind(first.local_addr(), cache)
+            .err()
+            .expect("port in use");
+        assert!(matches!(err, Error::Bind { addr, .. } if addr == first.local_addr()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_open_connections() {
+        let s = server(None);
+        let addr = s.local_addr();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(async move {
+            s.run_until(async {
+                let _ = rx.await;
+            })
+            .await;
+        });
+        let conn = TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!run.is_finished(), "an open connection is drained first");
+        drop(conn);
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("drain ends once the connection closes")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_frame_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let s = server(None);
+        let addr = s.local_addr();
+        tokio::spawn(async move { s.run().await });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(&wire::encode_header(Op::Get as u8, MAX_FRAME + 1))
+            .await
+            .unwrap();
+        let mut hdr = [0u8; wire::HEADER_LEN];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(wire::decode_header(&hdr).0, Status::TooLarge as u8);
+        let mut rest = Vec::new();
+        c.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest.len(), wire::decode_header(&hdr).1, "then disconnected");
+    }
+
+    #[tokio::test]
+    async fn reset_connection_is_reported_not_fatal() {
+        let s = server(None);
+        let addr = s.local_addr();
+        let srv = s.clone();
+        tokio::spawn(async move { srv.run().await });
+        let c = TcpStream::connect(addr).await.unwrap();
+        socket2::SockRef::from(&c)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(c); // RST rather than FIN
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The server is still accepting.
+        let (st, _) = call(&s.cache, Op::Get as u8, wire::encode_keys([&b"k"[..]]));
+        assert_eq!(st, Status::Ok);
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut c, &wire::encode_header(Op::Get as u8, 0))
+            .await
+            .unwrap();
+        let mut hdr = [0u8; wire::HEADER_LEN];
+        tokio::io::AsyncReadExt::read_exact(&mut c, &mut hdr)
+            .await
+            .unwrap();
+        assert_eq!(wire::decode_header(&hdr).0, Status::BadRequest as u8);
+    }
+
+    #[test]
+    fn oversized_response_is_refused() {
+        let cache = Cache::new(256 << 20, 1);
+        let v = vec![0u8; MAX_RESPONSE / 2];
+        cache.set(b"a", &v).unwrap();
+        cache.set(b"b", &v).unwrap();
+        let (st, _) = call(
+            &cache,
+            Op::Get as u8,
+            wire::encode_keys([&b"a"[..], &b"b"[..]]),
+        );
+        assert_eq!(st, Status::TooLarge);
+    }
 }

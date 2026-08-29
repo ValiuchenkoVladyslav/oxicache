@@ -558,4 +558,23 @@ mod tests {
             Err(DecodeError::Trailing(1))
         );
     }
+
+    #[test]
+    fn unknown_status_byte() {
+        assert_eq!(Status::from_u8(9), None);
+    }
+
+    #[test]
+    fn rejects_trailing_and_too_many() {
+        let mut k = encode_keys([&b"a"[..]]).to_vec();
+        k.push(0);
+        assert!(matches!(keys(&k), Err(DecodeError::Trailing(1))));
+        let mut e = encode_entries([(&b"a"[..], &b"b"[..])]).to_vec();
+        e.push(0);
+        assert!(matches!(entries(&e), Err(DecodeError::Trailing(1))));
+        let n = (MAX_ITEMS + 1) as u32;
+        let huge = n.to_le_bytes();
+        assert!(matches!(keys(&huge), Err(DecodeError::TooMany(_))));
+        assert!(matches!(entries(&huge), Err(DecodeError::TooMany(_))));
+    }
 }

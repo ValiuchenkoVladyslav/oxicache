@@ -123,15 +123,9 @@ async fn token_auth() {
     // No auth: rejected and disconnected.
     let c = Client::connect(addr).await.unwrap();
     let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
-    assert!(
-        matches!(
-            err,
-            Error::Status {
-                status: Status::Unauthorized,
-                ..
-            }
-        ),
-        "{err}"
+    assert_eq!(
+        err.to_string(),
+        "server returned Unauthorized: auth required"
     );
     assert!(matches!(
         c.raw().get_multi([&b"a"[..]]).await,
@@ -183,7 +177,8 @@ async fn unsolicited_frame_closes_connection() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let (hold, held) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
         let mut hdr = [0u8; 5];
         s.read_exact(&mut hdr).await.unwrap();
@@ -198,12 +193,120 @@ async fn unsolicited_frame_closes_connection() {
             .unwrap();
         s.flush().await.unwrap();
         // Keep the socket open; the client should still fail.
-        let _ = s.read(&mut hdr).await;
+        let _ = held.await;
     });
     let c = Client::connect(addr).await.unwrap();
     c.raw().set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
     // Without detection this call would receive the stray frame as its own
     // reply and decode an empty body as a values list.
+    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
+    drop(hold);
+    server.await.unwrap();
+}
+
+/// A fake server that answers the first request with `reply` verbatim and
+/// then holds the socket open until the returned sender is dropped.
+async fn scripted(reply: Vec<u8>) -> (std::net::SocketAddr, Scripted) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (hold, held) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut hdr = [0u8; 5];
+        s.read_exact(&mut hdr).await.unwrap();
+        let mut body = vec![0u8; oxicache_wire::decode_header(&hdr).1];
+        s.read_exact(&mut body).await.unwrap();
+        s.write_all(&reply).await.unwrap();
+        s.flush().await.unwrap();
+        let _ = held.await;
+    });
+    (addr, Scripted { hold, task })
+}
+
+/// Handle to a scripted server: `finish` releases the socket and joins it.
+struct Scripted {
+    hold: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Scripted {
+    async fn finish(self) {
+        drop(self.hold);
+        self.task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn connect_without_token() {
+    let (server, _) = start().await;
+    let c = Client::connect_with_token(server.local_addr(), None)
+        .await
+        .unwrap();
+    c.raw().set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_status_byte_closes_connection() {
+    let (addr, fake) = scripted(oxicache_wire::encode_header(9, 0).to_vec()).await;
+    let c = Client::connect(addr).await.unwrap();
+    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    assert!(matches!(err, Error::InvalidStatus(9)), "{err}");
+    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
+    fake.finish().await;
+}
+
+#[tokio::test]
+async fn oversized_response_is_reported() {
+    let too_big = oxicache_wire::MAX_FRAME + 1;
+    let (addr, fake) = scripted(oxicache_wire::encode_header(0, too_big).to_vec()).await;
+    let c = Client::connect(addr).await.unwrap();
+    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    assert!(
+        matches!(err, Error::ResponseTooLarge(n) if n == too_big),
+        "{err}"
+    );
+    fake.finish().await;
+}
+
+#[tokio::test]
+async fn malformed_bodies_are_decode_errors() {
+    let mut bad = oxicache_wire::encode_header(0, 2).to_vec();
+    bad.extend_from_slice(&[9, 0]);
+    let (addr, fake) = scripted(bad.clone()).await;
+    let c = Client::connect(addr).await.unwrap();
+    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    assert!(matches!(err, Error::Decode(_)), "{err}");
+    fake.finish().await;
+    let (addr, fake) = scripted(bad).await;
+    let c = Client::connect(addr).await.unwrap();
+    let err = c.raw().del_multi([&b"a"[..]]).await.unwrap_err();
+    assert!(matches!(err, Error::Decode(_)), "{err}");
+    fake.finish().await;
+}
+
+/// The peer closes without reading while a large request is still being
+/// written (closing with unread data resets the connection): the write
+/// fails and the client reports closure.
+#[tokio::test]
+async fn write_failure_closes_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (s, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(s);
+    });
+    let c = Client::connect(addr).await.unwrap();
+    let big = vec![0u8; 32 << 20];
+    let err = c
+        .raw()
+        .set_multi([(&b"a"[..], &big[..])])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Closed | Error::Io(_)), "{err}");
     let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Closed), "{err}");
 }

@@ -788,4 +788,56 @@ mod tests {
                 .count()
         );
     }
+
+    /// Once promoted entries hold more than the main queue's share of the
+    /// budget, the small queue stays below its own and eviction turns to
+    /// main: entries with a nonzero frequency get a second chance, cold and
+    /// dead ones leave.
+    #[test]
+    fn main_queue_evicts_cold_and_dead_entries() {
+        let cap = 100 * (ENTRY_OVERHEAD + 10 + 100);
+        let s = shard(cap);
+        let hot = 95;
+        for i in 0..hot {
+            set(&s, i, 100);
+        }
+        for _ in 0..3 {
+            for i in 0..hot {
+                let g = epoch::pin();
+                s.get(h(&key(i)), &key(i), &g).unwrap().touch();
+            }
+        }
+        for i in hot..200 {
+            set(&s, i, 100);
+        }
+        assert!(
+            s.q.lock().main.len() > 50,
+            "hot entries are promoted to main"
+        );
+        let victim = (0..hot)
+            .find(|&i| s.q.lock().main.iter().any(|e| e.key() == key(i)))
+            .unwrap();
+        assert!(del(&s, &key(victim)));
+        // Promotion resets the frequency; a later touch gives a main entry
+        // a second chance when its turn comes.
+        for i in 0..hot {
+            if let Some(e) = s.get(h(&key(i)), &key(i), &epoch::pin()) {
+                e.touch();
+            }
+        }
+        // Keep main growing with fresh hot entries so it is the queue that
+        // has to give way; the dead victim is dropped when it reaches the head.
+        for i in 200..1200 {
+            set(&s, i, 100);
+            for _ in 0..2 {
+                s.get(h(&key(i)), &key(i), &epoch::pin()).unwrap().touch();
+            }
+        }
+        assert!(s.used_bytes() <= cap);
+        assert!(get(&s, &key(victim)).is_none());
+        assert!(
+            (0..hot).any(|i| get(&s, &key(i)).is_none()),
+            "a cold promoted entry is eventually evicted from main"
+        );
+    }
 }

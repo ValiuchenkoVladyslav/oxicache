@@ -242,4 +242,30 @@ mod tests {
         });
         assert_eq!(seen, vec![Some(b"v".to_vec()), None, Some(b"v".to_vec())]);
     }
+
+    #[test]
+    fn size_accounting() {
+        let c = Cache::new(1 << 20, 1);
+        assert!(c.is_empty());
+        assert_eq!(c.used_bytes(), 0);
+        c.set(b"k", b"v").unwrap();
+        assert!(!c.is_empty());
+        assert!(c.used_bytes() > 0);
+    }
+
+    /// Replacing large values retires them in batches; enough of them must
+    /// reach the flush threshold and hand the bag to the collector.
+    #[test]
+    fn large_retirements_are_batched_then_flushed() {
+        let c = Cache::new(64 << 20, 1);
+        let big = vec![1u8; 2048];
+        for _ in 0..(FLUSH_ENTRIES + 8) {
+            c.set(b"k", &big).unwrap();
+        }
+        let huge = vec![2u8; FLUSH_BYTES / 2 + 1];
+        for _ in 0..3 {
+            c.set(b"h", &huge).unwrap();
+        }
+        assert_eq!(c.len(), 2);
+    }
 }

@@ -333,4 +333,37 @@ mod tests {
         r.buf.put_slice(&encode_header(1, 11));
         assert_eq!(r.next_buffered(), Err(FrameTooLarge(11)));
     }
+
+    #[test]
+    fn writer_spills_a_full_chunk() {
+        let mut w = FrameWriter::default();
+        assert!(w.is_empty());
+        w.header(1, BUF + 8);
+        w.put_slice(&vec![1u8; BUF]);
+        assert!(!w.is_empty());
+        assert_eq!(w.pieces.len(), 1, "a chunk that would overflow is spilled");
+        w.put_slice(&[2u8; 8]);
+        let out = w.take();
+        assert_eq!(out.len(), HEADER_LEN + BUF + 8);
+        assert_eq!(&out[HEADER_LEN + BUF..], &[2u8; 8]);
+        assert!(w.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flush_reports_write_zero() {
+        let mut w = FrameWriter::new();
+        w.frame(1, Bytes::from_static(b"x"));
+        // A full cursor accepts nothing: every write returns zero.
+        let mut full = io::Cursor::new(&mut [][..]);
+        let err = w.flush(&mut full).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+    }
+
+    #[test]
+    fn allocator_tuning_is_harmless() {
+        tune_allocator();
+        tune_allocator();
+        let v = vec![7u8; 1 << 20];
+        assert_eq!(v[v.len() - 1], 7);
+    }
 }

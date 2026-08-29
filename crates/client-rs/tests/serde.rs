@@ -213,3 +213,53 @@ async fn empty_batches() {
     c.set_multi(Vec::<(&str, User)>::new()).await.unwrap();
     assert!(c.del_multi(Vec::<&str>::new()).await.unwrap().is_empty());
 }
+
+/// A server that answers with the wrong number of values or flags for an
+/// array of keys is reported as a count mismatch, not a panic.
+#[tokio::test]
+async fn wrong_count_from_server_is_an_error() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn scripted(reply: Vec<u8>) -> (std::net::SocketAddr, Scripted) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (hold, held) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; 5];
+            s.read_exact(&mut hdr).await.unwrap();
+            let mut body = vec![0u8; oxicache_wire::decode_header(&hdr).1];
+            s.read_exact(&mut body).await.unwrap();
+            s.write_all(&reply).await.unwrap();
+            s.flush().await.unwrap();
+            let _ = held.await;
+        });
+        (addr, Scripted { hold, task })
+    }
+    struct Scripted {
+        hold: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Scripted {
+        async fn finish(self) {
+            drop(self.hold);
+            self.task.await.unwrap();
+        }
+    }
+    // Zero values for two keys.
+    let mut reply = oxicache_wire::encode_header(0, 4).to_vec();
+    reply.extend_from_slice(&0u32.to_le_bytes());
+    let (addr, fake) = scripted(reply).await;
+    let c = Client::connect(addr).await.unwrap();
+    let err = c.get_multi::<_, String>(["a", "b"]).await.unwrap_err();
+    assert_eq!(err.to_string(), "server answered 0 values for 2 keys");
+    fake.finish().await;
+    // One flag for two keys.
+    let mut reply = oxicache_wire::encode_header(0, 5).to_vec();
+    reply.extend_from_slice(&1u32.to_le_bytes());
+    reply.push(1);
+    let (addr, fake) = scripted(reply).await;
+    let c = Client::connect(addr).await.unwrap();
+    let err = c.del_multi(["a", "b"]).await.unwrap_err();
+    assert_eq!(err.to_string(), "server answered 1 values for 2 keys");
+    fake.finish().await;
+}

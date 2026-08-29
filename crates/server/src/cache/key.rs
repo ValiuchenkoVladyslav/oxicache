@@ -74,4 +74,13 @@ mod tests {
         assert_eq!(long.as_slice(), &[7u8; 100][..]);
         assert_eq!(Key::new(b"abc"), short);
     }
+
+    #[test]
+    fn borrows_and_hashes_as_its_bytes() {
+        use std::hash::BuildHasher;
+        let k = Key::new(b"hello");
+        assert_eq!(<Key as Borrow<[u8]>>::borrow(&k), b"hello");
+        let s = std::hash::RandomState::new();
+        assert_eq!(s.hash_one(&k), s.hash_one(&b"hello"[..]));
+    }
 }

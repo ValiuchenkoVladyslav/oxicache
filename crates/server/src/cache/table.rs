@@ -682,4 +682,46 @@ mod tests {
             assert!(r.join().unwrap() > 0);
         }
     }
+
+    #[test]
+    fn default_is_empty() {
+        assert_eq!(Index::default().len(), 0);
+    }
+
+    /// Keys sharing a tag and home bucket saturate both candidate buckets;
+    /// the insert must fall back to growing until the table separates them.
+    #[test]
+    fn colliding_hashes_force_growth() {
+        let idx = Index::new();
+        let mut w = Writer::new();
+        // A private collector: reclamation then depends on this test alone,
+        // not on whatever other tests keep the global epoch pinned.
+        let collector = epoch::Collector::new();
+        let handle = collector.register();
+        let g = handle.pin();
+        let n = 2 * SLOTS + 4;
+        let hash = |i: usize| (0xABCDu64 << 48) | ((i as u64) << 8) | 0x2A;
+        for i in 0..n {
+            let k = format!("col{i}");
+            let e = Entry::new(Key::new(k.as_bytes()), b"v", hash(i));
+            assert!(idx.insert(&mut w, hash(i), e, &g).is_none());
+        }
+        assert_eq!(idx.len(), n);
+        for i in 0..n {
+            let k = format!("col{i}");
+            assert!(idx.get(hash(i), k.as_bytes(), &g).is_some());
+        }
+        assert!(idx.load(&g).buckets.len() > MIN_BUCKETS);
+        // Let the collector reclaim the retired tables: they no longer own
+        // their entries, so dropping them must free only the bucket arrays.
+        g.flush();
+        drop(g);
+        for _ in 0..8 {
+            handle.pin().flush();
+        }
+        for i in 0..n {
+            let k = format!("col{i}");
+            assert!(idx.get(hash(i), k.as_bytes(), &handle.pin()).is_some());
+        }
+    }
 }
