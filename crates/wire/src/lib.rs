@@ -257,7 +257,8 @@ impl<'a> Iterator for Keys<'a> {
             return None;
         }
         self.left -= 1;
-        let (k, rest) = take_blob(self.rest);
+        // SAFETY: `keys` validated `left` blobs ahead of `rest`.
+        let (k, rest) = unsafe { take_blob(self.rest) };
         self.rest = rest;
         Some(k)
     }
@@ -300,8 +301,12 @@ impl<'a> Iterator for Entries<'a> {
             return None;
         }
         self.left -= 1;
-        let (k, rest) = take_blob(self.rest);
-        let (v, rest) = take_blob(rest);
+        // SAFETY: `entries` validated `2 * left` blobs ahead of `rest`.
+        let (k, v, rest) = unsafe {
+            let (k, rest) = take_blob(self.rest);
+            let (v, rest) = take_blob(rest);
+            (k, v, rest)
+        };
         self.rest = rest;
         Some((k, v))
     }
@@ -334,10 +339,22 @@ fn skip_blob(b: &[u8]) -> Result<(&[u8], &[u8])> {
 }
 
 /// Split one blob off an already validated buffer.
+///
+/// # Safety
+/// `b` must start with a blob that [`skip_blob`] has accepted: a length
+/// prefix followed by at least that many bytes. [`Keys`] and [`Entries`] are
+/// only built by [`keys`] and [`entries`], which validate every blob they
+/// will later yield, and their fields are private, so this holds for every
+/// call from their iterators.
 #[inline]
-fn take_blob(b: &[u8]) -> (&[u8], &[u8]) {
-    let (len, rest) = b.split_first_chunk::<U32>().expect("validated");
-    rest.split_at(u32::from_le_bytes(*len) as usize)
+unsafe fn take_blob(b: &[u8]) -> (&[u8], &[u8]) {
+    debug_assert!(b.len() >= U32);
+    unsafe {
+        let len = u32::from_le_bytes(*(b.as_ptr() as *const [u8; U32])) as usize;
+        let rest = b.get_unchecked(U32..);
+        debug_assert!(rest.len() >= len);
+        rest.split_at_unchecked(len)
+    }
 }
 
 /// Encode a `/get` response: one optional value per requested key.

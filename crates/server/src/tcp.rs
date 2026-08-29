@@ -313,7 +313,11 @@ mod tests {
         huge.resize(4 + 4 * (wire::MAX_ITEMS + 1), 0);
         let (st, msg) = call(&cache, Op::Get as u8, Bytes::from(huge));
         assert_eq!(st, Status::BadRequest);
-        assert!(std::str::from_utf8(&msg).unwrap().contains("exceeds the limit"));
+        assert!(
+            std::str::from_utf8(&msg)
+                .unwrap()
+                .contains("exceeds the limit")
+        );
     }
 
     #[test]
@@ -326,7 +330,10 @@ mod tests {
             wire::encode_entries([(&b"small"[..], &b"v"[..]), (&b"big"[..], &big[..])]),
         );
         assert_eq!(st, Status::TooLarge);
-        assert!(cache.get(b"small").is_none(), "nothing from the batch is stored");
+        assert!(
+            cache.get(b"small").is_none(),
+            "nothing from the batch is stored"
+        );
         assert!(cache.get(b"big").is_none());
     }
 }

@@ -27,7 +27,11 @@ impl Key {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         match self {
-            Key::Inline(len, buf) => &buf[..*len as usize],
+            Key::Inline(len, buf) => {
+                debug_assert!(*len as usize <= INLINE);
+                // SAFETY: `new` only builds `Inline` with `len <= INLINE`.
+                unsafe { buf.get_unchecked(..*len as usize) }
+            }
             Key::Heap(b) => b,
         }
     }

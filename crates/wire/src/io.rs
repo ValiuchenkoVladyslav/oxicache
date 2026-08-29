@@ -54,7 +54,15 @@ impl FrameReader {
             return Ok(None);
         };
         self.lent = HEADER_LEN + len;
-        Ok(Some((self.buf[0], &self.buf[HEADER_LEN..self.lent])))
+        debug_assert!(self.buf.len() >= self.lent);
+        // SAFETY: `head` returned `Some` only after checking that the buffer
+        // holds at least `HEADER_LEN + len` bytes.
+        unsafe {
+            Ok(Some((
+                *self.buf.get_unchecked(0),
+                self.buf.get_unchecked(HEADER_LEN..self.lent),
+            )))
+        }
     }
 
     #[inline]
@@ -69,7 +77,8 @@ impl FrameReader {
         if self.buf.len() < HEADER_LEN {
             return Ok(None);
         }
-        let (_, len) = decode_header(self.buf[..HEADER_LEN].try_into().unwrap());
+        // SAFETY: at least `HEADER_LEN` bytes are buffered (checked above).
+        let (_, len) = decode_header(unsafe { &*(self.buf.as_ptr() as *const [u8; HEADER_LEN]) });
         if len > self.max_frame {
             return Err(FrameTooLarge(len));
         }
@@ -307,7 +316,9 @@ mod tests {
             .unwrap();
         assert!(r.fill(&mut b).await.unwrap());
         assert_eq!(r.next_buffered().unwrap(), None);
-        tokio::io::AsyncWriteExt::write_all(&mut a, &[0u8; 16]).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut a, &[0u8; 16])
+            .await
+            .unwrap();
         assert!(r.fill(&mut b).await.unwrap());
         assert!(
             r.buf.capacity() <= 4 * BUF,

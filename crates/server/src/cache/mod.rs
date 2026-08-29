@@ -11,9 +11,9 @@ use std::cell::Cell;
 use std::hash::{BuildHasher, Hasher};
 
 use crossbeam_epoch as epoch;
-pub use s3fifo::{Entry, TooLarge};
 use s3fifo::Retired;
 use s3fifo::Shard;
+pub use s3fifo::{Entry, TooLarge};
 pub use table::EntryRef;
 
 pub struct Cache {
@@ -45,7 +45,9 @@ impl Cache {
         } else {
             (hash >> self.shift) as usize
         };
-        (&self.shards[idx], hash)
+        debug_assert!(idx < self.shards.len());
+        // SAFETY: `shards.len() == 2^(64 - shift)`, so `hash >> shift` is below it.
+        (unsafe { self.shards.get_unchecked(idx) }, hash)
     }
 
     /// Look up one key. The returned handle keeps the value alive.

@@ -45,6 +45,18 @@ const _: () = assert!(
 #[repr(C, align(64))]
 struct Bucket([AtomicU64; SLOTS]);
 
+impl Bucket {
+    /// Slot `i` without a bounds check. Every slot index in this module is
+    /// either taken `% SLOTS`, found by `position` over the slots, or is the
+    /// bit index of a mask with only the low `SLOTS` bits set.
+    #[inline(always)]
+    fn slot(&self, i: usize) -> &AtomicU64 {
+        debug_assert!(i < SLOTS);
+        // SAFETY: see above; `i < SLOTS` by construction at every call site.
+        unsafe { self.0.get_unchecked(i) }
+    }
+}
+
 /// Line-aligned so the header every lookup reads (`buckets`, `mask`) never
 /// shares a line with a neighbouring allocation another thread writes.
 #[repr(align(64))]
@@ -74,6 +86,16 @@ impl Table {
         hash as usize & self.mask
     }
 
+    /// Bucket `b` without a bounds check. Bucket indices only ever come from
+    /// [`home`](Self::home) and [`alt`](Self::alt), which mask with
+    /// `mask = buckets.len() - 1` (the length is a power of two).
+    #[inline(always)]
+    fn bucket(&self, b: usize) -> &Bucket {
+        debug_assert!(b <= self.mask && self.mask + 1 == self.buckets.len());
+        // SAFETY: `b <= mask < buckets.len()` at every call site.
+        unsafe { self.buckets.get_unchecked(b) }
+    }
+
     /// Partial-key cuckoo: the alternate bucket depends only on the home
     /// bucket and the tag, so it can be recomputed from a slot word.
     #[inline]
@@ -93,7 +115,7 @@ impl Table {
         let b1 = self.home(hash);
         let b2 = self.alt(b1, tag);
         for b in [b1, b2] {
-            for s in &self.buckets[b].0 {
+            for s in &self.bucket(b).0 {
                 let w = s.load(Relaxed);
                 if w != 0 && tag_of_word(w) == tag {
                     let p = (w & PTR_MASK) as *const u8;
@@ -113,7 +135,8 @@ impl Table {
         for b in [b1, b2] {
             // Load the whole bucket and build a match mask without branching
             // per slot; only candidates with the right tag touch an entry.
-            let words: [u64; SLOTS] = std::array::from_fn(|i| self.buckets[b].0[i].load(Acquire));
+            let bucket = self.bucket(b);
+            let words: [u64; SLOTS] = std::array::from_fn(|i| bucket.slot(i).load(Acquire));
             let mut m = 0u32;
             for (i, &w) in words.iter().enumerate() {
                 m |= ((w != 0 && tag_of_word(w) == tag) as u32) << i;
@@ -121,7 +144,8 @@ impl Table {
             while m != 0 {
                 let i = m.trailing_zeros() as usize;
                 m &= m - 1;
-                let w = words[i];
+                // SAFETY: only bits `0..SLOTS` of `m` are ever set, so `i < SLOTS`.
+                let w = unsafe { *words.get_unchecked(i) };
                 // SAFETY: a nonzero word is a live entry under the guard.
                 let e = unsafe { entry_at(w) };
                 if e.key() == key {
@@ -265,8 +289,8 @@ impl Index {
         let t = self.load(guard);
         let b1 = t.home(hash);
         let b2 = t.alt(b1, tag_of(hash));
-        prefetch_line(&t.buckets[b1]);
-        prefetch_line(&t.buckets[b2]);
+        prefetch_line(t.bucket(b1));
+        prefetch_line(t.bucket(b2));
     }
 
     /// Prefetch the candidate entries for `hash` (buckets must be hot).
@@ -301,7 +325,9 @@ impl Index {
         let tag = tag_of(hash);
         let t = self.load(guard);
         if let Some((b, i, old)) = t.find(hash, entry.key()) {
-            t.buckets[b].0[i].store(word(tag, entry.into_raw()), Release);
+            t.bucket(b)
+                .slot(i)
+                .store(word(tag, entry.into_raw()), Release);
             // SAFETY: the old handle is no longer reachable from the table.
             return Some(unsafe { entry_from_word(old) });
         }
@@ -323,7 +349,7 @@ impl Index {
     pub fn remove(&self, _w: &mut Writer, hash: u64, key: &[u8], guard: &Guard) -> Option<Entry> {
         let t = self.load(guard);
         let (b, i, w) = t.find(hash, key)?;
-        t.buckets[b].0[i].store(0, Release);
+        t.bucket(b).slot(i).store(0, Release);
         self.w.len.fetch_sub(1, Relaxed);
         // SAFETY: unlinked; caller retires or keeps the handle.
         Some(unsafe { entry_from_word(w) })
@@ -342,7 +368,7 @@ impl Index {
         if (w & PTR_MASK) != entry.as_ptr() as u64 {
             return None;
         }
-        t.buckets[b].0[i].store(0, Release);
+        t.bucket(b).slot(i).store(0, Release);
         self.w.len.fetch_sub(1, Relaxed);
         // SAFETY: unlinked; caller retires or keeps the handle.
         Some(unsafe { entry_from_word(w) })
@@ -357,8 +383,9 @@ impl Index {
         let b1 = t.home(hash);
         let b2 = t.alt(b1, tag);
         for b in [b1, b2] {
-            if let Some(i) = empty_slot(&t.buckets[b]) {
-                t.buckets[b].0[i].store(new_word, Release);
+            let bucket = t.bucket(b);
+            if let Some(i) = empty_slot(bucket) {
+                bucket.slot(i).store(new_word, Release);
                 return true;
             }
         }
@@ -373,11 +400,11 @@ impl Index {
         }
         let (mut db, mut di) = dest;
         for &(sb, si) in path.iter().rev() {
-            let w = t.buckets[sb].0[si].load(Relaxed);
-            t.buckets[db].0[di].store(w, Release);
+            let w = t.bucket(sb).slot(si).load(Relaxed);
+            t.bucket(db).slot(di).store(w, Release);
             (db, di) = (sb, si);
         }
-        t.buckets[db].0[di].store(new_word, Release);
+        t.bucket(db).slot(di).store(new_word, Release);
         if live {
             self.r.moving.fetch_add(1, Release);
         }
@@ -404,10 +431,10 @@ impl Index {
                 if path.contains(&(b, i)) {
                     continue 'walk;
                 }
-                let w = t.buckets[b].0[i].load(Relaxed);
+                let w = t.bucket(b).slot(i).load(Relaxed);
                 path.push((b, i));
                 let next = t.alt(b, tag_of_word(w));
-                if let Some(j) = empty_slot(&t.buckets[next]) {
+                if let Some(j) = empty_slot(t.bucket(next)) {
                     found = Some((next, j));
                     break 'walk;
                 }

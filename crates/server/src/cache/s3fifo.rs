@@ -54,9 +54,16 @@ impl Retired {
     fn one(e: &Entry) -> Self {
         let cost = e.cost();
         if e.value().len() < NT_MIN {
-            Self { small: 1, ..Self::default() }
+            Self {
+                small: 1,
+                ..Self::default()
+            }
         } else {
-            Self { large: 1, large_bytes: cost, small: 0 }
+            Self {
+                large: 1,
+                large_bytes: cost,
+                small: 0,
+            }
         }
     }
 }
@@ -436,9 +443,11 @@ impl Shard {
             // Not identical: eviction order differs, which is the whole point of S3-FIFO.
             #[allow(clippy::if_same_then_else)]
             let evicted = if q.small_bytes >= self.small_capacity {
-                self.evict_small(&mut q, guard).or_else(|| self.evict_main(&mut q, guard))
+                self.evict_small(&mut q, guard)
+                    .or_else(|| self.evict_main(&mut q, guard))
             } else {
-                self.evict_main(&mut q, guard).or_else(|| self.evict_small(&mut q, guard))
+                self.evict_main(&mut q, guard)
+                    .or_else(|| self.evict_small(&mut q, guard))
             };
             let Some(r) = evicted else {
                 break;
@@ -550,9 +559,13 @@ fn compact(q: &mut VecDeque<Entry>) {
         if let Some(e) = s.get(i + AHEAD) {
             e.prefetch();
         }
-        if s[i].live().load(Relaxed) {
-            s.swap(w, i);
-            w += 1;
+        // SAFETY: `w <= i < n == s.len()`.
+        unsafe {
+            if s.get_unchecked(i).live().load(Relaxed) {
+                let p = s.as_mut_ptr();
+                std::ptr::swap(p.add(w), p.add(i));
+                w += 1;
+            }
         }
     }
     q.truncate(w);
