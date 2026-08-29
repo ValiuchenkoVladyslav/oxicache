@@ -1,3 +1,3 @@
-export { Client, ClosedError, StatusError, type ConnectOptions, type Entries, type Entry } from "./client";
+export { Client, ClosedError, StatusError, type ConnectOptions, type Entries, type Entry, type Fill } from "./client";
 export { type Encodable, type Primitive, type Value } from "./value";
 export { type Bin, DecodeError, MAX_FRAME, MAX_ITEMS, Status } from "./wire";

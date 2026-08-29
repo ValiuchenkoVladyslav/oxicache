@@ -48,6 +48,11 @@ export type Entries<E extends readonly Entry<unknown>[]> = E & {
   readonly [I in keyof E]: readonly [Bin, Encodable<E[I] extends Entry<infer V> ? V : never>];
 };
 
+/** A tuple of `N` copies of `R`. */
+export type Fill<N extends number, R, A extends R[] = []> = A["length"] extends N
+  ? A
+  : Fill<N, R, [...A, R]>;
+
 interface Pending {
   resolve: (body: Uint8Array) => void;
   reject: (err: Error) => void;
@@ -110,6 +115,25 @@ export class Client {
    * `T` is what the stored value decodes to; it is not checked at runtime.
    */
   get<T = Value>(key: Bin): Promise<T | null>;
+  // A key tuple of known length (up to 16) yields a result tuple of the same
+  // length; generated per arity because `T` is given explicitly, which stops
+  // TypeScript inferring a second type parameter for the keys.
+  get<T = Value>(keys: readonly [Bin]): Promise<Fill<1, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin]): Promise<Fill<2, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin]): Promise<Fill<3, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin]): Promise<Fill<4, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin]): Promise<Fill<5, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<6, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<7, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<8, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<9, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<10, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<11, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<12, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<13, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<14, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<15, T | null>>;
+  get<T = Value>(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<16, T | null>>;
   get<T = Value>(keys: readonly Bin[]): Promise<(T | null)[]>;
   async get<T = Value>(keys: Bin | readonly Bin[]): Promise<(T | null) | (T | null)[]> {
     const many = Array.isArray(keys);
@@ -133,6 +157,22 @@ export class Client {
 
   /** Delete one key or many; returns whether each one existed. */
   del(key: Bin): Promise<boolean>;
+  del(keys: readonly [Bin]): Promise<Fill<1, boolean>>;
+  del(keys: readonly [Bin, Bin]): Promise<Fill<2, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin]): Promise<Fill<3, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin]): Promise<Fill<4, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin]): Promise<Fill<5, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<6, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<7, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<8, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<9, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<10, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<11, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<12, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<13, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<14, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<15, boolean>>;
+  del(keys: readonly [Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin, Bin]): Promise<Fill<16, boolean>>;
   del(keys: readonly Bin[]): Promise<boolean[]>;
   async del(keys: Bin | readonly Bin[]): Promise<boolean | boolean[]> {
     const many = Array.isArray(keys);

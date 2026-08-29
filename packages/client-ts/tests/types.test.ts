@@ -32,13 +32,32 @@ async function _shapes() {
   const one = await c.get<User>("k");
   assertType<Equal<typeof one, User | null>>();
   const many = await c.get<User>(["a", new Uint8Array(1)]);
-  assertType<Equal<typeof many, (User | null)[]>>();
+  assertType<Equal<typeof many, [User | null, User | null]>>();
+  // Key tuples of known length give result tuples of that length.
+  const two = await c.get<User>(["a", "b"]);
+  assertType<Equal<typeof two, [User | null, User | null]>>();
+  const [x, y] = two;
+  assertType<Equal<typeof x, User | null>>();
+  assertType<Equal<typeof y, User | null>>();
+  const ks = ["a", "b", "c"] as const;
+  const three = await c.get<number>(ks);
+  assertType<Equal<typeof three, [number | null, number | null, number | null]>>();
+  const sixteen = await c.get<number>(["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]);
+  assertType<Equal<typeof sixteen["length"], 16>>();
+  // Past 16, or from a plain array, the length is unknown.
+  const seventeen = await c.get<number>(["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17"]);
+  assertType<Equal<typeof seventeen, (number | null)[]>>();
+  const dyn: string[] = ["a", "b"];
+  const fromArray = await c.get<User>(dyn);
+  assertType<Equal<typeof fromArray, (User | null)[]>>();
   const dflt = await c.get("k");
   assertType<Equal<typeof dflt, Value | null>>();
   const d1 = await c.del("k");
   assertType<Equal<typeof d1, boolean>>();
-  const dn = await c.del(["k"]);
-  assertType<Equal<typeof dn, boolean[]>>();
+  const dn = await c.del(["k", "j"]);
+  assertType<Equal<typeof dn, [boolean, boolean]>>();
+  const dArr = await c.del(dyn);
+  assertType<Equal<typeof dArr, boolean[]>>();
   // @ts-expect-error array in must not be assignable to single out
   const wrong: User | null = await c.get<User>(["k"]);
   void wrong;
