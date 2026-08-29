@@ -78,6 +78,29 @@ describe("client-ts e2e", () => {
     c.close();
   });
 
+  test("useRecords is on by default and can be turned off", async () => {
+    const shape = { id: 1, name: "alice", tags: ["x"] };
+    for (const useRecords of [undefined, true, false]) {
+      const c = await Client.connect({ port: server.port, ...(useRecords === undefined ? {} : { useRecords }) });
+      await c.set(["r1", shape], ["r2", { ...shape, id: 2 }]);
+      const [a, b] = await c.get<[typeof shape, typeof shape]>("r1", "r2");
+      expect(a).toEqual(shape);
+      expect(b!.id).toBe(2);
+      // A fresh client with the same setting reads it back too.
+      const c2 = await Client.connect({ port: server.port, ...(useRecords === undefined ? {} : { useRecords }) });
+      expect(await c2.get<typeof shape>("r2")).toEqual({ ...shape, id: 2 });
+      c.close();
+      c2.close();
+    }
+    // Plain msgpack written by a no-records client is readable by a records client.
+    const plain = await Client.connect({ port: server.port, useRecords: false });
+    await plain.set("plain", shape);
+    const rec = await Client.connect({ port: server.port });
+    expect(await rec.get<typeof shape>("plain")).toEqual(shape);
+    plain.close();
+    rec.close();
+  });
+
   test("every primitive kind", async () => {
     const c = await Client.connect({ port: server.port });
     await c.set(

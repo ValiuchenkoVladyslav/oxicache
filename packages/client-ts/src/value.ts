@@ -21,14 +21,34 @@ export type Encodable<T> = T extends Primitive
         ? { readonly [K in keyof T]: Encodable<T[K]> }
         : never;
 
-// Plain msgpack only: no msgpackr record extension, so the bytes are readable
-// by any decoder and object key order round-trips as written.
-const packr = new Packr({ useRecords: false });
-
-export function encodeValue(value: unknown): Uint8Array {
-  return packr.pack(value);
+export interface CodecOptions {
+  /**
+   * msgpackr's record extension: within a value, an object's key set is
+   * written once as a structure definition and further objects of the same
+   * shape refer to it, which is smaller and faster for repeated shapes. Data
+   * written this way is msgpack with an extension type that only msgpackr
+   * reads back; turn it off for plain MessagePack readable by any decoder.
+   * Default `true`.
+   */
+  useRecords?: boolean;
 }
 
-export function decodeValue<T>(bytes: Uint8Array): T {
-  return packr.unpack(bytes) as T;
+/** Encodes and decodes values; one per client so record structures stay private to it. */
+export class Codec {
+  private readonly packr: Packr;
+
+  constructor(opts: CodecOptions = {}) {
+    // mapsAsObjects is explicit because msgpackr flips its default to Map
+    // when records are on, and plain msgpack maps must still come back as
+    // objects whichever mode wrote them.
+    this.packr = new Packr({ useRecords: opts.useRecords ?? true, mapsAsObjects: true });
+  }
+
+  encode(value: unknown): Uint8Array {
+    return this.packr.pack(value);
+  }
+
+  decode<T>(bytes: Uint8Array): T {
+    return this.packr.unpack(bytes) as T;
+  }
 }

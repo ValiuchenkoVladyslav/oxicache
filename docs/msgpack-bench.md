@@ -20,5 +20,5 @@ native accelerator loaded), single thread, ops/s in thousands, 600 ms per cell a
 
 msgpackr encodes 2–5× faster and decodes as fast or faster everywhere; its only cost is ~8 %
 larger output for nested objects (it uses `map16`/`float64` where the other lib picks the
-smallest form). `useRecords: false` disables msgpackr's record extension so the bytes stay
-plain MessagePack; the `useRecords` default was within noise of that setting.
+smallest form). The client exposes msgpackr's `useRecords` on `Client.connect` (default on); the two settings
+were within noise of each other here, and `false` keeps the bytes plain MessagePack.

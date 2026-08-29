@@ -101,6 +101,10 @@ const ds = await c.del("a", "b");               // [boolean, boolean]
 c.close();
 ```
 
+`Client.connect({ …, useRecords })` picks the encoding: msgpackr's record extension (default
+`true`; repeated object shapes inside a value share one structure definition) or plain
+MessagePack (`false`, readable by any decoder). Either client reads what the other wrote.
+
 One key in, one result out; several keys in, a tuple of that length out (up to 16 literal
 keys); an array in, an array out for lengths only known at runtime — all enforced by
 overloads, so `...spread` of a plain array is a compile error (pass the array). The return

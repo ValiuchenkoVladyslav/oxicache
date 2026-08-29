@@ -12,7 +12,7 @@ import {
   encodeRawFrame,
   toBytes,
 } from "./wire";
-import { type Encodable, type Value, decodeValue, encodeValue } from "./value";
+import { Codec, type CodecOptions, type Encodable, type Value } from "./value";
 
 /** The server answered with a non-OK status. */
 export class StatusError extends Error {
@@ -33,7 +33,7 @@ export class ClosedError extends Error {
   }
 }
 
-export interface ConnectOptions {
+export interface ConnectOptions extends CodecOptions {
   hostname?: string;
   port: number;
   /** Shared secret; when given, AUTH is sent before `connect` resolves. */
@@ -87,12 +87,15 @@ export class Client {
   private flushScheduled = false;
   private closed: Error | null = null;
   private readonly reader = new FrameReader();
+  private readonly codec: Codec;
   private socket!: Socket<undefined>;
 
-  private constructor() {}
+  private constructor(opts: CodecOptions) {
+    this.codec = new Codec(opts);
+  }
 
   static async connect(opts: ConnectOptions): Promise<Client> {
-    const client = new Client();
+    const client = new Client(opts);
     client.socket = await Bun.connect({
       hostname: opts.hostname ?? "127.0.0.1",
       port: opts.port,
@@ -152,7 +155,7 @@ export class Client {
   async get<T = Value>(...args: Bin[] | [readonly Bin[]]): Promise<(T | null) | (T | null)[]> {
     const [keys, many] = keyArgs(args);
     const body = await this.call(encodeKeysFrame(Op.Get, keys));
-    const values = decodeValues(body).map((v) => (v === null ? null : decodeValue<T>(v)));
+    const values = decodeValues(body).map((v) => (v === null ? null : this.codec.decode<T>(v)));
     return many ? values : (values[0] ?? null);
   }
 
@@ -174,7 +177,7 @@ export class Client {
     } else {
       entries = args as Entry<unknown>[]; // set([k, v], [k2, v2], ...)
     }
-    await this.call(encodeEntriesFrame(entries.map(([k, v]) => [k, encodeValue(v)] as const)));
+    await this.call(encodeEntriesFrame(entries.map(([k, v]) => [k, this.codec.encode(v)] as const)));
   }
 
   /** Delete one key or many; returns whether each one existed. Same shapes as `get`. */
