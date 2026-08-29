@@ -3,7 +3,6 @@ import {
   type Bin,
   DecodeError,
   FrameReader,
-  MAX_FRAME,
   Op,
   Status,
   decodeFlags,
@@ -38,8 +37,6 @@ export interface ConnectOptions {
   port: number;
   /** Shared secret; when given, AUTH is sent before `connect` resolves. */
   token?: Bin;
-  /** Largest response body accepted, default 64 MiB. */
-  maxFrame?: number;
 }
 
 interface Pending {
@@ -62,15 +59,13 @@ export class Client {
   private unsent: Uint8Array | null = null;
   private flushScheduled = false;
   private closed: Error | null = null;
-  private readonly reader: FrameReader;
+  private readonly reader = new FrameReader();
   private socket!: Socket<undefined>;
 
-  private constructor(maxFrame: number) {
-    this.reader = new FrameReader(maxFrame);
-  }
+  private constructor() {}
 
   static async connect(opts: ConnectOptions): Promise<Client> {
-    const client = new Client(opts.maxFrame ?? MAX_FRAME);
+    const client = new Client();
     client.socket = await Bun.connect({
       hostname: opts.hostname ?? "127.0.0.1",
       port: opts.port,

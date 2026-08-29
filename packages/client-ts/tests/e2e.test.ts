@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { Client, ClosedError, DecodeError, Status, StatusError } from "../src/index";
+import { Client, ClosedError, Status, StatusError } from "../src/index";
 import { type TestServer, startServer } from "./server";
 
 const text = (b: Uint8Array | null) => (b === null ? null : new TextDecoder().decode(b));
@@ -88,15 +88,6 @@ describe("client-ts e2e", () => {
     await expect(inflight).rejects.toBeInstanceOf(ClosedError);
     await expect(c.get(["x"])).rejects.toBeInstanceOf(ClosedError);
     await expect(Client.connect({ port: 1 })).rejects.toBeDefined();
-  });
-
-  test("server error status is surfaced", async () => {
-    const c = await Client.connect({ port: server.port, maxFrame: 1 << 10 });
-    // A valid frame the server rejects: the client refuses to read more
-    // than maxFrame, so a value larger than that is a DecodeError.
-    await c.set([["toobig", new Uint8Array(2048)]]);
-    await expect(c.get(["toobig"])).rejects.toBeInstanceOf(DecodeError);
-    expect(c.isOpen).toBe(false);
   });
 });
 
