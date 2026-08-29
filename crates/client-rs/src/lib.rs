@@ -1,6 +1,7 @@
 //! TCP client for oxicache. One [`Client`] owns one connection and is cheap
 //! to clone; calls from any number of tasks are pipelined onto it and matched
-//! to responses in order. Keys are bytes; what values are is fixed at
+//! to responses in order. Every client authenticates with a token as it
+//! connects. Keys are bytes; what values are is fixed at
 //! [`Client::connect`] by the format it is given: [`Raw`] for bytes, or
 //! (with the `serde` feature) any serde type through a
 //! [`Format`](typed::Format) — the same method names, the value types
@@ -173,23 +174,11 @@ impl Drop for Connection {
 }
 
 impl<F> Client<F> {
-    /// Connect and, if `token` is given, authenticate before returning.
-    pub async fn connect_with_token(
-        addr: SocketAddr,
-        format: F,
-        token: Option<&[u8]>,
-    ) -> Result<Self> {
-        let client = Self::connect(addr, format).await?;
-        if let Some(t) = token {
-            client.auth(t).await?;
-        }
-        Ok(client)
-    }
-
-    /// Connect; `format` says what values are — [`Raw`] bytes, or any
-    /// [`Format`](typed::Format) with the `serde` feature. A client cannot
-    /// exist without one.
-    pub async fn connect(addr: SocketAddr, format: F) -> Result<Self> {
+    /// Connect and authenticate with `token` before returning; a wrong
+    /// token is an [`Error::Status`] with `Unauthorized`. `format` says what
+    /// values are — [`Raw`] bytes, or any [`Format`](typed::Format) with
+    /// the `serde` feature. A client cannot exist without either.
+    pub async fn connect(addr: SocketAddr, format: F, token: impl AsRef<[u8]>) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         let (r, w) = stream.into_split();
@@ -197,22 +186,19 @@ impl<F> Client<F> {
         let (pending_tx, pending_rx) = mpsc::unbounded_channel::<Reply>();
         let writer = tokio::spawn(write_loop(w, rx, pending_tx));
         let reader = tokio::spawn(read_loop(r, pending_rx));
-        Ok(Self {
+        let client = Self {
             tx,
             _conn: Arc::new(Connection { writer, reader }),
             format,
-        })
+        };
+        client
+            .call(Op::Auth, Bytes::copy_from_slice(token.as_ref()))
+            .await?;
+        Ok(client)
     }
 
     pub fn format(&self) -> &F {
         &self.format
-    }
-
-    /// Present the server's shared secret. Required once per connection when
-    /// the server was started with a token; a no-op otherwise.
-    pub async fn auth(&self, token: &[u8]) -> Result<()> {
-        self.call(Op::Auth, Bytes::copy_from_slice(token)).await?;
-        Ok(())
     }
 
     async fn call(&self, op: Op, body: Bytes) -> Result<Bytes> {

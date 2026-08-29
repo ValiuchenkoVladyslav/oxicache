@@ -33,8 +33,10 @@ status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized 
 
 If the server is started with a token (`--token` or `OXICACHE_TOKEN`), AUTH must be the
 first request on every connection; anything else gets status 4 and the connection is closed.
-The client library does this in `Client::connect_with_token(addr, format, token)`, the CLI via `--token` /
-`OXICACHE_TOKEN` (the CLI also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
+Every client always presents one: the Rust `Client::connect(addr, format, token)` and the TS
+transports (`tcp({ …, token })`, `http({ …, token })`) take it as a required argument, and the
+CLI requires `--token` / `OXICACHE_TOKEN` (it also reads the server address from
+`OXICACHE_ADDR`). A server started without a token accepts any. The token travels in clear text — pair it with a private network or a TLS
 tunnel.
 
 ### HTTP
@@ -61,7 +63,8 @@ no CORS handling — put a reverse proxy in front for either.
 ```sh
 cargo run --release -p oxicache-server -- --addr 0.0.0.0:4433 --http-addr 0.0.0.0:4434 --capacity 1G
 # --shards N      independent S3-FIFO shards (default: CPUs)
-# --token T       require AUTH with this secret (or OXICACHE_TOKEN in the environment)
+# --token T       require AUTH with this secret (or OXICACHE_TOKEN in the environment);
+#                 clients always send one, so set it
 # --http-addr A   also serve the HTTP API on A (off unless given)
 # every server flag has an environment variable: OXICACHE_ADDR, OXICACHE_HTTP_ADDR,
 # OXICACHE_CAPACITY, OXICACHE_SHARDS, OXICACHE_TOKEN; a flag wins over a differing
@@ -78,8 +81,9 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
 `get`/`set`/`del` act on one key; `get_multi`/`set_multi`/`del_multi` on several. Keys are
 any bytes (`&str`, `String`, `&[u8]`, `Vec<u8>`, `[u8; N]`); a batch of keys is a tuple (up to
 16), an array, a `Vec` or a slice, and comes back the same shape — an array for a tuple or
-array, a `Vec` for a `Vec` or slice. `Client::connect(addr, format)` fixes what values are for
-the life of the client — there is no client without a format: `Raw` for bytes (`Bytes` out,
+array, a `Vec` for a `Vec` or slice. `Client::connect(addr, format, token)` authenticates as
+it connects (a refused token means no client) and fixes what values are for the life of the
+client — there is no client without a token or a format: `Raw` for bytes (`Bytes` out,
 `AsRef<[u8]>` in), or with `oxicache-client = { features = ["serde"] }` any `Format`, which
 makes the same method names take any `Serialize` value and decode into any `DeserializeOwned`
 type. The crate ships no data format and never inspects the bytes: `Format` is a two-method
@@ -91,7 +95,7 @@ impl Format for Json {
     fn encode<T: Serialize + ?Sized>(&self, v: &T) -> Result<Vec<u8>, BoxError> { Ok(serde_json::to_vec(v)?) }
     fn decode<T: DeserializeOwned>(&self, b: &[u8]) -> Result<T, BoxError> { Ok(serde_json::from_slice(b)?) }
 }
-let client = Client::connect(addr, Json).await?;
+let client = Client::connect(addr, Json, "s3cret").await?;
 
 #[derive(Serialize, Deserialize)] struct User { id: u64, name: String }
 client.set("user:7", User { id: 7, name: "alice".into() }).await?;
@@ -111,7 +115,7 @@ let [a, b] = client.del_multi(("a", "b")).await?;
 
 A tuple of keys must be paired with a tuple of exactly as many value types; a mismatch does
 not compile. A format failure surfaces as `Error::Serialize` / `Error::Deserialize`; a
-`Client::connect(addr, Raw)` reads the stored bytes as they are.
+`Client::connect(addr, Raw, token)` reads the stored bytes as they are.
 
 ## TypeScript client
 

@@ -10,7 +10,7 @@ export interface HttpOptions {
   /** Base URL of the server's HTTP listener, e.g. `http://127.0.0.1:4434`. */
   url: string | URL;
   /** Shared secret, sent as `Authorization: Bearer <token>` on every request. */
-  token?: string;
+  token: string;
   /** `fetch` to use instead of the global one (custom agents, tests). */
   fetch?: Fetch;
 }
@@ -45,9 +45,10 @@ class HttpTransport implements Transport {
 
   constructor(opts: HttpOptions) {
     this.base = String(opts.url).replace(TRAILING_SLASHES, "");
-    this.headers = { "content-type": "application/octet-stream" };
-    if (opts.token !== undefined)
-      this.headers.authorization = `Bearer ${opts.token}`;
+    this.headers = {
+      "content-type": "application/octet-stream",
+      authorization: `Bearer ${opts.token}`,
+    };
     this.fetch = opts.fetch ?? globalThis.fetch;
   }
 

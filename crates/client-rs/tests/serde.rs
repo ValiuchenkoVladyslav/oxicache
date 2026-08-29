@@ -27,7 +27,9 @@ async fn start() -> (Arc<Server>, Client<Json>) {
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
-    let client = Client::connect(server.local_addr(), Json).await.unwrap();
+    let client = Client::connect(server.local_addr(), Json, "t")
+        .await
+        .unwrap();
     (server, client)
 }
 
@@ -217,7 +219,9 @@ async fn primitives_and_collections() {
 #[tokio::test]
 async fn keys_are_shared_between_formats_values_are_not() {
     let (server, c) = start().await;
-    let raw = Client::connect(server.local_addr(), Raw).await.unwrap();
+    let raw = Client::connect(server.local_addr(), Raw, "t")
+        .await
+        .unwrap();
     c.set("k", "typed").await.unwrap();
     // Same key; the bytes are whatever the format wrote (JSON here).
     assert_eq!(
@@ -244,7 +248,9 @@ async fn format_errors_are_reported() {
     }
     let (server, c) = start().await;
     c.set("k", 1).await.unwrap();
-    let b = Client::connect(server.local_addr(), Broken).await.unwrap();
+    let b = Client::connect(server.local_addr(), Broken, "t")
+        .await
+        .unwrap();
     let err = b.set("k", 1).await.unwrap_err();
     assert_eq!(err.to_string(), "serialize: no encoding");
     assert!(matches!(err, Error::Serialize(_)));
@@ -295,6 +301,14 @@ async fn wrong_count_from_server_is_an_error() {
         let (hold, held) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
+            // Accept AUTH, then answer the request with the script.
+            let mut hdr = [0u8; 5];
+            s.read_exact(&mut hdr).await.unwrap();
+            let mut body = vec![0u8; oxicache_wire::decode_header(&hdr).1];
+            s.read_exact(&mut body).await.unwrap();
+            s.write_all(&oxicache_wire::encode_header(0, 0))
+                .await
+                .unwrap();
             let mut hdr = [0u8; 5];
             s.read_exact(&mut hdr).await.unwrap();
             let mut body = vec![0u8; oxicache_wire::decode_header(&hdr).1];
@@ -319,7 +333,7 @@ async fn wrong_count_from_server_is_an_error() {
     let mut reply = oxicache_wire::encode_header(0, 4).to_vec();
     reply.extend_from_slice(&0u32.to_le_bytes());
     let (addr, fake) = scripted(reply).await;
-    let c = Client::connect(addr, Json).await.unwrap();
+    let c = Client::connect(addr, Json, "t").await.unwrap();
     let err = c
         .get_multi(["a", "b"])
         .decode::<String>()
@@ -332,7 +346,7 @@ async fn wrong_count_from_server_is_an_error() {
     reply.extend_from_slice(&1u32.to_le_bytes());
     reply.push(1);
     let (addr, fake) = scripted(reply).await;
-    let c = Client::connect(addr, Raw).await.unwrap();
+    let c = Client::connect(addr, Raw, "t").await.unwrap();
     let err = c.del_multi(["a", "b"]).await.unwrap_err();
     assert_eq!(err.to_string(), "server answered 1 values for 2 keys");
     fake.finish().await;

@@ -14,7 +14,7 @@
 //!         Ok(serde_json::from_slice(b)?)
 //!     }
 //! }
-//! let c = Client::connect(addr, Json).await?;
+//! let c = Client::connect(addr, Json, "s3cret").await?;
 //! c.set("user:7", &user).await?;
 //! let user = c.get::<User>("user:7").await?;                          // Option<User>
 //! let (user, hits) = c.get_multi(("user:7", "hits:7")).decode::<(User, u64)>().await?;

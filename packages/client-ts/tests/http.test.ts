@@ -27,7 +27,9 @@ describe("http transport e2e", () => {
   });
 
   test("get/set/del in every shape, values are binary msgpack", async () => {
-    const c = await Client.connect(http({ url: `${server.url}/` }));
+    const c = await Client.connect(
+      http({ url: `${server.url}/`, token: "any" }),
+    );
     expect(c.isOpen).toBe(true);
     expect(await c.get("h")).toBeNull();
     await c.set("h", { id: 7, when: new Date(1234567890123), big: 2n ** 70n });
@@ -59,7 +61,7 @@ describe("http transport e2e", () => {
   });
 
   test("large values", async () => {
-    const c = await Client.connect(http(server));
+    const c = await Client.connect(http({ url: server.url, token: "any" }));
     const big = new Uint8Array(4 << 20).fill(3);
     await c.set("hbig", big);
     const got = must(await c.get<Uint8Array>("hbig"));
@@ -68,7 +70,7 @@ describe("http transport e2e", () => {
   });
 
   test("server statuses become StatusError", async () => {
-    const t = http(server);
+    const t = http({ url: server.url, token: "any" });
     // A malformed body: the frame says one key but carries none.
     const bad = new Uint8Array([Op.Get, 4, 0, 0, 0, 1, 0, 0, 0]);
     const err = await t.request(bad).catch((e) => e);
@@ -80,6 +82,7 @@ describe("http transport e2e", () => {
     const fetchTo = (path: string) =>
       http({
         url: server.url,
+        token: "any",
         fetch: (_u, init) => fetch(server.url + path, init),
       });
     const e404 = await fetchTo("/nope")
@@ -88,6 +91,7 @@ describe("http transport e2e", () => {
     expect((e404 as StatusError).status).toBe(Status.UnknownOp);
     const e413 = await http({
       url: server.url,
+      token: "any",
       fetch: async () => new Response("too big", { status: 413 }),
     })
       .request(bad)
@@ -96,6 +100,7 @@ describe("http transport e2e", () => {
     // Statuses the server never sends (a proxy's, say) are plain errors.
     const e502 = await http({
       url: server.url,
+      token: "any",
       fetch: async () => new Response("bad gateway", { status: 502 }),
     })
       .request(bad)
@@ -139,22 +144,17 @@ describe("http token auth", () => {
   });
   afterAll(() => server.stop());
 
-  test("missing or wrong token is Unauthorized, /health needs none", async () => {
+  test("wrong token is Unauthorized, /health needs none", async () => {
     expect((await fetch(`${server.url}/health`)).status).toBe(200);
-    for (const token of [undefined, "s3cre"]) {
-      // biome-ignore lint/performance/noAwaitInLoops: each case is checked in turn
-      const c = await Client.connect(
-        http({ url: server.url, ...(token === undefined ? {} : { token }) }),
-      );
-      const err = await c.get("a").catch((e) => e);
-      expect(err).toBeInstanceOf(StatusError);
-      expect((err as StatusError).status).toBe(Status.Unauthorized);
-      // Unlike TCP, a refused request does not end the transport.
-      expect(c.isOpen).toBe(true);
-    }
-    const c = await Client.connect(http({ url: server.url, token: "s3cret" }));
-    await c.set("a", 1);
-    expect(await c.get<number>("a")).toBe(1);
-    c.close();
+    const c = await Client.connect(http({ url: server.url, token: "s3cre" }));
+    const err = await c.get("a").catch((e) => e);
+    expect(err).toBeInstanceOf(StatusError);
+    expect((err as StatusError).status).toBe(Status.Unauthorized);
+    // Unlike TCP, a refused request does not end the transport.
+    expect(c.isOpen).toBe(true);
+    const ok = await Client.connect(http({ url: server.url, token: "s3cret" }));
+    await ok.set("a", 1);
+    expect(await ok.get<number>("a")).toBe(1);
+    ok.close();
   });
 });

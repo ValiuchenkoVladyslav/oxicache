@@ -10,7 +10,9 @@ async fn start() -> (Arc<Server>, Client<Raw>) {
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
-    let client = Client::connect(server.local_addr(), Raw).await.unwrap();
+    let client = Client::connect(server.local_addr(), Raw, "any")
+        .await
+        .unwrap();
     (server, client)
 }
 
@@ -106,39 +108,29 @@ async fn token_auth() {
     tokio::spawn(async move { s.run().await });
     let addr = server.local_addr();
 
-    // No auth: rejected and disconnected.
-    let c = Client::connect(addr, Raw).await.unwrap();
-    let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "server returned Unauthorized: auth required"
-    );
-    assert!(matches!(
-        c.get_multi([&b"a"[..]]).await,
-        Err(Error::Closed | Error::Io(_))
-    ));
+    // Wrong (or empty) token: no client comes out of `connect`.
+    for wrong in [&b"s3cre"[..], b""] {
+        let err = Client::connect(addr, Raw, wrong).await.err().unwrap();
+        assert_eq!(
+            err.to_string(),
+            "server returned Unauthorized: auth required"
+        );
+        assert!(matches!(
+            err,
+            Error::Status {
+                status: Status::Unauthorized,
+                ..
+            }
+        ));
+    }
 
-    // Wrong token: rejected.
-    let c = Client::connect(addr, Raw).await.unwrap();
-    assert!(matches!(
-        c.auth(b"s3cre").await,
-        Err(Error::Status {
-            status: Status::Unauthorized,
-            ..
-        })
-    ));
-
-    // Right token, once per connection: everything works, including a
-    // redundant second AUTH.
-    let c = Client::connect_with_token(addr, Raw, Some(b"s3cret"))
-        .await
-        .unwrap();
+    // Right token: everything works.
+    let c = Client::connect(addr, Raw, "s3cret").await.unwrap();
     c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
     assert_eq!(
         c.get_multi([&b"a"[..]]).await.unwrap(),
         [Some(Bytes::from_static(b"1"))]
     );
-    c.auth(b"s3cret").await.unwrap();
     assert_eq!(c.del_multi([&b"a"[..]]).await.unwrap(), [true]);
 }
 
@@ -148,7 +140,7 @@ async fn closed_connection_errors() {
     drop(server);
     // Existing connection still works because the accept loop task owns the listener clone.
     client.set_multi([(&b"x"[..], &b"y"[..])]).await.unwrap();
-    let dead = Client::connect("127.0.0.1:1".parse().unwrap(), Raw).await;
+    let dead = Client::connect("127.0.0.1:1".parse().unwrap(), Raw, "t").await;
     assert!(matches!(dead, Err(Error::Io(_))));
 }
 
@@ -162,22 +154,20 @@ async fn unsolicited_frame_closes_connection() {
     let (hold, held) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
+        accept_auth(&mut s).await;
         let mut hdr = [0u8; 5];
         s.read_exact(&mut hdr).await.unwrap();
         let mut body = vec![0u8; oxicache_wire::decode_header(&hdr).1];
         s.read_exact(&mut body).await.unwrap();
-        // Legit SET reply, then a stray one.
-        s.write_all(&oxicache_wire::encode_header(0, 0))
-            .await
-            .unwrap();
-        s.write_all(&oxicache_wire::encode_header(0, 0))
-            .await
-            .unwrap();
+        // Legit SET reply and a stray one, in one write so both are in the
+        // client's buffer before the next request is issued.
+        let ok = oxicache_wire::encode_header(0, 0);
+        s.write_all(&[ok, ok].concat()).await.unwrap();
         s.flush().await.unwrap();
         // Keep the socket open; the client should still fail.
         let _ = held.await;
     });
-    let c = Client::connect(addr, Raw).await.unwrap();
+    let c = Client::connect(addr, Raw, "t").await.unwrap();
     c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
     // Without detection this call would receive the stray frame as its own
     // reply and decode an empty body as a values list.
@@ -187,8 +177,23 @@ async fn unsolicited_frame_closes_connection() {
     server.await.unwrap();
 }
 
-/// A fake server that answers the first request with `reply` verbatim and
-/// then holds the socket open until the returned sender is dropped.
+/// Read the client's AUTH frame and accept it, as any server would.
+async fn accept_auth(s: &mut tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut hdr = [0u8; 5];
+    s.read_exact(&mut hdr).await.unwrap();
+    assert_eq!(hdr[0], oxicache_wire::Op::Auth as u8);
+    let mut body = vec![0u8; oxicache_wire::decode_header(&hdr).1];
+    s.read_exact(&mut body).await.unwrap();
+    s.write_all(&oxicache_wire::encode_header(0, 0))
+        .await
+        .unwrap();
+    s.flush().await.unwrap();
+}
+
+/// A fake server that accepts AUTH, answers the next request with `reply`
+/// verbatim and then holds the socket open until the returned sender is
+/// dropped.
 async fn scripted(reply: Vec<u8>) -> (std::net::SocketAddr, Scripted) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -196,6 +201,7 @@ async fn scripted(reply: Vec<u8>) -> (std::net::SocketAddr, Scripted) {
     let (hold, held) = tokio::sync::oneshot::channel::<()>();
     let task = tokio::spawn(async move {
         let (mut s, _) = listener.accept().await.unwrap();
+        accept_auth(&mut s).await;
         let mut hdr = [0u8; 5];
         s.read_exact(&mut hdr).await.unwrap();
         let mut body = vec![0u8; oxicache_wire::decode_header(&hdr).1];
@@ -221,18 +227,9 @@ impl Scripted {
 }
 
 #[tokio::test]
-async fn connect_without_token() {
-    let (server, _) = start().await;
-    let c = Client::connect_with_token(server.local_addr(), Raw, None)
-        .await
-        .unwrap();
-    c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
-}
-
-#[tokio::test]
 async fn invalid_status_byte_closes_connection() {
     let (addr, fake) = scripted(oxicache_wire::encode_header(9, 0).to_vec()).await;
-    let c = Client::connect(addr, Raw).await.unwrap();
+    let c = Client::connect(addr, Raw, "t").await.unwrap();
     let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::InvalidStatus(9)), "{err}");
     let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
@@ -244,7 +241,7 @@ async fn invalid_status_byte_closes_connection() {
 async fn oversized_response_is_reported() {
     let too_big = oxicache_wire::MAX_FRAME + 1;
     let (addr, fake) = scripted(oxicache_wire::encode_header(0, too_big).to_vec()).await;
-    let c = Client::connect(addr, Raw).await.unwrap();
+    let c = Client::connect(addr, Raw, "t").await.unwrap();
     let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(
         matches!(err, Error::ResponseTooLarge(n) if n == too_big),
@@ -258,12 +255,12 @@ async fn malformed_bodies_are_decode_errors() {
     let mut bad = oxicache_wire::encode_header(0, 2).to_vec();
     bad.extend_from_slice(&[9, 0]);
     let (addr, fake) = scripted(bad.clone()).await;
-    let c = Client::connect(addr, Raw).await.unwrap();
+    let c = Client::connect(addr, Raw, "t").await.unwrap();
     let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Decode(_)), "{err}");
     fake.finish().await;
     let (addr, fake) = scripted(bad).await;
-    let c = Client::connect(addr, Raw).await.unwrap();
+    let c = Client::connect(addr, Raw, "t").await.unwrap();
     let err = c.del_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Decode(_)), "{err}");
     fake.finish().await;
@@ -277,11 +274,12 @@ async fn write_failure_closes_connection() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (s, _) = listener.accept().await.unwrap();
+        let (mut s, _) = listener.accept().await.unwrap();
+        accept_auth(&mut s).await;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         drop(s);
     });
-    let c = Client::connect(addr, Raw).await.unwrap();
+    let c = Client::connect(addr, Raw, "t").await.unwrap();
     let big = vec![0u8; 32 << 20];
     let err = c.set_multi([(&b"a"[..], &big[..])]).await.unwrap_err();
     assert!(matches!(err, Error::Closed | Error::Io(_)), "{err}");

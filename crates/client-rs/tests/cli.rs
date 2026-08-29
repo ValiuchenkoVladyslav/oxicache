@@ -45,15 +45,16 @@ fn text(o: &Output) -> (String, String) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_set_del() {
-    let server = start(None).await;
+    let server = start(Some(b"t")).await;
     let addr = server.local_addr().to_string();
-    let out = cli(&["--addr", &addr, "set", "a", "1", "b", "2"], &[]).await;
+    let env = [("OXICACHE_TOKEN", "t")];
+    let out = cli(&["--addr", &addr, "set", "a", "1", "b", "2"], &env).await;
     assert!(out.status.success(), "{}", text(&out).1);
     assert_eq!(text(&out).0, "OK (2 entries)\n");
-    let out = cli(&["--addr", &addr, "get", "a", "b", "zz"], &[]).await;
+    let out = cli(&["--addr", &addr, "get", "a", "b", "zz"], &env).await;
     assert!(out.status.success());
     assert_eq!(text(&out).0, "a: 1\nb: 2\nzz: (nil)\n");
-    let out = cli(&["--addr", &addr, "del", "a", "zz"], &[]).await;
+    let out = cli(&["--addr", &addr, "del", "a", "zz"], &env).await;
     assert!(out.status.success());
     assert_eq!(text(&out).0, "a: deleted\nzz: (nil)\n");
 }
@@ -62,11 +63,15 @@ async fn get_set_del() {
 async fn errors_are_reported() {
     let server = start(None).await;
     let addr = server.local_addr().to_string();
-    let out = cli(&["--addr", &addr, "set", "a"], &[]).await;
+    let out = cli(&["--addr", &addr, "--token", "t", "set", "a"], &[]).await;
     assert!(!out.status.success());
     assert!(text(&out).1.contains("key value pairs"));
-    let out = cli(&["--addr", "127.0.0.1:1", "get", "a"], &[]).await;
+    let out = cli(&["--addr", "127.0.0.1:1", "--token", "t", "get", "a"], &[]).await;
     assert!(!out.status.success());
+    // No token at all is a usage error, before any connection.
+    let out = cli(&["--addr", &addr, "get", "a"], &[]).await;
+    assert!(!out.status.success());
+    assert!(text(&out).1.contains("--token"), "{}", text(&out).1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -92,8 +97,9 @@ async fn token_and_env_overrides() {
     )
     .await;
     assert_eq!(text(&out).0, "k: v\n");
-    let out = cli(&["--addr", &addr, "get", "k"], &[]).await;
+    let out = cli(&["--addr", &addr, "--token", "wrong", "get", "k"], &[]).await;
     assert!(!out.status.success(), "unauthenticated");
+    assert!(text(&out).1.contains("Unauthorized"), "{}", text(&out).1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -104,6 +110,8 @@ async fn bench_runs() {
         &[
             "--addr",
             &addr,
+            "--token",
+            "t",
             "bench",
             "--conns",
             "2",

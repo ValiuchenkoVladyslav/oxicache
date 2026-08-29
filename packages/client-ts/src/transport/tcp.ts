@@ -18,8 +18,8 @@ import {
 export interface TcpOptions {
   hostname?: string;
   port: number;
-  /** Shared secret; when given, AUTH is sent before `tcp` resolves. */
-  token?: Bin;
+  /** Shared secret; AUTH is sent before `tcp` resolves and a refusal rejects it. */
+  token: Bin;
 }
 
 interface Pending {
@@ -63,13 +63,11 @@ class TcpTransport implements Transport {
       },
     });
     if (t.closed) throw t.closed;
-    if (opts.token !== undefined) {
-      try {
-        await t.request(encodeRawFrame(Op.Auth, toBytes(opts.token)));
-      } catch (e) {
-        t.close();
-        throw e;
-      }
+    try {
+      await t.request(encodeRawFrame(Op.Auth, toBytes(opts.token)));
+    } catch (e) {
+      t.close();
+      throw e;
     }
     return t;
   }
