@@ -1,5 +1,5 @@
-//! Typed values, enabled by the `serde` feature: a `Client<F>` made by
-//! [`Client::with_format`] takes any `Serialize` value and decodes into any
+//! Typed values, enabled by the `serde` feature: a `Client<F>` connected
+//! with a [`Format`] takes any `Serialize` value and decodes into any
 //! `DeserializeOwned` type, through `F` — any serde data format the caller
 //! implements [`Format`] for. The crate ships no format of its own and never
 //! looks inside the bytes; keys are always plain bytes.
@@ -14,7 +14,7 @@
 //!         Ok(serde_json::from_slice(b)?)
 //!     }
 //! }
-//! let c = Client::connect(addr).await?.with_format(Json);
+//! let c = Client::connect(addr, Json).await?;
 //! c.set("user:7", &user).await?;
 //! let user = c.get::<User>("user:7").await?;                          // Option<User>
 //! let (user, hits) = c.get_multi(("user:7", "hits:7")).decode::<(User, u64)>().await?;

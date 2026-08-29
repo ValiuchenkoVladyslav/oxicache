@@ -1,9 +1,10 @@
 //! TCP client for oxicache. One [`Client`] owns one connection and is cheap
 //! to clone; calls from any number of tasks are pipelined onto it and matched
-//! to responses in order. Keys are bytes; values are bytes on a
-//! `Client<Raw>` (what [`Client::connect`] returns) and, with the `serde`
-//! feature, any serde type on a `Client<F>` made by [`Client::with_format`]
-//! — the same method names, the value types picked by the caller.
+//! to responses in order. Keys are bytes; what values are is fixed at
+//! [`Client::connect`] by the format it is given: [`Raw`] for bytes, or
+//! (with the `serde` feature) any serde type through a
+//! [`Format`](typed::Format) — the same method names, the value types
+//! picked by the caller.
 
 use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
@@ -56,7 +57,7 @@ type Reply = oneshot::Sender<Result<Bytes>>;
 /// One connection. `F` says what values are: [`Raw`] bytes, or (with the
 /// `serde` feature) anything a [`Format`](typed::Format) can encode.
 #[derive(Clone)]
-pub struct Client<F = Raw> {
+pub struct Client<F> {
     tx: mpsc::Sender<(Op, Bytes, Reply)>,
     _conn: Arc<Connection>,
     format: F,
@@ -171,17 +172,24 @@ impl Drop for Connection {
     }
 }
 
-impl Client<Raw> {
+impl<F> Client<F> {
     /// Connect and, if `token` is given, authenticate before returning.
-    pub async fn connect_with_token(addr: SocketAddr, token: Option<&[u8]>) -> Result<Self> {
-        let client = Self::connect(addr).await?;
+    pub async fn connect_with_token(
+        addr: SocketAddr,
+        format: F,
+        token: Option<&[u8]>,
+    ) -> Result<Self> {
+        let client = Self::connect(addr, format).await?;
         if let Some(t) = token {
             client.auth(t).await?;
         }
         Ok(client)
     }
 
-    pub async fn connect(addr: SocketAddr) -> Result<Self> {
+    /// Connect; `format` says what values are — [`Raw`] bytes, or any
+    /// [`Format`](typed::Format) with the `serde` feature. A client cannot
+    /// exist without one.
+    pub async fn connect(addr: SocketAddr, format: F) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         let (r, w) = stream.into_split();
@@ -192,20 +200,8 @@ impl Client<Raw> {
         Ok(Self {
             tx,
             _conn: Arc::new(Connection { writer, reader }),
-            format: Raw,
-        })
-    }
-}
-
-impl<F> Client<F> {
-    /// The same connection with values going through `format` (any
-    /// [`Format`](typed::Format), or [`Raw`] for bytes).
-    pub fn with_format<G>(self, format: G) -> Client<G> {
-        Client {
-            tx: self.tx,
-            _conn: self._conn,
             format,
-        }
+        })
     }
 
     pub fn format(&self) -> &F {

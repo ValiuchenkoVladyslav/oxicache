@@ -33,7 +33,7 @@ status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized 
 
 If the server is started with a token (`--token` or `OXICACHE_TOKEN`), AUTH must be the
 first request on every connection; anything else gets status 4 and the connection is closed.
-The client library does this in `Client::connect_with_token`, the CLI via `--token` /
+The client library does this in `Client::connect_with_token(addr, format, token)`, the CLI via `--token` /
 `OXICACHE_TOKEN` (the CLI also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
 tunnel.
 
@@ -78,12 +78,12 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
 `get`/`set`/`del` act on one key; `get_multi`/`set_multi`/`del_multi` on several. Keys are
 any bytes (`&str`, `String`, `&[u8]`, `Vec<u8>`, `[u8; N]`); a batch of keys is a tuple (up to
 16), an array, a `Vec` or a slice, and comes back the same shape — an array for a tuple or
-array, a `Vec` for a `Vec` or slice. `Client::connect` gives a `Client<Raw>` whose values are
-bytes. With `oxicache-client = { features = ["serde"] }`, `client.with_format(f)` gives a
-`Client<F>` with the same method names taking any `Serialize` value and decoding into any
-`DeserializeOwned` type. The crate ships no data format and never inspects the bytes: `F` is
-anything implementing the two-method `Format` trait — JSON, MessagePack, postcard, … — and
-only that choice decides what the cache stores.
+array, a `Vec` for a `Vec` or slice. `Client::connect(addr, format)` fixes what values are for
+the life of the client — there is no client without a format: `Raw` for bytes (`Bytes` out,
+`AsRef<[u8]>` in), or with `oxicache-client = { features = ["serde"] }` any `Format`, which
+makes the same method names take any `Serialize` value and decode into any `DeserializeOwned`
+type. The crate ships no data format and never inspects the bytes: `Format` is a two-method
+trait — JSON, MessagePack, postcard, … — and only that choice decides what the cache stores.
 
 ```rust
 struct Json;
@@ -91,7 +91,7 @@ impl Format for Json {
     fn encode<T: Serialize + ?Sized>(&self, v: &T) -> Result<Vec<u8>, BoxError> { Ok(serde_json::to_vec(v)?) }
     fn decode<T: DeserializeOwned>(&self, b: &[u8]) -> Result<T, BoxError> { Ok(serde_json::from_slice(b)?) }
 }
-let client = Client::connect(addr).await?.with_format(Json);
+let client = Client::connect(addr, Json).await?;
 
 #[derive(Serialize, Deserialize)] struct User { id: u64, name: String }
 client.set("user:7", User { id: 7, name: "alice".into() }).await?;
@@ -110,8 +110,8 @@ let [a, b] = client.del_multi(("a", "b")).await?;
 ```
 
 A tuple of keys must be paired with a tuple of exactly as many value types; a mismatch does
-not compile. A format failure surfaces as `Error::Serialize` / `Error::Deserialize`;
-`client.with_format(Raw)` on the same connection reads the stored bytes as they are.
+not compile. A format failure surfaces as `Error::Serialize` / `Error::Deserialize`; a
+`Client::connect(addr, Raw)` reads the stored bytes as they are.
 
 ## TypeScript client
 

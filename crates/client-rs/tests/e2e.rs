@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use oxicache_client::{Client, Error};
+use oxicache_client::{Client, Error, Raw};
 use oxicache_server::{Cache, Options, Server};
 use oxicache_wire::Status;
 
-async fn start() -> (Arc<Server>, Client) {
+async fn start() -> (Arc<Server>, Client<Raw>) {
     let cache = Arc::new(Cache::new(64 << 20, 4));
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
-    let client = Client::connect(server.local_addr()).await.unwrap();
+    let client = Client::connect(server.local_addr(), Raw).await.unwrap();
     (server, client)
 }
 
@@ -107,7 +107,7 @@ async fn token_auth() {
     let addr = server.local_addr();
 
     // No auth: rejected and disconnected.
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr, Raw).await.unwrap();
     let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert_eq!(
         err.to_string(),
@@ -119,7 +119,7 @@ async fn token_auth() {
     ));
 
     // Wrong token: rejected.
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr, Raw).await.unwrap();
     assert!(matches!(
         c.auth(b"s3cre").await,
         Err(Error::Status {
@@ -130,7 +130,7 @@ async fn token_auth() {
 
     // Right token, once per connection: everything works, including a
     // redundant second AUTH.
-    let c = Client::connect_with_token(addr, Some(b"s3cret"))
+    let c = Client::connect_with_token(addr, Raw, Some(b"s3cret"))
         .await
         .unwrap();
     c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
@@ -148,7 +148,7 @@ async fn closed_connection_errors() {
     drop(server);
     // Existing connection still works because the accept loop task owns the listener clone.
     client.set_multi([(&b"x"[..], &b"y"[..])]).await.unwrap();
-    let dead = Client::connect("127.0.0.1:1".parse().unwrap()).await;
+    let dead = Client::connect("127.0.0.1:1".parse().unwrap(), Raw).await;
     assert!(matches!(dead, Err(Error::Io(_))));
 }
 
@@ -177,7 +177,7 @@ async fn unsolicited_frame_closes_connection() {
         // Keep the socket open; the client should still fail.
         let _ = held.await;
     });
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr, Raw).await.unwrap();
     c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
     // Without detection this call would receive the stray frame as its own
     // reply and decode an empty body as a values list.
@@ -223,7 +223,7 @@ impl Scripted {
 #[tokio::test]
 async fn connect_without_token() {
     let (server, _) = start().await;
-    let c = Client::connect_with_token(server.local_addr(), None)
+    let c = Client::connect_with_token(server.local_addr(), Raw, None)
         .await
         .unwrap();
     c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
@@ -232,7 +232,7 @@ async fn connect_without_token() {
 #[tokio::test]
 async fn invalid_status_byte_closes_connection() {
     let (addr, fake) = scripted(oxicache_wire::encode_header(9, 0).to_vec()).await;
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr, Raw).await.unwrap();
     let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::InvalidStatus(9)), "{err}");
     let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
@@ -244,7 +244,7 @@ async fn invalid_status_byte_closes_connection() {
 async fn oversized_response_is_reported() {
     let too_big = oxicache_wire::MAX_FRAME + 1;
     let (addr, fake) = scripted(oxicache_wire::encode_header(0, too_big).to_vec()).await;
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr, Raw).await.unwrap();
     let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(
         matches!(err, Error::ResponseTooLarge(n) if n == too_big),
@@ -258,12 +258,12 @@ async fn malformed_bodies_are_decode_errors() {
     let mut bad = oxicache_wire::encode_header(0, 2).to_vec();
     bad.extend_from_slice(&[9, 0]);
     let (addr, fake) = scripted(bad.clone()).await;
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr, Raw).await.unwrap();
     let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Decode(_)), "{err}");
     fake.finish().await;
     let (addr, fake) = scripted(bad).await;
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr, Raw).await.unwrap();
     let err = c.del_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Decode(_)), "{err}");
     fake.finish().await;
@@ -281,7 +281,7 @@ async fn write_failure_closes_connection() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         drop(s);
     });
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr, Raw).await.unwrap();
     let big = vec![0u8; 32 << 20];
     let err = c.set_multi([(&b"a"[..], &big[..])]).await.unwrap_err();
     assert!(matches!(err, Error::Closed | Error::Io(_)), "{err}");

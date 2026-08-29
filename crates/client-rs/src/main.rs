@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use oxicache_client::Client;
+use oxicache_client::{Client, Raw};
 use oxicache_wire::cli::warn_if_overridden;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     let token = args.token.as_deref().map(str::as_bytes);
     match args.cmd {
         Cmd::Get { keys } => {
-            let client = Client::connect_with_token(args.addr, token).await?;
+            let client = Client::connect_with_token(args.addr, Raw, token).await?;
             let vals = client.get_multi(keys.as_slice()).await?;
             for (k, v) in keys.iter().zip(vals) {
                 match v {
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
             if kv.len() % 2 != 0 {
                 return Err("set expects key value pairs".into());
             }
-            let client = Client::connect_with_token(args.addr, token).await?;
+            let client = Client::connect_with_token(args.addr, Raw, token).await?;
             let pairs: Vec<(&[u8], &[u8])> = kv
                 .chunks(2)
                 .map(|c| (c[0].as_bytes(), c[1].as_bytes()))
@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
             println!("OK ({} entries)", pairs.len());
         }
         Cmd::Del { keys } => {
-            let client = Client::connect_with_token(args.addr, token).await?;
+            let client = Client::connect_with_token(args.addr, Raw, token).await?;
             let flags = client.del_multi(keys.as_slice()).await?;
             for (k, f) in keys.iter().zip(flags) {
                 println!("{k}: {}", if f { "deleted" } else { "(nil)" });
@@ -158,7 +158,7 @@ async fn bench(
 
     let mut clients = Vec::with_capacity(conns);
     for _ in 0..conns {
-        clients.push(Client::connect_with_token(addr, token).await?);
+        clients.push(Client::connect_with_token(addr, Raw, token).await?);
     }
     let start = Instant::now();
     let deadline = start + Duration::from_secs(seconds);

@@ -27,8 +27,8 @@ async fn start() -> (Arc<Server>, Client<Json>) {
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
-    let client = Client::connect(server.local_addr()).await.unwrap();
-    (server, client.with_format(Json))
+    let client = Client::connect(server.local_addr(), Json).await.unwrap();
+    (server, client)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -216,8 +216,8 @@ async fn primitives_and_collections() {
 
 #[tokio::test]
 async fn keys_are_shared_between_formats_values_are_not() {
-    let (_server, c) = start().await;
-    let raw = c.clone().with_format(Raw);
+    let (server, c) = start().await;
+    let raw = Client::connect(server.local_addr(), Raw).await.unwrap();
     c.set("k", "typed").await.unwrap();
     // Same key; the bytes are whatever the format wrote (JSON here).
     assert_eq!(
@@ -242,9 +242,9 @@ async fn format_errors_are_reported() {
             Err("no decoding".into())
         }
     }
-    let (_server, c) = start().await;
+    let (server, c) = start().await;
     c.set("k", 1).await.unwrap();
-    let b = c.clone().with_format(Broken);
+    let b = Client::connect(server.local_addr(), Broken).await.unwrap();
     let err = b.set("k", 1).await.unwrap_err();
     assert_eq!(err.to_string(), "serialize: no encoding");
     assert!(matches!(err, Error::Serialize(_)));
@@ -319,7 +319,7 @@ async fn wrong_count_from_server_is_an_error() {
     let mut reply = oxicache_wire::encode_header(0, 4).to_vec();
     reply.extend_from_slice(&0u32.to_le_bytes());
     let (addr, fake) = scripted(reply).await;
-    let c = Client::connect(addr).await.unwrap().with_format(Json);
+    let c = Client::connect(addr, Json).await.unwrap();
     let err = c
         .get_multi(["a", "b"])
         .decode::<String>()
@@ -332,7 +332,7 @@ async fn wrong_count_from_server_is_an_error() {
     reply.extend_from_slice(&1u32.to_le_bytes());
     reply.push(1);
     let (addr, fake) = scripted(reply).await;
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr, Raw).await.unwrap();
     let err = c.del_multi(["a", "b"]).await.unwrap_err();
     assert_eq!(err.to_string(), "server answered 1 values for 2 keys");
     fake.finish().await;
