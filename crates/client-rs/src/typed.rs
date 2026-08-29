@@ -1,9 +1,11 @@
-//! Typed API, enabled by the `serde` feature: `Client`'s `get`/`set`/`del`
-//! and their `_multi` forms take any `Serialize` key or value and decode
-//! into any `DeserializeOwned` type (MessagePack via `rmp-serde`, compact
-//! form). The byte-level API stays available as [`Client::raw`]; a `&str`
-//! key stored through it is a different key from the same `&str` stored
-//! through the typed API, which MessagePack-encodes it.
+//! Typed API, enabled by the `serde` feature: [`Typed`] wraps a [`Client`]
+//! and a [`Format`] — any serde data format the caller picks — and its
+//! `get`/`set`/`del` and `_multi` forms take any `Serialize` key or value
+//! and decode into any `DeserializeOwned` type. The crate ships no format of
+//! its own; implementing [`Format`] is two one-line methods around e.g.
+//! `serde_json`, `rmp_serde` or `postcard`. Keys go through the format too,
+//! so a `&str` key stored through `Typed` is a different key from the same
+//! `&str` stored as bytes through the [`Client`].
 //!
 //! The `_multi` forms accept three key shapes (see [`Keys`]):
 //!
@@ -14,25 +16,45 @@
 //! - a `Vec<K>` or `&[K]`, one value type: `Vec<Option<V>>`
 //!
 //! ```ignore
-//! let user: Option<User> = client.get("user:7").await?;
+//! struct Json;
+//! impl Format for Json {
+//!     fn encode<T: Serialize + ?Sized>(&self, v: &T) -> Result<Vec<u8>, BoxError> {
+//!         Ok(serde_json::to_vec(v)?)
+//!     }
+//!     fn decode<T: DeserializeOwned>(&self, b: &[u8]) -> Result<T, BoxError> {
+//!         Ok(serde_json::from_slice(b)?)
+//!     }
+//! }
+//! let c = client.typed(Json);
+//! let user: Option<User> = c.get("user:7").await?;
 //! let (user, hits): (Option<User>, Option<u64>) =
-//!     client.get_multi(("user:7", "hits:7")).await?;
-//! let users: Vec<Option<User>> = client.get_multi(ids).await?;
-//! client.set_multi([("a", 1), ("b", 2)]).await?;
+//!     c.get_multi(("user:7", "hits:7")).await?;
+//! let users: Vec<Option<User>> = c.get_multi(ids).await?;
+//! c.set_multi([("a", 1), ("b", 2)]).await?;
 //! ```
 
 use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::{Client, Error, Result};
+use crate::{BoxError, Client, Error, Result};
 
-fn encode<K: Serialize>(key: K) -> Result<Vec<u8>> {
-    Ok(rmp_serde::to_vec(&key)?)
+/// A serde data format: how keys and values become bytes and back. Any
+/// format works as long as `decode(encode(x)) == x`; the cache never looks
+/// inside.
+pub trait Format {
+    fn encode<T: Serialize + ?Sized>(&self, value: &T) -> std::result::Result<Vec<u8>, BoxError>;
+    fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> std::result::Result<T, BoxError>;
 }
 
-fn decode<V: DeserializeOwned>(value: Option<Bytes>) -> Result<Option<V>> {
-    Ok(value.map(|v| rmp_serde::from_slice(&v)).transpose()?)
+fn encode<F: Format, K: Serialize>(f: &F, key: K) -> Result<Vec<u8>> {
+    f.encode(&key).map_err(Error::Serialize)
+}
+
+fn decode<F: Format, V: DeserializeOwned>(f: &F, value: Option<Bytes>) -> Result<Option<V>> {
+    value
+        .map(|v| f.decode(&v).map_err(Error::Deserialize))
+        .transpose()
 }
 
 fn expect_count<T>(values: &[T], expected: usize) -> Result<()> {
@@ -51,7 +73,7 @@ fn expect_count<T>(values: &[T], expected: usize) -> Result<()> {
 pub trait Keys {
     /// The `del_multi` result: `[bool; N]` for tuples and arrays, `Vec<bool>` otherwise.
     type Flags;
-    fn encode(self) -> Result<Vec<Vec<u8>>>;
+    fn encode<F: Format>(self, f: &F) -> Result<Vec<Vec<u8>>>;
     fn flags(flags: Vec<bool>) -> Result<Self::Flags>;
 }
 
@@ -61,15 +83,15 @@ pub trait Keys {
 pub trait ValuesFor<Vs>: Keys {
     /// `(Option<V1>, Option<V2>, …)`, `[Option<V>; N]` or `Vec<Option<V>>`.
     type Output;
-    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output>;
+    fn decode<F: Format>(f: &F, values: Vec<Option<Bytes>>) -> Result<Self::Output>;
 }
 
 macro_rules! impl_tuples {
     ($($n:literal => ($($i:tt $K:ident $V:ident),+);)+) => {$(
         impl<$($K: Serialize),+> Keys for ($($K,)+) {
             type Flags = [bool; $n];
-            fn encode(self) -> Result<Vec<Vec<u8>>> {
-                Ok(vec![$(encode(self.$i)?),+])
+            fn encode<F: Format>(self, f: &F) -> Result<Vec<Vec<u8>>> {
+                Ok(vec![$(encode(f, self.$i)?),+])
             }
             fn flags(flags: Vec<bool>) -> Result<[bool; $n]> {
                 expect_count(&flags, $n)?;
@@ -78,10 +100,10 @@ macro_rules! impl_tuples {
         }
         impl<$($K: Serialize, $V: DeserializeOwned),+> ValuesFor<($($V,)+)> for ($($K,)+) {
             type Output = ($(Option<$V>,)+);
-            fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
+            fn decode<F: Format>(f: &F, values: Vec<Option<Bytes>>) -> Result<Self::Output> {
                 expect_count(&values, $n)?;
                 let mut it = values.into_iter();
-                Ok(($(decode::<$V>(it.next().unwrap())?,)+))
+                Ok(($(decode::<F, $V>(f, it.next().unwrap())?,)+))
             }
         }
     )+};
@@ -108,8 +130,8 @@ impl_tuples! {
 
 impl<K: Serialize, const N: usize> Keys for [K; N] {
     type Flags = [bool; N];
-    fn encode(self) -> Result<Vec<Vec<u8>>> {
-        self.into_iter().map(encode).collect()
+    fn encode<F: Format>(self, f: &F) -> Result<Vec<Vec<u8>>> {
+        self.into_iter().map(|k| encode(f, k)).collect()
     }
     fn flags(flags: Vec<bool>) -> Result<[bool; N]> {
         flags.try_into().map_err(|f: Vec<bool>| Error::Count {
@@ -121,17 +143,20 @@ impl<K: Serialize, const N: usize> Keys for [K; N] {
 
 impl<K: Serialize, V: DeserializeOwned, const N: usize> ValuesFor<V> for [K; N] {
     type Output = [Option<V>; N];
-    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
+    fn decode<F: Format>(f: &F, values: Vec<Option<Bytes>>) -> Result<Self::Output> {
         expect_count(&values, N)?;
-        let decoded = values.into_iter().map(decode).collect::<Result<Vec<_>>>()?;
+        let decoded = values
+            .into_iter()
+            .map(|v| decode(f, v))
+            .collect::<Result<Vec<_>>>()?;
         Ok(decoded.try_into().unwrap_or_else(|_| unreachable!()))
     }
 }
 
 impl<K: Serialize> Keys for Vec<K> {
     type Flags = Vec<bool>;
-    fn encode(self) -> Result<Vec<Vec<u8>>> {
-        self.into_iter().map(encode).collect()
+    fn encode<F: Format>(self, f: &F) -> Result<Vec<Vec<u8>>> {
+        self.into_iter().map(|k| encode(f, k)).collect()
     }
     fn flags(flags: Vec<bool>) -> Result<Vec<bool>> {
         Ok(flags)
@@ -140,15 +165,15 @@ impl<K: Serialize> Keys for Vec<K> {
 
 impl<K: Serialize, V: DeserializeOwned> ValuesFor<V> for Vec<K> {
     type Output = Vec<Option<V>>;
-    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
-        values.into_iter().map(decode).collect()
+    fn decode<F: Format>(f: &F, values: Vec<Option<Bytes>>) -> Result<Self::Output> {
+        values.into_iter().map(|v| decode(f, v)).collect()
     }
 }
 
 impl<K: Serialize> Keys for &[K] {
     type Flags = Vec<bool>;
-    fn encode(self) -> Result<Vec<Vec<u8>>> {
-        self.iter().map(encode).collect()
+    fn encode<F: Format>(self, f: &F) -> Result<Vec<Vec<u8>>> {
+        self.iter().map(|k| encode(f, k)).collect()
     }
     fn flags(flags: Vec<bool>) -> Result<Vec<bool>> {
         Ok(flags)
@@ -157,15 +182,38 @@ impl<K: Serialize> Keys for &[K] {
 
 impl<K: Serialize, V: DeserializeOwned> ValuesFor<V> for &[K] {
     type Output = Vec<Option<V>>;
-    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
-        values.into_iter().map(decode).collect()
+    fn decode<F: Format>(f: &F, values: Vec<Option<Bytes>>) -> Result<Self::Output> {
+        values.into_iter().map(|v| decode(f, v)).collect()
     }
 }
 
-impl Client {
+/// A [`Client`] paired with a [`Format`]; see the module docs. Cheap to
+/// clone when `F` is.
+#[derive(Clone)]
+pub struct Typed<F> {
+    client: Client,
+    format: F,
+}
+
+impl<F: Format> Typed<F> {
+    pub fn new(client: Client, format: F) -> Self {
+        Self { client, format }
+    }
+
+    /// The underlying byte-level client.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
+    /// The format keys and values go through.
+    pub fn format(&self) -> &F {
+        &self.format
+    }
+
     /// Fetch one key, decoding its value as `V`.
     pub async fn get<K: Serialize, V: DeserializeOwned>(&self, key: K) -> Result<Option<V>> {
-        decode(self.raw().get(&encode(key)?).await?)
+        let f = &self.format;
+        decode(f, self.client.get(encode(f, key)?).await?)
     }
 
     /// Fetch a batch of keys. For a tuple of keys `Vs` is a tuple with one
@@ -173,15 +221,19 @@ impl Client {
     /// value type. `Vs` is inferred when the binding is annotated:
     /// `let (u, n): (Option<User>, Option<u64>) = c.get_multi(("u", "n")).await?;`
     pub async fn get_multi<Ks: ValuesFor<Vs>, Vs>(&self, keys: Ks) -> Result<Ks::Output> {
-        let keys = keys.encode()?;
-        let values = self.raw().get_multi(keys.iter().map(Vec::as_slice)).await?;
+        let keys = keys.encode(&self.format)?;
+        let values = self
+            .client
+            .get_multi(keys.iter().map(Vec::as_slice))
+            .await?;
         expect_count(&values, keys.len())?;
-        Ks::decode(values)
+        Ks::decode(&self.format, values)
     }
 
     /// Store one key/value pair.
     pub async fn set<K: Serialize, V: Serialize>(&self, key: K, value: V) -> Result<()> {
-        self.raw().set(&encode(key)?, &encode(value)?).await
+        let f = &self.format;
+        self.client.set(encode(f, key)?, encode(f, value)?).await
     }
 
     /// Store many key/value pairs from any iterator of `(key, value)`.
@@ -191,25 +243,29 @@ impl Client {
         V: Serialize,
         I: IntoIterator<Item = (K, V)>,
     {
+        let f = &self.format;
         let entries = entries
             .into_iter()
-            .map(|(k, v)| Ok((encode(k)?, encode(v)?)))
+            .map(|(k, v)| Ok((encode(f, k)?, encode(f, v)?)))
             .collect::<Result<Vec<_>>>()?;
-        self.raw()
+        self.client
             .set_multi(entries.iter().map(|(k, v)| (k.as_slice(), v.as_slice())))
             .await
     }
 
     /// Delete one key; returns whether it existed.
     pub async fn del<K: Serialize>(&self, key: K) -> Result<bool> {
-        self.raw().del(&encode(key)?).await
+        self.client.del(encode(&self.format, key)?).await
     }
 
     /// Delete a batch of keys; `[bool; N]` for tuples and arrays,
     /// `Vec<bool>` for a `Vec` or slice.
     pub async fn del_multi<Ks: Keys>(&self, keys: Ks) -> Result<Ks::Flags> {
-        let keys = keys.encode()?;
-        let flags = self.raw().del_multi(keys.iter().map(Vec::as_slice)).await?;
+        let keys = keys.encode(&self.format)?;
+        let flags = self
+            .client
+            .del_multi(keys.iter().map(Vec::as_slice))
+            .await?;
         expect_count(&flags, keys.len())?;
         Ks::flags(flags)
     }

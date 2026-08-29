@@ -3,17 +3,32 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use oxicache_client::{Client, Error};
+use oxicache_client::{BoxError, Client, Error, Format, Typed};
 use oxicache_server::{Cache, Server};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-async fn start() -> (Arc<Server>, Client) {
+/// The client ships no format; the tests bring JSON, which also proves the
+/// encoding is the caller's business.
+#[derive(Clone, Copy)]
+struct Json;
+
+impl Format for Json {
+    fn encode<T: Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>, BoxError> {
+        Ok(serde_json::to_vec(value)?)
+    }
+    fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, BoxError> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+}
+
+async fn start() -> (Arc<Server>, Typed<Json>) {
     let cache = Arc::new(Cache::new(64 << 20, 2));
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
     let client = Client::connect(server.local_addr()).await.unwrap();
-    (server, client)
+    (server, client.typed(Json))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,16 +195,52 @@ async fn primitives_and_collections() {
 }
 
 #[tokio::test]
-async fn typed_and_raw_keys_are_distinct_namespaces() {
+async fn typed_and_byte_keys_are_distinct_namespaces() {
     let (_server, c) = start().await;
-    c.raw().set(b"k", b"raw").await.unwrap();
+    c.client().set(b"k", b"raw").await.unwrap();
     c.set("k", "typed").await.unwrap();
     assert_eq!(
-        c.raw().get(b"k").await.unwrap().as_deref(),
+        c.client().get(b"k").await.unwrap().as_deref(),
         Some(&b"raw"[..])
     );
     let got: Option<String> = c.get("k").await.unwrap();
     assert_eq!(got, Some("typed".into()));
+    // The bytes are whatever the format wrote: JSON here.
+    let json_key = c.format().encode("k").unwrap();
+    assert_eq!(json_key, b"\"k\"");
+    assert_eq!(
+        c.client().get(&json_key).await.unwrap().as_deref(),
+        Some(&b"\"typed\""[..])
+    );
+}
+
+/// A format that cannot encode or decode reports through the client's error.
+#[tokio::test]
+async fn format_errors_are_reported() {
+    struct Broken;
+    impl Format for Broken {
+        fn encode<T: Serialize + ?Sized>(&self, _: &T) -> Result<Vec<u8>, BoxError> {
+            Err("no encoding".into())
+        }
+        fn decode<T: DeserializeOwned>(&self, _: &[u8]) -> Result<T, BoxError> {
+            Err("no decoding".into())
+        }
+    }
+    let (_server, c) = start().await;
+    c.set("k", 1).await.unwrap();
+    let b = c.client().typed(Broken);
+    let err = b.set("k", 1).await.unwrap_err();
+    assert_eq!(err.to_string(), "serialize: no encoding");
+    assert!(matches!(err, Error::Serialize(_)));
+    // Decoding fails only once a value comes back, so encode the key with JSON.
+    let err = Typed::new(c.client().clone(), Broken)
+        .get_multi::<_, String>(Vec::<&str>::new())
+        .await;
+    assert!(err.unwrap().is_empty(), "nothing to decode, nothing fails");
+    let raw = c.client().get(b"\"k\"").await.unwrap();
+    assert_eq!(raw.as_deref(), Some(&b"1"[..]));
+    let err = b.del_multi(["k"]).await.unwrap_err();
+    assert!(matches!(err, Error::Serialize(_)), "{err}");
 }
 
 #[tokio::test]
@@ -249,7 +300,7 @@ async fn wrong_count_from_server_is_an_error() {
     let mut reply = oxicache_wire::encode_header(0, 4).to_vec();
     reply.extend_from_slice(&0u32.to_le_bytes());
     let (addr, fake) = scripted(reply).await;
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr).await.unwrap().typed(Json);
     let err = c.get_multi::<_, String>(["a", "b"]).await.unwrap_err();
     assert_eq!(err.to_string(), "server answered 0 values for 2 keys");
     fake.finish().await;
@@ -258,7 +309,7 @@ async fn wrong_count_from_server_is_an_error() {
     reply.extend_from_slice(&1u32.to_le_bytes());
     reply.push(1);
     let (addr, fake) = scripted(reply).await;
-    let c = Client::connect(addr).await.unwrap();
+    let c = Client::connect(addr).await.unwrap().typed(Json);
     let err = c.del_multi(["a", "b"]).await.unwrap_err();
     assert_eq!(err.to_string(), "server answered 1 values for 2 keys");
     fake.finish().await;

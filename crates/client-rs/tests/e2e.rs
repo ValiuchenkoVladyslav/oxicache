@@ -17,17 +17,12 @@ async fn start() -> (Arc<Server>, Client) {
 #[tokio::test]
 async fn get_set_del_over_tcp() {
     let (_server, client) = start().await;
-    assert_eq!(
-        client.raw().get_multi([&b"a"[..]]).await.unwrap(),
-        vec![None]
-    );
+    assert_eq!(client.get_multi([&b"a"[..]]).await.unwrap(), vec![None]);
     client
-        .raw()
         .set_multi([(&b"a"[..], &b"1"[..]), (&b"b"[..], &[0u8, 1, 2][..])])
         .await
         .unwrap();
     let got = client
-        .raw()
         .get_multi([&b"a"[..], &b"b"[..], &b"c"[..]])
         .await
         .unwrap();
@@ -40,17 +35,10 @@ async fn get_set_del_over_tcp() {
         ]
     );
     assert_eq!(
-        client
-            .raw()
-            .del_multi([&b"a"[..], &b"zz"[..]])
-            .await
-            .unwrap(),
+        client.del_multi([&b"a"[..], &b"zz"[..]]).await.unwrap(),
         vec![true, false]
     );
-    assert_eq!(
-        client.raw().get_multi([&b"a"[..]]).await.unwrap(),
-        vec![None]
-    );
+    assert_eq!(client.get_multi([&b"a"[..]]).await.unwrap(), vec![None]);
 }
 
 #[tokio::test]
@@ -58,11 +46,10 @@ async fn large_values() {
     let (_server, client) = start().await;
     let big = vec![7u8; 4 << 20];
     client
-        .raw()
         .set_multi([(&b"big"[..], big.as_slice())])
         .await
         .unwrap();
-    let got = client.raw().get_multi([&b"big"[..]]).await.unwrap();
+    let got = client.get_multi([&b"big"[..]]).await.unwrap();
     assert_eq!(got[0].as_deref(), Some(big.as_slice()));
 }
 
@@ -76,11 +63,10 @@ async fn pipelined_concurrent_calls() {
                 for i in 0..50 {
                     let k = format!("t{t}-{i}");
                     client
-                        .raw()
                         .set_multi([(k.as_bytes(), k.as_bytes())])
                         .await
                         .unwrap();
-                    let got = client.raw().get_multi([k.as_bytes()]).await.unwrap();
+                    let got = client.get_multi([k.as_bytes()]).await.unwrap();
                     assert_eq!(got[0].as_deref(), Some(k.as_bytes()));
                 }
             })
@@ -122,13 +108,13 @@ async fn token_auth() {
 
     // No auth: rejected and disconnected.
     let c = Client::connect(addr).await.unwrap();
-    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert_eq!(
         err.to_string(),
         "server returned Unauthorized: auth required"
     );
     assert!(matches!(
-        c.raw().get_multi([&b"a"[..]]).await,
+        c.get_multi([&b"a"[..]]).await,
         Err(Error::Closed | Error::Io(_))
     ));
 
@@ -147,13 +133,13 @@ async fn token_auth() {
     let c = Client::connect_with_token(addr, Some(b"s3cret"))
         .await
         .unwrap();
-    c.raw().set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
+    c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
     assert_eq!(
-        c.raw().get_multi([&b"a"[..]]).await.unwrap(),
+        c.get_multi([&b"a"[..]]).await.unwrap(),
         vec![Some(Bytes::from_static(b"1"))]
     );
     c.auth(b"s3cret").await.unwrap();
-    assert_eq!(c.raw().del_multi([&b"a"[..]]).await.unwrap(), vec![true]);
+    assert_eq!(c.del_multi([&b"a"[..]]).await.unwrap(), vec![true]);
 }
 
 #[tokio::test]
@@ -161,11 +147,7 @@ async fn closed_connection_errors() {
     let (server, client) = start().await;
     drop(server);
     // Existing connection still works because the accept loop task owns the listener clone.
-    client
-        .raw()
-        .set_multi([(&b"x"[..], &b"y"[..])])
-        .await
-        .unwrap();
+    client.set_multi([(&b"x"[..], &b"y"[..])]).await.unwrap();
     let dead = Client::connect("127.0.0.1:1".parse().unwrap()).await;
     assert!(matches!(dead, Err(Error::Io(_))));
 }
@@ -196,10 +178,10 @@ async fn unsolicited_frame_closes_connection() {
         let _ = held.await;
     });
     let c = Client::connect(addr).await.unwrap();
-    c.raw().set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
+    c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
     // Without detection this call would receive the stray frame as its own
     // reply and decode an empty body as a values list.
-    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Closed), "{err}");
     drop(hold);
     server.await.unwrap();
@@ -244,16 +226,16 @@ async fn connect_without_token() {
     let c = Client::connect_with_token(server.local_addr(), None)
         .await
         .unwrap();
-    c.raw().set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
+    c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
 }
 
 #[tokio::test]
 async fn invalid_status_byte_closes_connection() {
     let (addr, fake) = scripted(oxicache_wire::encode_header(9, 0).to_vec()).await;
     let c = Client::connect(addr).await.unwrap();
-    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::InvalidStatus(9)), "{err}");
-    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Closed), "{err}");
     fake.finish().await;
 }
@@ -263,7 +245,7 @@ async fn oversized_response_is_reported() {
     let too_big = oxicache_wire::MAX_FRAME + 1;
     let (addr, fake) = scripted(oxicache_wire::encode_header(0, too_big).to_vec()).await;
     let c = Client::connect(addr).await.unwrap();
-    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(
         matches!(err, Error::ResponseTooLarge(n) if n == too_big),
         "{err}"
@@ -277,12 +259,12 @@ async fn malformed_bodies_are_decode_errors() {
     bad.extend_from_slice(&[9, 0]);
     let (addr, fake) = scripted(bad.clone()).await;
     let c = Client::connect(addr).await.unwrap();
-    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Decode(_)), "{err}");
     fake.finish().await;
     let (addr, fake) = scripted(bad).await;
     let c = Client::connect(addr).await.unwrap();
-    let err = c.raw().del_multi([&b"a"[..]]).await.unwrap_err();
+    let err = c.del_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Decode(_)), "{err}");
     fake.finish().await;
 }
@@ -301,18 +283,12 @@ async fn write_failure_closes_connection() {
     });
     let c = Client::connect(addr).await.unwrap();
     let big = vec![0u8; 32 << 20];
-    let err = c
-        .raw()
-        .set_multi([(&b"a"[..], &big[..])])
-        .await
-        .unwrap_err();
+    let err = c.set_multi([(&b"a"[..], &big[..])]).await.unwrap_err();
     assert!(matches!(err, Error::Closed | Error::Io(_)), "{err}");
-    let err = c.raw().get_multi([&b"a"[..]]).await.unwrap_err();
+    let err = c.get_multi([&b"a"[..]]).await.unwrap_err();
     assert!(matches!(err, Error::Closed), "{err}");
 }
 
-/// Without `serde` the client's own methods are the byte API.
-#[cfg(not(feature = "serde"))]
 #[tokio::test]
 async fn byte_api_single_and_multi() {
     let (_server, c) = start().await;

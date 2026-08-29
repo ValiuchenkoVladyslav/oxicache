@@ -1,6 +1,7 @@
 //! TCP client for oxicache. One [`Client`] owns one connection and is cheap
 //! to clone; calls from any number of tasks are pipelined onto it and matched
-//! to responses in order.
+//! to responses in order. Keys and values are bytes; with the `serde`
+//! feature, [`Client::typed`] pairs the client with any serde data format.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -26,16 +27,21 @@ pub enum Error {
     Decode(#[from] wire::DecodeError),
     #[error("response of {0} bytes exceeds the client limit of {MAX_FRAME}")]
     ResponseTooLarge(usize),
+    /// The [`Format`](typed::Format) failed to encode a key or value.
     #[cfg(feature = "serde")]
     #[error("serialize: {0}")]
-    Serialize(#[from] rmp_serde::encode::Error),
+    Serialize(#[source] BoxError),
+    /// The [`Format`](typed::Format) failed to decode a value.
     #[cfg(feature = "serde")]
     #[error("deserialize: {0}")]
-    Deserialize(#[from] rmp_serde::decode::Error),
+    Deserialize(#[source] BoxError),
     #[cfg(feature = "serde")]
     #[error("server answered {got} values for {expected} keys")]
     Count { expected: usize, got: usize },
 }
+
+/// Error type a [`Format`](typed::Format) reports with.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -103,74 +109,16 @@ impl Client {
         rx.await.map_err(|_| Error::Closed)?
     }
 
-    /// The byte-level API: keys and values as raw bytes, whatever features
-    /// are enabled. Without the `serde` feature `Client`'s own `get`/`set`/
-    /// `del` are the same thing.
-    pub fn raw(&self) -> Raw<'_> {
-        Raw(self)
-    }
-}
-
-/// Byte-level view of a [`Client`]; see [`Client::raw`].
-#[derive(Clone, Copy)]
-pub struct Raw<'a>(&'a Client);
-
-impl Raw<'_> {
-    /// Fetch one key.
-    pub async fn get(self, key: &[u8]) -> Result<Option<Bytes>> {
-        Ok(self.get_multi([key]).await?.pop().flatten())
+    /// Wrap this client (a cheap clone) in a [`Typed`](typed::Typed) view
+    /// whose keys and values go through `format`.
+    #[cfg(feature = "serde")]
+    pub fn typed<F: typed::Format>(&self, format: F) -> typed::Typed<F> {
+        typed::Typed::new(self.clone(), format)
     }
 
-    /// Fetch many keys; the result has one slot per key in request order.
-    pub async fn get_multi<'a, I>(self, keys: I) -> Result<Vec<Option<Bytes>>>
-    where
-        I: IntoIterator<Item = &'a [u8]>,
-        I::IntoIter: ExactSizeIterator + Clone,
-    {
-        Ok(wire::decode_values(
-            self.0.call(Op::Get, wire::encode_keys(keys)).await?,
-        )?)
-    }
-
-    /// Store one key/value pair.
-    pub async fn set(self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.set_multi([(key, value)]).await
-    }
-
-    /// Store many key/value pairs.
-    pub async fn set_multi<'a, I>(self, entries: I) -> Result<()>
-    where
-        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
-        I::IntoIter: ExactSizeIterator + Clone,
-    {
-        self.0.call(Op::Set, wire::encode_entries(entries)).await?;
-        Ok(())
-    }
-
-    /// Delete one key; returns whether it existed.
-    pub async fn del(self, key: &[u8]) -> Result<bool> {
-        Ok(self.del_multi([key]).await?.pop().unwrap_or(false))
-    }
-
-    /// Delete many keys; returns whether each one existed.
-    pub async fn del_multi<'a, I>(self, keys: I) -> Result<Vec<bool>>
-    where
-        I: IntoIterator<Item = &'a [u8]>,
-        I::IntoIter: ExactSizeIterator + Clone,
-    {
-        Ok(wire::decode_flags(
-            self.0.call(Op::Del, wire::encode_keys(keys)).await?,
-        )?)
-    }
-}
-
-/// Byte-level `get`/`set`/`del` on the client itself; with the `serde`
-/// feature these names take any serializable type instead (see [`typed`]).
-#[cfg(not(feature = "serde"))]
-impl Client {
     /// Fetch one key.
     pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>> {
-        self.raw().get(key.as_ref()).await
+        Ok(self.get_multi([key.as_ref()]).await?.pop().flatten())
     }
 
     /// Fetch many keys; the result has one slot per key in request order.
@@ -179,12 +127,14 @@ impl Client {
         I: IntoIterator<Item = &'a [u8]>,
         I::IntoIter: ExactSizeIterator + Clone,
     {
-        self.raw().get_multi(keys).await
+        Ok(wire::decode_values(
+            self.call(Op::Get, wire::encode_keys(keys)).await?,
+        )?)
     }
 
     /// Store one key/value pair.
     pub async fn set(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
-        self.raw().set(key.as_ref(), value.as_ref()).await
+        self.set_multi([(key.as_ref(), value.as_ref())]).await
     }
 
     /// Store many key/value pairs.
@@ -193,12 +143,13 @@ impl Client {
         I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
         I::IntoIter: ExactSizeIterator + Clone,
     {
-        self.raw().set_multi(entries).await
+        self.call(Op::Set, wire::encode_entries(entries)).await?;
+        Ok(())
     }
 
     /// Delete one key; returns whether it existed.
     pub async fn del(&self, key: impl AsRef<[u8]>) -> Result<bool> {
-        self.raw().del(key.as_ref()).await
+        Ok(self.del_multi([key.as_ref()]).await?.pop().unwrap_or(false))
     }
 
     /// Delete many keys; returns whether each one existed.
@@ -207,14 +158,16 @@ impl Client {
         I: IntoIterator<Item = &'a [u8]>,
         I::IntoIter: ExactSizeIterator + Clone,
     {
-        self.raw().del_multi(keys).await
+        Ok(wire::decode_flags(
+            self.call(Op::Del, wire::encode_keys(keys)).await?,
+        )?)
     }
 }
 
 #[cfg(feature = "serde")]
 pub mod typed;
 #[cfg(feature = "serde")]
-pub use typed::{Keys, ValuesFor};
+pub use typed::{Format, Keys, Typed, ValuesFor};
 
 /// Writes queued requests, coalescing everything already queued into one flush.
 async fn write_loop<W: AsyncWrite + Unpin>(

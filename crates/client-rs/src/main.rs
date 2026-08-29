@@ -78,10 +78,7 @@ async fn main() -> Result<()> {
     match args.cmd {
         Cmd::Get { keys } => {
             let client = Client::connect_with_token(args.addr, token).await?;
-            let vals = client
-                .raw()
-                .get_multi(keys.iter().map(String::as_bytes))
-                .await?;
+            let vals = client.get_multi(keys.iter().map(String::as_bytes)).await?;
             for (k, v) in keys.iter().zip(vals) {
                 match v {
                     Some(v) => println!("{k}: {}", String::from_utf8_lossy(&v)),
@@ -98,15 +95,12 @@ async fn main() -> Result<()> {
                 .chunks(2)
                 .map(|c| (c[0].as_bytes(), c[1].as_bytes()))
                 .collect();
-            client.raw().set_multi(pairs.iter().copied()).await?;
+            client.set_multi(pairs.iter().copied()).await?;
             println!("OK ({} entries)", pairs.len());
         }
         Cmd::Del { keys } => {
             let client = Client::connect_with_token(args.addr, token).await?;
-            let flags = client
-                .raw()
-                .del_multi(keys.iter().map(String::as_bytes))
-                .await?;
+            let flags = client.del_multi(keys.iter().map(String::as_bytes)).await?;
             for (k, f) in keys.iter().zip(flags) {
                 println!("{k}: {}", if f { "deleted" } else { "(nil)" });
             }
@@ -198,9 +192,9 @@ async fn bench(
                     if (next() % 10_000) as f64 / 10_000.0 < write_ratio {
                         let pairs: Vec<(&[u8], &[u8])> =
                             ks.iter().map(|k| (*k, value.as_slice())).collect();
-                        client.raw().set_multi(pairs.iter().copied()).await?;
+                        client.set_multi(pairs.iter().copied()).await?;
                     } else {
-                        let r = client.raw().get_multi(ks.iter().copied()).await?;
+                        let r = client.get_multi(ks.iter().copied()).await?;
                         hits.fetch_add(r.iter().flatten().count() as u64, Relaxed);
                     }
                     ops.fetch_add(batch as u64, Relaxed);
