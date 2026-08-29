@@ -3,13 +3,14 @@
 In-memory cache server in Rust: [S3-FIFO](https://blog.jasony.me/system/cache/2023/08/01/s3fifo)
 eviction, length-prefixed frames over plain TCP, tokio multi-threaded runtime. No persistence.
 
-## Crates
+## Layout
 
-| crate | role |
+| path | role |
 |---|---|
-| `oxicache-wire` | binary request/response framing shared by both sides |
-| `oxicache-server` | `oxicache-server` binary: sharded S3-FIFO engine + TCP front end |
-| `oxicache-client` | `Client` library + `oxicache-cli` (get/set/del/bench) |
+| `crates/wire` (`oxicache-wire`) | binary request/response framing shared by both sides |
+| `crates/server` (`oxicache-server`) | `oxicache-server` binary: sharded S3-FIFO engine + TCP front end |
+| `crates/client-rs` (`oxicache-client`) | Rust `Client` library + `oxicache-cli` (get/set/del/bench) |
+| `packages/client-ts` (`@oxicache/client`) | TypeScript `Client` library for the Bun runtime |
 
 ## Protocol
 
@@ -49,6 +50,36 @@ cargo run --release -p oxicache-client -- get a b c
 cargo run --release -p oxicache-client -- del a
 cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 16
 ```
+
+## TypeScript client (Bun)
+
+`packages/client-ts` is a dependency-free library on `Bun.connect`: the same framing,
+pipelining and in-order response matching as the Rust client, in ~300 lines of TypeScript.
+Keys and values are `string` (UTF-8) or `Uint8Array`; values come back as `Uint8Array`.
+
+```ts
+import { Client } from "@oxicache/client";
+
+const c = await Client.connect({ hostname: "127.0.0.1", port: 4433, token: "s3cret" });
+await c.set([["a", "1"], ["b", new Uint8Array([0, 1, 2])]]);
+const [a, b, missing] = await c.get(["a", "b", "c"]);   // Uint8Array | null each
+const [existed] = await c.del(["a"]);                   // boolean each
+c.close();
+```
+
+Calls issued in the same tick are coalesced into one write; a non-OK status rejects with
+`StatusError` (`.status` is the `Status` enum), a dropped connection with `ClosedError`.
+
+## Development
+
+```sh
+bun install            # installs the husky pre-commit hook
+bun test               # client-ts unit + e2e tests (builds and spawns the debug server)
+cargo test --workspace # wire, server and client-rs unit + e2e tests
+```
+
+The pre-commit hook (`.husky/pre-commit`) runs `cargo fmt --check`, `clippy -D warnings`,
+`cargo build`, `cargo test`, then the TypeScript type check, `bun build` and `bun test`.
 
 ## Design
 

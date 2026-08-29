@@ -1,0 +1,81 @@
+import type { Subprocess } from "bun";
+import { resolve } from "node:path";
+
+const root = resolve(import.meta.dir, "../../..");
+const bin = resolve(root, "target/debug/oxicache-server");
+
+let built: Promise<void> | undefined;
+
+/** Build the server once per test process. */
+function build(): Promise<void> {
+  return (built ??= (async () => {
+    const p = Bun.spawn(["cargo", "build", "-p", "oxicache-server"], {
+      cwd: root,
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    if ((await p.exited) !== 0) throw new Error("cargo build failed");
+  })());
+}
+
+/** A loopback port that was free a moment ago. */
+function freePort(): number {
+  const l = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const port = l.port;
+  l.stop(true);
+  return port;
+}
+
+/** Resolves once something accepts on `port`, rejects after `timeoutMs`. */
+async function waitForListen(port: number, alive: () => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!alive()) throw new Error("server exited before listening");
+    const ok = await new Promise<boolean>((resolve) => {
+      Bun.connect({
+        hostname: "127.0.0.1",
+        port,
+        socket: {
+          open(s) {
+            s.end();
+            resolve(true);
+          },
+          data() {},
+          error() {
+            resolve(false);
+          },
+          connectError() {
+            resolve(false);
+          },
+        },
+      }).catch(() => resolve(false));
+    });
+    if (ok) return;
+    await Bun.sleep(20);
+  }
+  throw new Error(`server did not listen on ${port} within ${timeoutMs} ms`);
+}
+
+export interface TestServer {
+  port: number;
+  proc: Subprocess;
+  stop(): void;
+}
+
+/** Start a server on a random loopback port and wait until it is listening. */
+export async function startServer(args: string[] = []): Promise<TestServer> {
+  await build();
+  const port = freePort();
+  const proc = Bun.spawn(
+    [bin, "--addr", `127.0.0.1:${port}`, "--capacity", "64M", "--shards", "2", ...args],
+    { cwd: root, stdout: "ignore", stderr: "ignore" },
+  );
+  const stop = () => proc.kill();
+  try {
+    await waitForListen(port, () => proc.exitCode === null);
+  } catch (e) {
+    stop();
+    throw e;
+  }
+  return { port, proc, stop };
+}

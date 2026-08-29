@@ -1,0 +1,18 @@
+{
+  "name": "oxicache",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "prepare": "husky",
+    "check": "bun run --cwd packages/client-ts check",
+    "build": "bun run --cwd packages/client-ts build",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "husky": "^9.1.7",
+    "typescript": "^7.0.2"
+  }
+}

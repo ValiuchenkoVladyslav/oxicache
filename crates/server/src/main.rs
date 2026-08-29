@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
     let auth = token.is_some();
     let opts = Options { token };
     let server = Arc::new(Server::bind_with(args.addr, cache, opts)?);
-    info!(capacity = args.capacity, shards, auth, "cache ready");
+    info!(addr = %server.local_addr(), capacity = args.capacity, shards, auth, "cache ready");
 
     server
         .run_until(async {
