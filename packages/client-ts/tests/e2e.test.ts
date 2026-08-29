@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Client, ClosedError, Status, StatusError } from "../src/index";
+import { must } from "./must";
 import { startServer, type TestServer } from "./server";
 
 interface User {
@@ -44,8 +45,8 @@ describe("client-ts e2e", () => {
       "s",
       "nope",
     );
-    expect(n! + 1).toBe(6);
-    expect(str!.toUpperCase()).toBe("FIVE");
+    expect(must(n) + 1).toBe(6);
+    expect(must(str).toUpperCase()).toBe("FIVE");
     expect(none).toBeNull();
     c.close();
   });
@@ -74,14 +75,13 @@ describe("client-ts e2e", () => {
       avatar: new Uint8Array([1, 2, 3]),
     };
     await c.set("user:7", u);
-    const got = await c.get<User>("user:7");
-    expect(got).not.toBeNull();
-    expect(got!.id).toBe(7);
-    expect(got!.name).toBe("alice");
-    expect(got!.tags).toEqual(["x", "y"]);
-    expect(got!.joined).toBeInstanceOf(Date);
-    expect(got!.joined.getTime()).toBe(u.joined.getTime());
-    expect([...got!.avatar]).toEqual([1, 2, 3]);
+    const got = must(await c.get<User>("user:7"));
+    expect(got.id).toBe(7);
+    expect(got.name).toBe("alice");
+    expect(got.tags).toEqual(["x", "y"]);
+    expect(got.joined).toBeInstanceOf(Date);
+    expect(got.joined.getTime()).toBe(u.joined.getTime());
+    expect([...got.avatar]).toEqual([1, 2, 3]);
     c.close();
   });
 
@@ -96,7 +96,7 @@ describe("client-ts e2e", () => {
       await c.set(["r1", shape], ["r2", { ...shape, id: 2 }]);
       const [a, b] = await c.get<[typeof shape, typeof shape]>("r1", "r2");
       expect(a).toEqual(shape);
-      expect(b!.id).toBe(2);
+      expect(must(b).id).toBe(2);
       // A fresh client with the same setting reads it back too.
       const c2 = await Client.connect({
         port: server.port,
@@ -179,9 +179,9 @@ describe("client-ts e2e", () => {
     const big = new Uint8Array(4 << 20).fill(7);
     big[big.length - 1] = 9;
     await c.set("big", big);
-    const got = await c.get<Uint8Array>("big");
-    expect(got!.length).toBe(big.length);
-    expect(Buffer.from(got!).equals(Buffer.from(big))).toBe(true);
+    const got = must(await c.get<Uint8Array>("big"));
+    expect(got.length).toBe(big.length);
+    expect(Buffer.from(got).equals(Buffer.from(big))).toBe(true);
     const text = "y".repeat(1 << 20);
     await c.set("text", text);
     expect(await c.get<string>("text")).toBe(text);

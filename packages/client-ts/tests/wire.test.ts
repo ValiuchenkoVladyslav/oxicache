@@ -11,6 +11,7 @@ import {
   MAX_ITEMS,
   Op,
 } from "../src/wire";
+import { must } from "./must";
 
 const INVALID_TAG = /invalid tag byte 7/;
 const NEEDED_100 = /needed 100/;
@@ -87,9 +88,9 @@ describe("decode", () => {
     ]);
     const v = decodeValues(body);
     expect(v.length).toBe(3);
-    expect([...v[0]!]).toEqual([0x78]);
+    expect([...must(v[0])]).toEqual([0x78]);
     expect(v[1]).toBeNull();
-    expect(v[2]!.length).toBe(0);
+    expect(must(v[2]).length).toBe(0);
   });
 
   test("flags", () => {
@@ -131,7 +132,7 @@ describe("FrameReader", () => {
   test("body outlives later pushes", () => {
     const r = new FrameReader();
     r.push(new Uint8Array([0, ...le32(1), 42]));
-    const f = r.next()!;
+    const f = must(r.next());
     r.push(new Uint8Array([0, ...le32(1), 43]));
     r.next();
     expect([...f.body]).toEqual([42]);
@@ -144,7 +145,7 @@ describe("FrameReader", () => {
     expect(r.next()).toBeNull();
     for (let off = 0; off < big.length; off += 100_000)
       r.push(big.subarray(off, off + 100_000));
-    const f = r.next()!;
+    const f = must(r.next());
     expect(f.body.length).toBe(big.length);
     expect(f.body[big.length - 1]).toBe(5);
   });

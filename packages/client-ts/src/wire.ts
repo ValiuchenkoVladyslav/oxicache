@@ -87,6 +87,7 @@ class Reader {
   }
   u8(): number {
     this.need(1);
+    // biome-ignore lint/style/noNonNullAssertion: need(1) just checked pos < end
     return this.buf[this.pos++]!;
   }
   u32(): number {
@@ -229,11 +230,13 @@ export class FrameReader {
     if (avail < HEADER_LEN) return null;
     const b = this.buf;
     const s = this.start;
+    // biome-ignore-start lint/style/noNonNullAssertion: avail >= HEADER_LEN, so s..s+4 are within the buffer
     const len =
       b[s + 1]! |
       (b[s + 2]! << 8) |
       (b[s + 3]! << 16) |
       ((b[s + 4]! << 24) >>> 0);
+    // biome-ignore-end lint/style/noNonNullAssertion: end of the header read
     if (len > this.maxFrame) {
       throw new DecodeError(
         `response of ${len} bytes exceeds the client limit of ${this.maxFrame}`,
@@ -243,6 +246,7 @@ export class FrameReader {
     const body = b.slice(s + HEADER_LEN, s + HEADER_LEN + len);
     this.start = s + HEADER_LEN + len;
     if (this.start === this.end) this.start = this.end = 0;
+    // biome-ignore lint/style/noNonNullAssertion: same bound as above
     return { tag: b[s]!, body };
   }
 }

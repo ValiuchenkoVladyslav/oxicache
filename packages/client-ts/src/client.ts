@@ -547,6 +547,7 @@ export class Client {
     if (this.outbox.length === 0) return;
     let data: Uint8Array;
     if (this.outbox.length === 1) {
+      // biome-ignore lint/style/noNonNullAssertion: length === 1 was just checked
       data = this.outbox[0]!;
     } else {
       data = new Uint8Array(this.outboxBytes);
