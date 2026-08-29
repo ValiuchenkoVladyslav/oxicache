@@ -85,7 +85,7 @@ await c.set(["a", 1], ["b", ["x", null]]);                             // severa
 await c.set(entries);                                                  // Entry[] of any length
 
 const u = await c.get<User>("user:7");          // User | null
-const [a, z] = await c.get<number>("a", "z");   // [number | null, number | null]
+const [u7, n] = await c.get<[User, number]>("user:7", "n"); // one type per key, length checked
 const vs = await c.get<number>(someKeys);       // (number | null)[] for a runtime-length array
 const d = await c.del("a");                     // boolean
 const ds = await c.del("a", "b");               // [boolean, boolean]
@@ -95,7 +95,8 @@ c.close();
 One key in, one result out; several keys in, a tuple of that length out (up to 16 literal
 keys); an array in, an array out for lengths only known at runtime — all enforced by
 overloads, so `...spread` of a plain array is a compile error (pass the array). The return
-type parameter says what a stored value decodes to and is not checked at runtime. Calls
+type parameter says what stored values decode to and is not checked at runtime; with several
+keys it is a tuple with exactly one type per key. Calls
 issued in the same tick are coalesced into one write; a non-OK status rejects with
 `StatusError` (`.status` is the `Status` enum), a dropped connection with `ClosedError`.
 

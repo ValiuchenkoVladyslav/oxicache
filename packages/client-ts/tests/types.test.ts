@@ -4,7 +4,7 @@
  * includes this directory), which fails if any of them stops erroring.
  */
 import { expect, test } from "bun:test";
-import type { Client, Value } from "../src/index";
+import type { Client, Fill, Value } from "../src/index";
 
 type Equal<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
 const assertType = <_T extends true>(): void => {};
@@ -32,15 +32,37 @@ async function _shapes() {
   // One key: one value. Several keys: a tuple of that length. Array: a list.
   const one = await c.get<User>("k");
   assertType<Equal<typeof one, User | null>>();
-  const two = await c.get<User>("a", new Uint8Array(1));
+  const two = await c.get<[User, User]>("a", new Uint8Array(1));
   assertType<Equal<typeof two, [User | null, User | null]>>();
+  const dflt2 = await c.get("a", "b");
+  assertType<Equal<typeof dflt2, [Value | null, Value | null]>>();
   const [x, y] = two;
   assertType<Equal<typeof x, User | null>>();
   assertType<Equal<typeof y, User | null>>();
-  const three = await c.get<number>("a", "b", "c");
-  assertType<Equal<typeof three, [number | null, number | null, number | null]>>();
-  const sixteen = await c.get<number>("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16");
+  // Per-key types as a tuple, length enforced.
+  const mixed = await c.get<[User, number]>("a", "b");
+  assertType<Equal<typeof mixed, [User | null, number | null]>>();
+  const [mu, mn] = mixed;
+  assertType<Equal<typeof mu, User | null>>();
+  assertType<Equal<typeof mn, number | null>>();
+  const mixed3 = await c.get<[string, User[], Uint8Array]>("a", "b", "c");
+  assertType<Equal<typeof mixed3, [string | null, User[] | null, Uint8Array | null]>>();
+  const dm = await c.get<[User, number]>(...(["a", "b"] as const));
+  assertType<Equal<typeof dm, [User | null, number | null]>>();
+  // @ts-expect-error too few types for two keys
+  await c.get<[User]>("a", "b");
+  // @ts-expect-error too many types for two keys
+  await c.get<[User, number, string]>("a", "b");
+  // @ts-expect-error a plain array type is not a per-key tuple
+  await c.get<User[]>("a", "b");
+  // No single-type shorthand for several keys: the tuple is mandatory.
+  // @ts-expect-error one type for two keys
+  await c.get<User>("a", "b");
+  // @ts-expect-error one primitive type for two keys
+  await c.get<string>("a", "b");
+  const sixteen = await c.get<Fill<16, number>>("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16");
   assertType<Equal<typeof sixteen["length"], 16>>();
+  assertType<Equal<typeof sixteen[0], number | null>>();
   const dyn: string[] = ["a", "b"];
   const fromArray = await c.get<User>(dyn);
   assertType<Equal<typeof fromArray, (User | null)[]>>();
@@ -55,12 +77,12 @@ async function _shapes() {
   const dArr = await c.del(dyn);
   assertType<Equal<typeof dArr, boolean[]>>();
   // @ts-expect-error several keys in must not be assignable to single out
-  const wrong: User | null = await c.get<User>("k", "j");
+  const wrong: User | null = await c.get<[User, User]>("k", "j");
   void wrong;
   // @ts-expect-error a spread of unknown length must use the array form
-  await c.get<User>(...dyn);
+  await c.get<[User, User]>(...dyn);
   // @ts-expect-error more than 16 literal keys must use the array form
-  await c.get<number>("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17");
+  await c.get<Fill<17, number>>("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17");
 
   // Accepted values: literals, interfaces, classes, primitives, mixed batches.
   await c.set("u", user);

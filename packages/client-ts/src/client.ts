@@ -53,6 +53,12 @@ export type Fill<N extends number, R, A extends R[] = []> = A["length"] extends 
   ? A
   : Fill<N, R, [...A, R]>;
 
+/** The type argument of an `N`-key `get`: a tuple of exactly `N` value types, one per key. */
+export type Types<N extends number> = Fill<N, unknown>;
+
+/** Result tuple of an `N`-key `get`: each key's type, or `null` when absent. */
+export type Results<T extends readonly unknown[]> = { -readonly [I in keyof T]: T[I] | null };
+
 /** Normalise `(key)`, `(k1, k2, …)` and `(keys[])` into a key list plus whether the result is a list. */
 function keyArgs(args: Bin[] | [readonly Bin[]]): [readonly Bin[], boolean] {
   const first = args[0];
@@ -120,25 +126,28 @@ export class Client {
    * Fetch one key or many. One key in, one value out; several keys in, a
    * tuple of values out, one per key in argument order (up to 16 literal
    * keys); an array in, an array out, for lists whose length is only known
-   * at runtime. `null` marks an absent key. `T` is what a stored value
-   * decodes to; it is not checked at runtime.
+   * at runtime. `null` marks an absent key.
+   *
+   * `T` is what the stored values decode to and is not checked at runtime.
+   * With several keys it is a tuple with exactly one type per key:
+   * `get<[User, number]>(a, b)`.
    */
   get<T = Value>(key: Bin): Promise<T | null>;
-  get<T = Value>(k1: Bin, k2: Bin): Promise<Fill<2, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin): Promise<Fill<3, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin): Promise<Fill<4, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin): Promise<Fill<5, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin): Promise<Fill<6, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin): Promise<Fill<7, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin): Promise<Fill<8, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin): Promise<Fill<9, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin): Promise<Fill<10, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin): Promise<Fill<11, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin): Promise<Fill<12, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin): Promise<Fill<13, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin): Promise<Fill<14, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin, k15: Bin): Promise<Fill<15, T | null>>;
-  get<T = Value>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin, k15: Bin, k16: Bin): Promise<Fill<16, T | null>>;
+  get<T extends Types<2> = Fill<2, Value>>(k1: Bin, k2: Bin): Promise<Results<T>>;
+  get<T extends Types<3> = Fill<3, Value>>(k1: Bin, k2: Bin, k3: Bin): Promise<Results<T>>;
+  get<T extends Types<4> = Fill<4, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin): Promise<Results<T>>;
+  get<T extends Types<5> = Fill<5, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin): Promise<Results<T>>;
+  get<T extends Types<6> = Fill<6, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin): Promise<Results<T>>;
+  get<T extends Types<7> = Fill<7, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin): Promise<Results<T>>;
+  get<T extends Types<8> = Fill<8, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin): Promise<Results<T>>;
+  get<T extends Types<9> = Fill<9, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin): Promise<Results<T>>;
+  get<T extends Types<10> = Fill<10, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin): Promise<Results<T>>;
+  get<T extends Types<11> = Fill<11, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin): Promise<Results<T>>;
+  get<T extends Types<12> = Fill<12, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin): Promise<Results<T>>;
+  get<T extends Types<13> = Fill<13, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin): Promise<Results<T>>;
+  get<T extends Types<14> = Fill<14, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin): Promise<Results<T>>;
+  get<T extends Types<15> = Fill<15, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin, k15: Bin): Promise<Results<T>>;
+  get<T extends Types<16> = Fill<16, Value>>(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin, k6: Bin, k7: Bin, k8: Bin, k9: Bin, k10: Bin, k11: Bin, k12: Bin, k13: Bin, k14: Bin, k15: Bin, k16: Bin): Promise<Results<T>>;
   get<T = Value>(keys: readonly Bin[]): Promise<(T | null)[]>;
   async get<T = Value>(...args: Bin[] | [readonly Bin[]]): Promise<(T | null) | (T | null)[]> {
     const [keys, many] = keyArgs(args);

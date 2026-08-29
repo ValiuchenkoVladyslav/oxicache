@@ -38,6 +38,11 @@ describe("client-ts e2e", () => {
     expect(missing).toBeNull();
     expect(await c.del("a", "zz")).toEqual([true, false]);
     expect(await c.get("a", "b")).toEqual([null, [0, 1, 2]]);
+    await c.set(["n", 5], ["s", "five"]);
+    const [n, str, none] = await c.get<[number, string, User]>("n", "s", "nope");
+    expect(n! + 1).toBe(6);
+    expect(str!.toUpperCase()).toBe("FIVE");
+    expect(none).toBeNull();
     c.close();
   });
 
