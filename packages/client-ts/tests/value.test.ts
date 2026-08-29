@@ -1,11 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { Codec } from "../src/value";
+import { decode } from "@msgpack/msgpack";
+import { BIGINT_EXT, decodeValue, encodeValue } from "../src/value";
 
-const records = new Codec();
-const plain = new Codec({ useRecords: false });
-const encodeValue = (v: unknown) => plain.encode(v);
-const decodeValue = <T>(b: Uint8Array): T => plain.decode<T>(b);
-const rt = <T>(v: T): T => records.decode<T>(records.encode(v));
+const rt = <T>(v: T): T => decodeValue<T>(encodeValue(v));
 
 describe("value codec", () => {
   test("primitives round-trip", () => {
@@ -69,31 +66,22 @@ describe("value codec", () => {
     expect(rt(new P(1, 2))).toEqual({ x: 1, y: 2 });
   });
 
-  test("records are on by default and self-describing", () => {
-    const shape = { id: 1, name: "a" };
-    const first = records.encode(shape);
-    const second = records.encode({ id: 2, name: "b" });
-    // Repeated shapes inside one value share a structure definition.
-    const many = Array.from({ length: 20 }, (_, id) => ({ id, name: "n" }));
-    expect(records.encode(many).length).toBeLessThan(plain.encode(many).length);
-    // Each value decodes on a fresh codec, and the plain encoding differs.
-    expect(new Codec().decode<typeof shape>(first)).toEqual(shape);
-    expect(new Codec().decode<typeof shape>(second)).toEqual({
-      id: 2,
-      name: "b",
-    });
-    expect([...plain.encode(shape)]).not.toEqual([...first]);
-    // The record extension is not plain msgpack: a records codec reads both,
-    // a plain codec only its own.
-    expect(records.decode<typeof shape>(plain.encode(shape))).toEqual(shape);
-    expect(plain.decode<typeof shape>(plain.encode(shape))).toEqual(shape);
+  test("bigints travel as a decimal-string extension of any size", () => {
+    const huge = 2n ** 200n + 7n;
+    expect(rt(huge)).toBe(huge);
+    expect(rt(-huge)).toBe(-huge);
+    const raw = encodeValue(5n);
+    expect(raw[0]).toBe(0xd4); // fixext 1
+    expect(raw[1]).toBe(BIGINT_EXT);
+    expect(raw[2]).toBe(0x35); // "5"
+    // Plain numbers keep msgpack's own integer formats, so a decoder
+    // without the extension reads them as numbers, never as bigints.
+    expect(decode(encodeValue(2 ** 40))).toBe(2 ** 40);
+    expect(rt(2 ** 40)).toBe(2 ** 40);
   });
 
-  test("useRecords: false emits standard msgpack", () => {
-    // msgpackr emits map16 for objects; still plain msgpack.
-    expect([...encodeValue({ a: 1 })]).toEqual([
-      0xde, 0x00, 0x01, 0xa1, 0x61, 0x01,
-    ]);
+  test("emits standard msgpack", () => {
+    expect([...encodeValue({ a: 1 })]).toEqual([0x81, 0xa1, 0x61, 0x01]);
     expect([...encodeValue([1, "b", null])]).toEqual([
       0x93, 0x01, 0xa1, 0x62, 0xc0,
     ]);

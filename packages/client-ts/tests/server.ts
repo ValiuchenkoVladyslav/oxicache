@@ -70,19 +70,25 @@ async function waitForListen(
 
 export interface TestServer {
   port: number;
+  httpPort: number;
+  /** Base URL of the HTTP listener. */
+  url: string;
   proc: Subprocess;
   stop(): void;
 }
 
-/** Start a server on a random loopback port and wait until it is listening. */
+/** Start a server on random loopback ports (TCP and HTTP) and wait until it is listening. */
 export async function startServer(args: string[] = []): Promise<TestServer> {
   await build();
   const port = freePort();
+  const httpPort = freePort();
   const proc = Bun.spawn(
     [
       bin,
       "--addr",
       `127.0.0.1:${port}`,
+      "--http-addr",
+      `127.0.0.1:${httpPort}`,
       "--capacity",
       "64M",
       "--shards",
@@ -98,5 +104,5 @@ export async function startServer(args: string[] = []): Promise<TestServer> {
     stop();
     throw e;
   }
-  return { port, proc, stop };
+  return { port, httpPort, url: `http://127.0.0.1:${httpPort}`, proc, stop };
 }

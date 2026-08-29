@@ -1,19 +1,26 @@
 export {
   Client,
-  ClosedError,
-  type ConnectOptions,
   type Entries,
   type Entry,
   type Fill,
   type Results,
-  StatusError,
   type Types,
-} from "./client";
+} from "./client.js";
+export { ClosedError, StatusError, type Transport } from "./transport.js";
 export {
-  Codec,
-  type CodecOptions,
+  BIGINT_EXT,
+  decodeValue,
   type Encodable,
+  encodeValue,
   type Primitive,
   type Value,
-} from "./value";
-export { type Bin, DecodeError, MAX_FRAME, MAX_ITEMS, Status } from "./wire";
+} from "./value.js";
+export {
+  type Bin,
+  DecodeError,
+  HEADER_LEN,
+  MAX_FRAME,
+  MAX_ITEMS,
+  Op,
+  Status,
+} from "./wire.js";

@@ -1,16 +1,17 @@
 # oxicache
 
 In-memory cache server in Rust: [S3-FIFO](https://blog.jasony.me/system/cache/2023/08/01/s3fifo)
-eviction, length-prefixed frames over plain TCP, tokio multi-threaded runtime. No persistence.
+eviction, length-prefixed binary frames over plain TCP (and the same frames over HTTP/1.1 for
+runtimes without sockets), tokio multi-threaded runtime. No persistence.
 
 ## Layout
 
 | path | role |
 |---|---|
 | `crates/wire` (`oxicache-wire`) | binary request/response framing shared by both sides |
-| `crates/server` (`oxicache-server`) | `oxicache-server` binary: sharded S3-FIFO engine + TCP front end |
+| `crates/server` (`oxicache-server`) | `oxicache-server` binary: sharded S3-FIFO engine + TCP and HTTP front ends |
 | `crates/client-rs` (`oxicache-client`) | Rust `Client` library (bytes, or any serde type with the `serde` feature) + `oxicache-cli` |
-| `packages/client-ts` (`@oxicache/client`) | TypeScript `Client` library for the Bun runtime |
+| `packages/client-ts` (`@oxicache/client`) | TypeScript `Client` library: TCP transport for Bun, HTTP transport for anything with `fetch` |
 
 ## Protocol
 
@@ -36,14 +37,35 @@ The client library does this in `Client::connect_with_token`, the CLI via `--tok
 `OXICACHE_TOKEN` (the CLI also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
 tunnel.
 
+### HTTP
+
+With `--http-addr` (or `OXICACHE_HTTP_ADDR`) the server also listens for HTTP/1.1, carrying the
+same binary bodies — nothing is JSON. The op is the path, the request body is the frame body,
+the response body is the frame body, and the frame status becomes the HTTP status:
+
+```
+POST /get   body: keys      -> 200, body: values
+POST /set   body: entries   -> 200, empty
+POST /del   body: keys      -> 200, body: flags
+GET  /health                -> 204, no body; never needs a token
+400 bad request | 401 unauthorized | 404 unknown path | 405 wrong method | 413 too large
+```
+
+With a token, every request except `/health` carries `Authorization: Bearer <token>`; a refused
+request gets a 401 and its body is never read, so the connection closes. Both listeners serve one
+cache, so a value written over TCP is readable over HTTP. Keep-alive is on; there is no TLS and
+no CORS handling — put a reverse proxy in front for either.
+
 ## Run
 
 ```sh
-cargo run --release -p oxicache-server -- --addr 0.0.0.0:4433 --capacity 1G
+cargo run --release -p oxicache-server -- --addr 0.0.0.0:4433 --http-addr 0.0.0.0:4434 --capacity 1G
 # --shards N      independent S3-FIFO shards (default: CPUs)
 # --token T       require AUTH with this secret (or OXICACHE_TOKEN in the environment)
-# every server flag has an environment variable: OXICACHE_ADDR, OXICACHE_CAPACITY,
-# OXICACHE_SHARDS, OXICACHE_TOKEN; a flag wins over a differing variable, with a warning
+# --http-addr A   also serve the HTTP API on A (off unless given)
+# every server flag has an environment variable: OXICACHE_ADDR, OXICACHE_HTTP_ADDR,
+# OXICACHE_CAPACITY, OXICACHE_SHARDS, OXICACHE_TOKEN; a flag wins over a differing
+# variable, with a warning
 
 cargo run --release -p oxicache-client -- set a 1 b 2
 cargo run --release -p oxicache-client -- get a b c
@@ -75,19 +97,32 @@ A tuple of keys must be paired with a tuple of exactly as many value types (up t
 mismatch does not compile. Typed keys are MessagePack-encoded, so `"k"` stored through the
 typed API is a different key from `b"k"` stored through `client.raw()`.
 
-## TypeScript client (Bun)
+## TypeScript client
 
-`packages/client-ts` runs on `Bun.connect` with the same framing, pipelining and in-order
-response matching as the Rust client. Keys are `string` (UTF-8) or `Uint8Array`; values are
-any MessagePack-representable data (`null`, booleans, numbers, `bigint`, strings,
-`Uint8Array`, `Date`, arrays, plain objects, class instances), encoded with
-[msgpackr](docs/msgpack-bench.md) and checked at the type level — a value containing a
-function, `symbol`, `undefined`, `Map` or `Set` is a compile error.
+`packages/client-ts` is a `Client` over a pluggable `Transport`, each transport on its own
+subpath so a bundle only carries the one it imports (the package is `sideEffects: false`):
+
+- `@oxicache/client/transport/tcp` — `Bun.connect`, with the same framing, pipelining and
+  in-order response matching as the Rust client. Bun only.
+- `@oxicache/client/transport/http` — one `fetch` per call against the server's HTTP listener.
+  Runs wherever `fetch` does: Bun, Node 18+, edge runtimes, lambdas. Importing it, or the main
+  entry, never touches Bun's socket API.
+
+Keys are `string` (UTF-8) or `Uint8Array`; values are any MessagePack-representable data
+(`null`, booleans, numbers, `bigint`, strings, `Uint8Array`, `Date`, arrays, plain objects,
+class instances), encoded with [`@msgpack/msgpack`](docs/msgpack-bench.md) as plain
+MessagePack (`bigint` as extension type 0 holding its decimal string) and checked at the
+type level — a value containing a function, `symbol`, `undefined`, `Map` or `Set` is a compile
+error.
 
 ```ts
 import { Client } from "@oxicache/client";
+import { tcp } from "@oxicache/client/transport/tcp";
+import { http } from "@oxicache/client/transport/http";
 
-const c = await Client.connect({ hostname: "127.0.0.1", port: 4433, token: "s3cret" });
+const c = await Client.connect(tcp({ hostname: "127.0.0.1", port: 4433, token: "s3cret" }));
+// or, from an edge function:
+const c = await Client.connect(http({ url: "http://cache.internal:4434", token: "s3cret" }));
 
 await c.set("user:7", { id: 7, name: "alice", joined: new Date() });  // one
 await c.set(["a", 1], ["b", ["x", null]]);                             // several
@@ -101,23 +136,20 @@ const ds = await c.del("a", "b");               // [boolean, boolean]
 c.close();
 ```
 
-`Client.connect({ …, useRecords })` picks the encoding: msgpackr's record extension (default
-`true`; repeated object shapes inside a value share one structure definition) or plain
-MessagePack (`false`, readable by any decoder). Either client reads what the other wrote.
-
 One key in, one result out; several keys in, a tuple of that length out (up to 16 literal
 keys); an array in, an array out for lengths only known at runtime — all enforced by
 overloads, so `...spread` of a plain array is a compile error (pass the array). The return
 type parameter says what stored values decode to and is not checked at runtime; with several
-keys it is a tuple with exactly one type per key. Calls
-issued in the same tick are coalesced into one write; a non-OK status rejects with
-`StatusError` (`.status` is the `Status` enum), a dropped connection with `ClosedError`.
+keys it is a tuple with exactly one type per key. A non-OK status rejects with `StatusError`
+(`.status` is the `Status` enum), a closed transport with `ClosedError`. On TCP, calls issued in
+the same tick are coalesced into one write; on HTTP each call is its own request and a refused
+one does not end the transport. `http({ fetch })` takes a custom `fetch` for agents or tests.
 
 ## Development
 
 ```sh
 bun install            # installs the husky pre-commit hook
-bun test               # client-ts unit + e2e tests (builds and spawns the debug server)
+bun test               # client-ts unit + e2e tests over both transports (builds and spawns the debug server)
 cargo test --workspace --all-features # wire, server and client-rs unit + e2e tests
 ```
 
@@ -145,7 +177,9 @@ The pre-commit hook (`.husky/pre-commit`) runs `cargo fmt --check`, `clippy -D w
   the queue head, with compaction once dead bytes exceed 25 % of the shard budget.
 - One tokio task per TCP connection; requests are handled inline and answered in order,
   responses are flushed once no more input is buffered (one write per pipelined batch).
-  One listener; accepted connections are spread over the runtime's worker threads.
+  One listener; accepted connections are spread over the runtime's worker threads. The
+  HTTP front end (hyper, HTTP/1.1) is a second listener over the same dispatch, one request
+  per exchange; bodies are bounded to the frame limit before and while reading.
   Frames are capped at 64 MiB each way; there is no connection limit or idle timeout,
   so put the server on a private network.
 - 64-bit targets only: index slots pack a 48-bit entry address next to a 16-bit tag.

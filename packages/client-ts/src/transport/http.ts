@@ -1,0 +1,87 @@
+/**
+ * HTTP transport: one `fetch` per request, the frame body as the request
+ * body, the op as the path. Runs anywhere `fetch` does (Bun, Node 18+, edge
+ * runtimes, lambdas); nothing here touches Bun's socket API.
+ */
+import { ClosedError, StatusError, type Transport } from "../transport.js";
+import { HEADER_LEN, Op, Status } from "../wire.js";
+
+export interface HttpOptions {
+  /** Base URL of the server's HTTP listener, e.g. `http://127.0.0.1:4434`. */
+  url: string | URL;
+  /** Shared secret, sent as `Authorization: Bearer <token>` on every request. */
+  token?: string;
+  /** `fetch` to use instead of the global one (custom agents, tests). */
+  fetch?: Fetch;
+}
+
+/** The part of `fetch` the transport uses. */
+export type Fetch = (url: string, init: RequestInit) => Promise<Response>;
+
+const PATH: Readonly<Record<Op, string>> = {
+  [Op.Get]: "/get",
+  [Op.Set]: "/set",
+  [Op.Del]: "/del",
+  [Op.Auth]: "",
+};
+
+/** HTTP status codes the server uses for each frame status. */
+const STATUS: Readonly<Record<number, Status>> = {
+  400: Status.BadRequest,
+  401: Status.Unauthorized,
+  404: Status.UnknownOp,
+  405: Status.UnknownOp,
+  413: Status.TooLarge,
+};
+
+const utf8 = new TextDecoder();
+const TRAILING_SLASHES = /\/+$/;
+
+class HttpTransport implements Transport {
+  private readonly base: string;
+  private readonly headers: Record<string, string>;
+  private readonly fetch: Fetch;
+  private closed: ClosedError | null = null;
+
+  constructor(opts: HttpOptions) {
+    this.base = String(opts.url).replace(TRAILING_SLASHES, "");
+    this.headers = { "content-type": "application/octet-stream" };
+    if (opts.token !== undefined)
+      this.headers.authorization = `Bearer ${opts.token}`;
+    this.fetch = opts.fetch ?? globalThis.fetch;
+  }
+
+  async request(frame: Uint8Array): Promise<Uint8Array> {
+    if (this.closed) throw this.closed;
+    // The op byte picks the path; the token travels as a header instead of
+    // an AUTH frame, so AUTH has nothing to send.
+    const op = frame[0] as Op;
+    if (op === Op.Auth) return new Uint8Array(0);
+    const res = await this.fetch(this.base + PATH[op], {
+      method: "POST",
+      headers: this.headers,
+      // The view is always over a plain ArrayBuffer; the cast only narrows the generic.
+      body: frame.subarray(HEADER_LEN) as Uint8Array<ArrayBuffer>,
+    });
+    const body = new Uint8Array(await res.arrayBuffer());
+    if (res.ok) return body;
+    const status = STATUS[res.status];
+    const message = utf8.decode(body);
+    if (status === undefined)
+      throw new Error(`server returned HTTP ${res.status}: ${message}`);
+    throw new StatusError(status, message);
+  }
+
+  get isOpen(): boolean {
+    return this.closed === null;
+  }
+
+  close(): void {
+    this.closed ??= new ClosedError();
+  }
+}
+
+/** A transport that talks to the server's HTTP listener. */
+export function http(opts: HttpOptions): Transport {
+  return new HttpTransport(opts);
+}

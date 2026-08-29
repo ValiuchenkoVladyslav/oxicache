@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Client, ClosedError, Status, StatusError } from "../src/index";
+import { tcp } from "../src/transport/tcp";
 import { must } from "./must";
 import { startServer, type TestServer } from "./server";
 
@@ -11,7 +12,7 @@ interface User {
   avatar: Uint8Array;
 }
 
-describe("client-ts e2e", () => {
+describe("tcp transport e2e", () => {
   let server: TestServer;
   beforeAll(async () => {
     server = await startServer();
@@ -19,7 +20,7 @@ describe("client-ts e2e", () => {
   afterAll(() => server.stop());
 
   test("single key in, single value out", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     expect(await c.get("a")).toBeNull();
     await c.set("a", 1);
     expect(await c.get<number>("a")).toBe(1);
@@ -31,7 +32,7 @@ describe("client-ts e2e", () => {
   });
 
   test("several keys in, tuple out", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     await c.set(["a", "1"], ["b", [0, 1, 2]]);
     const [a, b, missing] = await c.get("a", "b", "c");
     expect(a).toBe("1");
@@ -52,7 +53,7 @@ describe("client-ts e2e", () => {
   });
 
   test("array in, array out", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     const keys = Array.from({ length: 20 }, (_, i) => `arr-${i}`);
     await c.set(keys.map((k, i) => [k, i] as const));
     expect(await c.get<number>(keys)).toEqual(keys.map((_, i) => i));
@@ -66,7 +67,7 @@ describe("client-ts e2e", () => {
   });
 
   test("objects of any shape round-trip", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     const u: User = {
       id: 7,
       name: "alice",
@@ -85,41 +86,8 @@ describe("client-ts e2e", () => {
     c.close();
   });
 
-  test("useRecords is on by default and can be turned off", async () => {
-    const shape = { id: 1, name: "alice", tags: ["x"] };
-    for (const useRecords of [undefined, true, false]) {
-      // biome-ignore lint/performance/noAwaitInLoops: the settings share keys, so they must run one after another
-      const c = await Client.connect({
-        port: server.port,
-        ...(useRecords === undefined ? {} : { useRecords }),
-      });
-      await c.set(["r1", shape], ["r2", { ...shape, id: 2 }]);
-      const [a, b] = await c.get<[typeof shape, typeof shape]>("r1", "r2");
-      expect(a).toEqual(shape);
-      expect(must(b).id).toBe(2);
-      // A fresh client with the same setting reads it back too.
-      const c2 = await Client.connect({
-        port: server.port,
-        ...(useRecords === undefined ? {} : { useRecords }),
-      });
-      expect(await c2.get<typeof shape>("r2")).toEqual({ ...shape, id: 2 });
-      c.close();
-      c2.close();
-    }
-    // Plain msgpack written by a no-records client is readable by a records client.
-    const plain = await Client.connect({
-      port: server.port,
-      useRecords: false,
-    });
-    await plain.set("plain", shape);
-    const rec = await Client.connect({ port: server.port });
-    expect(await rec.get<typeof shape>("plain")).toEqual(shape);
-    plain.close();
-    rec.close();
-  });
-
   test("every primitive kind", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     await c.set(
       ["null", null],
       ["bool", false],
@@ -158,7 +126,7 @@ describe("client-ts e2e", () => {
   });
 
   test("binary keys and unicode string keys", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     const key = new Uint8Array([0, 255, 1, 2]);
     await c.set([
       [key, "bin"],
@@ -175,7 +143,7 @@ describe("client-ts e2e", () => {
   });
 
   test("large values", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     const big = new Uint8Array(4 << 20).fill(7);
     big[big.length - 1] = 9;
     await c.set("big", big);
@@ -189,7 +157,7 @@ describe("client-ts e2e", () => {
   });
 
   test("pipelined concurrent calls share one connection", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     await Promise.all(
       Array.from({ length: 16 }, async (_, t) => {
         for (let i = 0; i < 50; i++) {
@@ -214,7 +182,7 @@ describe("client-ts e2e", () => {
   });
 
   test("empty batches", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     expect(await c.get([])).toEqual([]);
     expect(await c.del([])).toEqual([]);
     await c.set([]);
@@ -222,12 +190,12 @@ describe("client-ts e2e", () => {
   });
 
   test("closed connection rejects in-flight and later calls", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     const inflight = c.get("x");
     c.close();
     await expect(inflight).rejects.toBeInstanceOf(ClosedError);
     await expect(c.get("x")).rejects.toBeInstanceOf(ClosedError);
-    await expect(Client.connect({ port: 1 })).rejects.toBeDefined();
+    await expect(Client.connect(tcp({ port: 1 }))).rejects.toBeDefined();
   });
 });
 
@@ -245,7 +213,7 @@ describe("token auth", () => {
   afterAll(() => server.stop());
 
   test("unauthenticated request is rejected and disconnected", async () => {
-    const c = await Client.connect({ port: server.port });
+    const c = await Client.connect(tcp({ port: server.port }));
     const err = await c.get("a").catch((e) => e);
     expect(err).toBeInstanceOf(StatusError);
     expect((err as StatusError).status).toBe(Status.Unauthorized);
@@ -253,19 +221,17 @@ describe("token auth", () => {
   });
 
   test("wrong token", async () => {
-    const err = await Client.connect({
-      port: server.port,
-      token: "s3cre",
-    }).catch((e) => e);
+    const err = await Client.connect(
+      tcp({ port: server.port, token: "s3cre" }),
+    ).catch((e) => e);
     expect(err).toBeInstanceOf(StatusError);
     expect((err as StatusError).status).toBe(Status.Unauthorized);
   });
 
-  test("right token works, redundant auth is fine", async () => {
-    const c = await Client.connect({ port: server.port, token: "s3cret" });
+  test("right token works", async () => {
+    const c = await Client.connect(tcp({ port: server.port, token: "s3cret" }));
     await c.set("a", 1);
     expect(await c.get<number>("a")).toBe(1);
-    await c.auth("s3cret");
     expect(await c.del("a")).toBe(true);
     c.close();
   });
@@ -286,7 +252,7 @@ describe("desync", () => {
       },
     });
     try {
-      const c = await Client.connect({ port: fake.port });
+      const c = await Client.connect(tcp({ port: fake.port }));
       await c.set("a", 1);
       const err = await c.get("a").catch((e) => e);
       expect(err).toBeInstanceOf(ClosedError);

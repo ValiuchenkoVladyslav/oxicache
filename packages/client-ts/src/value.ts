@@ -1,4 +1,4 @@
-import { Packr } from "msgpackr";
+import { decode, ExtensionCodec, encode } from "@msgpack/msgpack";
 
 /** Leaf types a value may contain. */
 export type Primitive =
@@ -31,37 +31,33 @@ export type Encodable<T> = T extends Primitive
         ? { readonly [K in keyof T]: Encodable<T[K]> }
         : never;
 
-export interface CodecOptions {
-  /**
-   * msgpackr's record extension: within a value, an object's key set is
-   * written once as a structure definition and further objects of the same
-   * shape refer to it, which is smaller and faster for repeated shapes. Data
-   * written this way is msgpack with an extension type that only msgpackr
-   * reads back; turn it off for plain MessagePack readable by any decoder.
-   * Default `true`.
-   */
-  useRecords?: boolean;
+/**
+ * Extension type carrying a `bigint` as its decimal string, so integers of
+ * any size survive. (msgpack's own int64 formats are not used for bigints:
+ * decoding them as bigint would also turn every plain number above 2^32
+ * into one.)
+ */
+export const BIGINT_EXT = 0;
+
+const utf8 = new TextEncoder();
+const utf8d = new TextDecoder();
+
+const codec = new ExtensionCodec();
+codec.register({
+  type: BIGINT_EXT,
+  encode: (v: unknown) =>
+    typeof v === "bigint" ? utf8.encode(v.toString()) : null,
+  decode: (data: Uint8Array) => BigInt(utf8d.decode(data)),
+});
+
+const options = { extensionCodec: codec } as const;
+
+/** Encode a value as MessagePack (plain, readable by any decoder; `bigint` via {@link BIGINT_EXT}). */
+export function encodeValue(value: unknown): Uint8Array {
+  return encode(value, options);
 }
 
-/** Encodes and decodes values; one per client so record structures stay private to it. */
-export class Codec {
-  private readonly packr: Packr;
-
-  constructor(opts: CodecOptions = {}) {
-    // mapsAsObjects is explicit because msgpackr flips its default to Map
-    // when records are on, and plain msgpack maps must still come back as
-    // objects whichever mode wrote them.
-    this.packr = new Packr({
-      useRecords: opts.useRecords ?? true,
-      mapsAsObjects: true,
-    });
-  }
-
-  encode(value: unknown): Uint8Array {
-    return this.packr.pack(value);
-  }
-
-  decode<T>(bytes: Uint8Array): T {
-    return this.packr.unpack(bytes) as T;
-  }
+/** Decode MessagePack produced by {@link encodeValue} (or any other encoder). */
+export function decodeValue<T>(bytes: Uint8Array): T {
+  return decode(bytes, options) as T;
 }
