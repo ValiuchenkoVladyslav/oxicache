@@ -274,3 +274,35 @@ Net, same client: read-heavy 4.4 → **3.4 µs** user; 1 KiB 50/50 22–24 → *
 
 Next: a size-class slab for entries backed by an `MADV_HUGEPAGE` region — alignment for
 free at every size, no glibc `malloc`/`free` (~8 %), and the TLB misses gone.
+
+## Round 9: review fixes and false sharing (2026-08-29)
+
+A full-tree review (bugs, performance, and a separate pass over cache-line layout).
+Same harness as round 7 (2 s warm-up, 6 s runs, min of 3 alternating). Baseline is the
+round-8 binary re-measured today; the client bench itself is faster than in round 7, so
+absolute numbers are lower across the board.
+
+| change | measurement (user / sys µs per request) | verdict |
+|---|---|---|
+| **fixes** (no perf intent): cap keys/entries per request at 65 536 (a 64 MiB body of empty keys pre-allocated ~800 MB of scratch); grow the read buffer geometrically instead of reserving a frame's claimed length up front; 4 KiB frame limit before authentication; back off 50 ms after a failed `accept` (fd exhaustion spun a worker); reject a SET whose entry cannot fit its shard instead of evicting the whole shard; replace before evicting so overwriting at full capacity does not also evict `cost` bytes of neighbours; drain connections for up to 2 s on Ctrl-C; `M_MMAP_THRESHOLD` 32 MiB (glibc silently rejected 64 MiB); client reports `ResponseTooLarge` instead of `Closed` | neutral on every profile | kept |
+| tag from hash bits 32..48 instead of the top 16 (the shard selector uses the top bits, so a 16-shard table had 12 usable tag bits) | neutral on A, B and D: the tag false-positive rate is already ~1/4096 per slot | rejected (no measured win) |
+| `Shard` and `Index` layout: reader-hot `table`/`moving` on their own 128-byte line, `len`/`kick_seed`/mutex/queues after it; `#[repr(align(128))]` on `Shard` (stride was 216 B, so half the shards' write counters shared a line with the next shard's reader words); `#[repr(align(64))]` on `Table` | eviction profile 11.5 → 11.2 (6/6 pairs); read-heavy −2 %; 1 KiB 50/50 neutral | kept |
+| flush retired entries to the epoch collector on a threshold instead of after every batch: every batch (`Guard::flush` → `try_advance` scans every thread + global queue CAS) | 4 KiB 90 % writes: 53.2 → 46.2 (−13 %). But with a plain threshold the 128 B eviction profile got slower the larger the threshold (32 entries +2 %, 256 entries +7 %), and 1 MiB of 128 B entries between flushes leaked (2.6 GB on a 32 MiB budget: a flush reclaims at most 8 bags of 64 entries) | reworked below |
+| same, size-split: small entries (< 1 KiB value) flush at once — their chunks are still cache-hot when freed and the next allocation reuses them warm; large ones batch up to 256 entries / 1 MiB per thread | 4 KiB writes 53.1 → **46.2** (−13 %); 1 KiB 50/50 20.9 → **18.6** (−11 %); eviction profile and read-heavy neutral; RSS bounded over 14 s on both write profiles | kept |
+
+Net, round-8 binary vs now, same client (user / sys µs per request, req/s):
+
+| profile | before | after |
+|---|---|---|
+| 8×16, 128 B, 10 % writes | 3.17 / 2.13, 500k | 3.17 / 2.08, 501k |
+| 8×16, 1 KiB, 50 % writes | 20.9 / 12.6, 137k | **18.6 / 12.2**, 150k |
+| 12×32, 4 KiB, 90 % writes | 53.1 / 43.8, 48.3k | **46.2 / 42.2**, 51.5k |
+| 8×16, 128 B, 50 % writes, 1M keys, `--capacity 32M` | 11.24 / 4.23, 305k | 11.19 / 4.13, 309k |
+
+Reviewed and left alone: the per-hit refcount on ≥ 1 KiB values (`Entry::clone` in the
+GET path puts a `lock xadd` on the header line every reader of that key must load; only
+matters for skewed key popularity, which the uniform bench does not exercise — revisit
+with the slab allocator, when the entry layout changes anyway); 8 `Acquire` loads per
+bucket in `Table::find` (free on x86, costs `ldar`s on aarch64 — unmeasurable here);
+`path.contains` in `find_path` (O(n²) over ≤ 256 hops, only at 7/8 load); grouping
+`set_many` by shard (16 entries over 16 shards already take ~one lock each).
