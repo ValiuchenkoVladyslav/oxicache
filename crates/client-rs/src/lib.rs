@@ -32,6 +32,9 @@ pub enum Error {
     #[cfg(feature = "serde")]
     #[error("deserialize: {0}")]
     Deserialize(#[from] rmp_serde::decode::Error),
+    #[cfg(feature = "serde")]
+    #[error("server answered {got} values for {expected} keys")]
+    Count { expected: usize, got: usize },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -100,92 +103,118 @@ impl Client {
         rx.await.map_err(|_| Error::Closed)?
     }
 
+    /// The byte-level API: keys and values as raw bytes, whatever features
+    /// are enabled. Without the `serde` feature `Client`'s own `get`/`set`/
+    /// `del` are the same thing.
+    pub fn raw(&self) -> Raw<'_> {
+        Raw(self)
+    }
+}
+
+/// Byte-level view of a [`Client`]; see [`Client::raw`].
+#[derive(Clone, Copy)]
+pub struct Raw<'a>(&'a Client);
+
+impl Raw<'_> {
+    /// Fetch one key.
+    pub async fn get(self, key: &[u8]) -> Result<Option<Bytes>> {
+        Ok(self.get_multi([key]).await?.pop().flatten())
+    }
+
     /// Fetch many keys; the result has one slot per key in request order.
-    pub async fn get<'a, I>(&self, keys: I) -> Result<Vec<Option<Bytes>>>
+    pub async fn get_multi<'a, I>(self, keys: I) -> Result<Vec<Option<Bytes>>>
     where
         I: IntoIterator<Item = &'a [u8]>,
         I::IntoIter: ExactSizeIterator + Clone,
     {
         Ok(wire::decode_values(
-            self.call(Op::Get, wire::encode_keys(keys)).await?,
+            self.0.call(Op::Get, wire::encode_keys(keys)).await?,
         )?)
     }
 
+    /// Store one key/value pair.
+    pub async fn set(self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.set_multi([(key, value)]).await
+    }
+
     /// Store many key/value pairs.
-    pub async fn set<'a, I>(&self, entries: I) -> Result<()>
+    pub async fn set_multi<'a, I>(self, entries: I) -> Result<()>
     where
         I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
         I::IntoIter: ExactSizeIterator + Clone,
     {
-        self.call(Op::Set, wire::encode_entries(entries)).await?;
+        self.0.call(Op::Set, wire::encode_entries(entries)).await?;
         Ok(())
     }
 
+    /// Delete one key; returns whether it existed.
+    pub async fn del(self, key: &[u8]) -> Result<bool> {
+        Ok(self.del_multi([key]).await?.pop().unwrap_or(false))
+    }
+
     /// Delete many keys; returns whether each one existed.
-    pub async fn del<'a, I>(&self, keys: I) -> Result<Vec<bool>>
+    pub async fn del_multi<'a, I>(self, keys: I) -> Result<Vec<bool>>
     where
         I: IntoIterator<Item = &'a [u8]>,
         I::IntoIter: ExactSizeIterator + Clone,
     {
         Ok(wire::decode_flags(
-            self.call(Op::Del, wire::encode_keys(keys)).await?,
+            self.0.call(Op::Del, wire::encode_keys(keys)).await?,
         )?)
     }
 }
 
-/// Typed API, enabled by the `serde` feature. Keys and values are encoded
-/// with MessagePack (`rmp-serde`, compact form), so a `&str` key stored here
-/// is a different key from the same bytes stored through [`Client::set`].
-#[cfg(feature = "serde")]
+/// Byte-level `get`/`set`/`del` on the client itself; with the `serde`
+/// feature these names take any serializable type instead (see [`typed`]).
+#[cfg(not(feature = "serde"))]
 impl Client {
-    /// Fetch many keys, decoding each present value as `V`.
-    pub async fn get_typed<K, V, I>(&self, keys: I) -> Result<Vec<Option<V>>>
+    /// Fetch one key.
+    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>> {
+        self.raw().get(key.as_ref()).await
+    }
+
+    /// Fetch many keys; the result has one slot per key in request order.
+    pub async fn get_multi<'a, I>(&self, keys: I) -> Result<Vec<Option<Bytes>>>
     where
-        K: serde::Serialize,
-        V: serde::de::DeserializeOwned,
-        I: IntoIterator<Item = K>,
+        I: IntoIterator<Item = &'a [u8]>,
+        I::IntoIter: ExactSizeIterator + Clone,
     {
-        let keys = encode_all(keys)?;
-        self.get(keys.iter().map(Vec::as_slice))
-            .await?
-            .into_iter()
-            .map(|v| v.map(|v| rmp_serde::from_slice(&v)).transpose())
-            .collect::<std::result::Result<_, _>>()
-            .map_err(Error::from)
+        self.raw().get_multi(keys).await
+    }
+
+    /// Store one key/value pair.
+    pub async fn set(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
+        self.raw().set(key.as_ref(), value.as_ref()).await
     }
 
     /// Store many key/value pairs.
-    pub async fn set_typed<K, V, I>(&self, entries: I) -> Result<()>
+    pub async fn set_multi<'a, I>(&self, entries: I) -> Result<()>
     where
-        K: serde::Serialize,
-        V: serde::Serialize,
-        I: IntoIterator<Item = (K, V)>,
+        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+        I::IntoIter: ExactSizeIterator + Clone,
     {
-        let entries = entries
-            .into_iter()
-            .map(|(k, v)| Ok((rmp_serde::to_vec(&k)?, rmp_serde::to_vec(&v)?)))
-            .collect::<Result<Vec<_>>>()?;
-        self.set(entries.iter().map(|(k, v)| (k.as_slice(), v.as_slice())))
-            .await
+        self.raw().set_multi(entries).await
+    }
+
+    /// Delete one key; returns whether it existed.
+    pub async fn del(&self, key: impl AsRef<[u8]>) -> Result<bool> {
+        self.raw().del(key.as_ref()).await
     }
 
     /// Delete many keys; returns whether each one existed.
-    pub async fn del_typed<K, I>(&self, keys: I) -> Result<Vec<bool>>
+    pub async fn del_multi<'a, I>(&self, keys: I) -> Result<Vec<bool>>
     where
-        K: serde::Serialize,
-        I: IntoIterator<Item = K>,
+        I: IntoIterator<Item = &'a [u8]>,
+        I::IntoIter: ExactSizeIterator + Clone,
     {
-        let keys = encode_all(keys)?;
-        self.del(keys.iter().map(Vec::as_slice)).await
+        self.raw().del_multi(keys).await
     }
 }
 
 #[cfg(feature = "serde")]
-fn encode_all<K: serde::Serialize>(keys: impl IntoIterator<Item = K>) -> Result<Vec<Vec<u8>>> {
-    keys.into_iter()
-        .map(|k| rmp_serde::to_vec(&k).map_err(Error::from))
-        .collect()
-}
+pub mod typed;
+#[cfg(feature = "serde")]
+pub use typed::{Keys, ValuesFor};
 
 /// Writes queued requests, coalescing everything already queued into one flush.
 async fn write_loop<W: AsyncWrite + Unpin>(

@@ -9,7 +9,7 @@ eviction, length-prefixed frames over plain TCP, tokio multi-threaded runtime. N
 |---|---|
 | `crates/wire` (`oxicache-wire`) | binary request/response framing shared by both sides |
 | `crates/server` (`oxicache-server`) | `oxicache-server` binary: sharded S3-FIFO engine + TCP front end |
-| `crates/client-rs` (`oxicache-client`) | Rust `Client` library + `oxicache-cli` (get/set/del/bench) |
+| `crates/client-rs` (`oxicache-client`) | Rust `Client` library (bytes, or any serde type with the `serde` feature) + `oxicache-cli` |
 | `packages/client-ts` (`@oxicache/client`) | TypeScript `Client` library for the Bun runtime |
 
 ## Protocol
@@ -51,20 +51,29 @@ cargo run --release -p oxicache-client -- del a
 cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 16
 ```
 
-### Rust typed API (`serde` feature)
+### Rust client API
 
-By default the Rust client works on raw bytes. With `oxicache-client = { features = ["serde"] }`
-it also offers `get_typed` / `set_typed` / `del_typed`, which take any `Serialize` key or value
-and decode responses into any `DeserializeOwned` type (MessagePack via `rmp-serde`):
+`get`/`set`/`del` act on one key; `get_multi`/`set_multi`/`del_multi` on several. Without
+features they take bytes; with `oxicache-client = { features = ["serde"] }` the same names take
+any `Serialize` key or value and decode into any `DeserializeOwned` type (MessagePack via
+`rmp-serde`), and the byte API stays available as `client.raw()`:
 
 ```rust
 #[derive(Serialize, Deserialize)] struct User { id: u64, name: String }
-client.set_typed([("user:7", User { id: 7, name: "alice".into() })]).await?;
-let users: Vec<Option<User>> = client.get_typed(["user:7", "user:8"]).await?;
+client.set("user:7", User { id: 7, name: "alice".into() }).await?;
+let user: Option<User> = client.get("user:7").await?;
+
+// several keys: a tuple gives one value type per key, an array or Vec one type for all
+let (user, hits): (Option<User>, Option<u64>) = client.get_multi(("user:7", "hits:7")).await?;
+let users: [Option<User>; 2] = client.get_multi(["user:7", "user:8"]).await?;
+let users: Vec<Option<User>> = client.get_multi(ids).await?;
+client.set_multi([("a", 1), ("b", 2)]).await?;
+let [a, b] = client.del_multi(("a", "b")).await?;
 ```
 
-Typed keys are MessagePack-encoded, so `"k"` stored through `set_typed` is a different key
-from `b"k"` stored through `set`.
+A tuple of keys must be paired with a tuple of exactly as many value types (up to 16); a
+mismatch does not compile. Typed keys are MessagePack-encoded, so `"k"` stored through the
+typed API is a different key from `b"k"` stored through `client.raw()`.
 
 ## TypeScript client (Bun)
 
