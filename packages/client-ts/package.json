@@ -16,7 +16,10 @@
   "files": ["dist", "src"],
   "scripts": {
     "check": "tsc --noEmit",
-    "build": "bun build ./src/index.ts --outdir ./dist --target bun --sourcemap=linked && tsc --emitDeclarationOnly --declaration --noEmit false --outDir dist",
+    "build": "bun build ./src/index.ts --outdir ./dist --target bun --sourcemap=linked && tsc -p tsconfig.build.json",
     "test": "bun test"
+  },
+  "dependencies": {
+    "msgpackr": "^2.1.0"
   }
 }

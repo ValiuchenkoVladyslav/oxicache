@@ -15,6 +15,14 @@ bytes.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 clap.workspace = true
+serde = { version = "1", optional = true }
+rmp-serde = { version = "1", optional = true }
+
+[features]
+## Typed API: `get_typed`, `set_typed`, `del_typed` accept any `Serialize` key
+## or value and decode responses into any `DeserializeOwned` type.
+serde = ["dep:serde", "dep:rmp-serde"]
 
 [dev-dependencies]
 oxicache-server.workspace = true
+serde = { version = "1", features = ["derive"] }

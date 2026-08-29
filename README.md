@@ -51,23 +51,48 @@ cargo run --release -p oxicache-client -- del a
 cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 16
 ```
 
+### Rust typed API (`serde` feature)
+
+By default the Rust client works on raw bytes. With `oxicache-client = { features = ["serde"] }`
+it also offers `get_typed` / `set_typed` / `del_typed`, which take any `Serialize` key or value
+and decode responses into any `DeserializeOwned` type (MessagePack via `rmp-serde`):
+
+```rust
+#[derive(Serialize, Deserialize)] struct User { id: u64, name: String }
+client.set_typed([("user:7", User { id: 7, name: "alice".into() })]).await?;
+let users: Vec<Option<User>> = client.get_typed(["user:7", "user:8"]).await?;
+```
+
+Typed keys are MessagePack-encoded, so `"k"` stored through `set_typed` is a different key
+from `b"k"` stored through `set`.
+
 ## TypeScript client (Bun)
 
-`packages/client-ts` is a dependency-free library on `Bun.connect`: the same framing,
-pipelining and in-order response matching as the Rust client, in ~300 lines of TypeScript.
-Keys and values are `string` (UTF-8) or `Uint8Array`; values come back as `Uint8Array`.
+`packages/client-ts` runs on `Bun.connect` with the same framing, pipelining and in-order
+response matching as the Rust client. Keys are `string` (UTF-8) or `Uint8Array`; values are
+any MessagePack-representable data (`null`, booleans, numbers, `bigint`, strings,
+`Uint8Array`, `Date`, arrays, plain objects, class instances), encoded with
+[msgpackr](docs/msgpack-bench.md) and checked at the type level — a value containing a
+function, `symbol`, `undefined`, `Map` or `Set` is a compile error.
 
 ```ts
 import { Client } from "@oxicache/client";
 
 const c = await Client.connect({ hostname: "127.0.0.1", port: 4433, token: "s3cret" });
-await c.set([["a", "1"], ["b", new Uint8Array([0, 1, 2])]]);
-const [a, b, missing] = await c.get(["a", "b", "c"]);   // Uint8Array | null each
-const [existed] = await c.del(["a"]);                   // boolean each
+
+await c.set("user:7", { id: 7, name: "alice", joined: new Date() });  // one
+await c.set([["a", 1], ["b", ["x", null]]]);                           // many
+
+const u = await c.get<User>("user:7");      // User | null
+const vs = await c.get<number>(["a", "z"]); // (number | null)[]
+const d = await c.del("a");                 // boolean
+const ds = await c.del(["a", "b"]);         // boolean[]
 c.close();
 ```
 
-Calls issued in the same tick are coalesced into one write; a non-OK status rejects with
+One key in, one result out; an array in, an array out — enforced by overloads. The return
+type parameter says what a stored value decodes to and is not checked at runtime. Calls
+issued in the same tick are coalesced into one write; a non-OK status rejects with
 `StatusError` (`.status` is the `Status` enum), a dropped connection with `ClosedError`.
 
 ## Development
@@ -75,11 +100,11 @@ Calls issued in the same tick are coalesced into one write; a non-OK status reje
 ```sh
 bun install            # installs the husky pre-commit hook
 bun test               # client-ts unit + e2e tests (builds and spawns the debug server)
-cargo test --workspace # wire, server and client-rs unit + e2e tests
+cargo test --workspace --all-features # wire, server and client-rs unit + e2e tests
 ```
 
 The pre-commit hook (`.husky/pre-commit`) runs `cargo fmt --check`, `clippy -D warnings`,
-`cargo build`, `cargo test`, then the TypeScript type check, `bun build` and `bun test`.
+`cargo build`, `cargo test` (all features), then the TypeScript type check, `bun build` and `bun test`.
 
 ## Design
 

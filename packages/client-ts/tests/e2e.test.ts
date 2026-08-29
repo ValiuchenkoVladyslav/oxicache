@@ -2,7 +2,13 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Client, ClosedError, Status, StatusError } from "../src/index";
 import { type TestServer, startServer } from "./server";
 
-const text = (b: Uint8Array | null) => (b === null ? null : new TextDecoder().decode(b));
+interface User {
+  id: number;
+  name: string;
+  tags: string[];
+  joined: Date;
+  avatar: Uint8Array;
+}
 
 describe("client-ts e2e", () => {
   let server: TestServer;
@@ -11,24 +17,82 @@ describe("client-ts e2e", () => {
   });
   afterAll(() => server.stop());
 
-  test("get, set, del over tcp", async () => {
+  test("single key in, single value out", async () => {
     const c = await Client.connect({ port: server.port });
-    expect(await c.get(["a"])).toEqual([null]);
-    await c.set([
-      ["a", "1"],
-      ["b", new Uint8Array([0, 1, 2])],
-    ]);
-    const got = await c.get(["a", "b", "c"]);
-    expect(text(got[0]!)).toBe("1");
-    expect([...got[1]!]).toEqual([0, 1, 2]);
-    expect(got[2]).toBeNull();
-    expect(await c.del(["a", "zz"])).toEqual([true, false]);
-    expect(await c.get(["a"])).toEqual([null]);
+    expect(await c.get("a")).toBeNull();
+    await c.set("a", 1);
+    expect(await c.get<number>("a")).toBe(1);
+    expect(await c.del("a")).toBe(true);
+    expect(await c.del("a")).toBe(false);
+    expect(await c.get("a")).toBeNull();
     c.close();
     expect(c.isOpen).toBe(false);
   });
 
-  test("binary keys and unicode strings", async () => {
+  test("array in, array out", async () => {
+    const c = await Client.connect({ port: server.port });
+    await c.set([
+      ["a", "1"],
+      ["b", [0, 1, 2]],
+    ]);
+    expect(await c.get(["a", "b", "c"])).toEqual(["1", [0, 1, 2], null]);
+    expect(await c.del(["a", "zz"])).toEqual([true, false]);
+    expect(await c.get(["a"])).toEqual([null]);
+    c.close();
+  });
+
+  test("objects of any shape round-trip", async () => {
+    const c = await Client.connect({ port: server.port });
+    const u: User = {
+      id: 7,
+      name: "alice",
+      tags: ["x", "y"],
+      joined: new Date("2026-01-02T03:04:05.678Z"),
+      avatar: new Uint8Array([1, 2, 3]),
+    };
+    await c.set("user:7", u);
+    const got = await c.get<User>("user:7");
+    expect(got).not.toBeNull();
+    expect(got!.id).toBe(7);
+    expect(got!.name).toBe("alice");
+    expect(got!.tags).toEqual(["x", "y"]);
+    expect(got!.joined).toBeInstanceOf(Date);
+    expect(got!.joined.getTime()).toBe(u.joined.getTime());
+    expect([...got!.avatar]).toEqual([1, 2, 3]);
+    c.close();
+  });
+
+  test("every primitive kind", async () => {
+    const c = await Client.connect({ port: server.port });
+    await c.set([
+      ["null", null],
+      ["bool", false],
+      ["int", -42],
+      ["float", 3.25],
+      ["bigint", 2n ** 62n],
+      ["str", "ключ ✓"],
+      ["bin", new Uint8Array([255, 0])],
+      ["date", new Date(1234567890123)],
+      ["arr", [1, "a", null]],
+      ["obj", { nested: { deep: true } }],
+    ]);
+    const [n, b, i, f, bi, s, bin, d, arr, obj] = await c.get([
+      "null", "bool", "int", "float", "bigint", "str", "bin", "date", "arr", "obj",
+    ]);
+    expect(n).toBeNull();
+    expect(b).toBe(false);
+    expect(i).toBe(-42);
+    expect(f).toBe(3.25);
+    expect(bi).toBe(2n ** 62n);
+    expect(s).toBe("ключ ✓");
+    expect([...(bin as Uint8Array)]).toEqual([255, 0]);
+    expect((d as Date).getTime()).toBe(1234567890123);
+    expect(arr).toEqual([1, "a", null]);
+    expect(obj).toEqual({ nested: { deep: true } });
+    c.close();
+  });
+
+  test("binary keys and unicode string keys", async () => {
     const c = await Client.connect({ port: server.port });
     const key = new Uint8Array([0, 255, 1, 2]);
     await c.set([
@@ -36,8 +100,7 @@ describe("client-ts e2e", () => {
       ["ключ", "значение"],
       ["", "empty key"],
     ]);
-    const got = await c.get([key, "ключ", "", "ключ2"]);
-    expect(got.map(text)).toEqual(["bin", "значение", "empty key", null]);
+    expect(await c.get([key, "ключ", "", "ключ2"])).toEqual(["bin", "значение", "empty key", null]);
     c.close();
   });
 
@@ -45,10 +108,13 @@ describe("client-ts e2e", () => {
     const c = await Client.connect({ port: server.port });
     const big = new Uint8Array(4 << 20).fill(7);
     big[big.length - 1] = 9;
-    await c.set([["big", big]]);
-    const [got] = await c.get(["big"]);
+    await c.set("big", big);
+    const got = await c.get<Uint8Array>("big");
     expect(got!.length).toBe(big.length);
     expect(Buffer.from(got!).equals(Buffer.from(big))).toBe(true);
+    const text = "y".repeat(1 << 20);
+    await c.set("text", text);
+    expect(await c.get<string>("text")).toBe(text);
     c.close();
   });
 
@@ -58,18 +124,17 @@ describe("client-ts e2e", () => {
       Array.from({ length: 16 }, async (_, t) => {
         for (let i = 0; i < 50; i++) {
           const k = `t${t}-${i}`;
-          await c.set([[k, k]]);
-          const [v] = await c.get([k]);
-          expect(text(v!)).toBe(k);
+          await c.set(k, { k, i });
+          expect(await c.get<{ k: string; i: number }>(k)).toEqual({ k, i });
         }
       }),
     );
     // Many calls issued in one tick are coalesced into one write and
     // answered in order.
     const results = await Promise.all(
-      Array.from({ length: 200 }, (_, i) => c.get([`t${i % 16}-${i % 50}`])),
+      Array.from({ length: 200 }, (_, i) => c.get<{ k: string }>(`t${i % 16}-${i % 50}`)),
     );
-    results.forEach((r, i) => expect(text(r[0]!)).toBe(`t${i % 16}-${i % 50}`));
+    results.forEach((r, i) => expect(r!.k).toBe(`t${i % 16}-${i % 50}`));
     c.close();
   });
 
@@ -83,10 +148,10 @@ describe("client-ts e2e", () => {
 
   test("closed connection rejects in-flight and later calls", async () => {
     const c = await Client.connect({ port: server.port });
-    const inflight = c.get(["x"]);
+    const inflight = c.get("x");
     c.close();
     await expect(inflight).rejects.toBeInstanceOf(ClosedError);
-    await expect(c.get(["x"])).rejects.toBeInstanceOf(ClosedError);
+    await expect(c.get("x")).rejects.toBeInstanceOf(ClosedError);
     await expect(Client.connect({ port: 1 })).rejects.toBeDefined();
   });
 });
@@ -100,10 +165,10 @@ describe("token auth", () => {
 
   test("unauthenticated request is rejected and disconnected", async () => {
     const c = await Client.connect({ port: server.port });
-    const err = await c.get(["a"]).catch((e) => e);
+    const err = await c.get("a").catch((e) => e);
     expect(err).toBeInstanceOf(StatusError);
     expect((err as StatusError).status).toBe(Status.Unauthorized);
-    await expect(c.get(["a"])).rejects.toBeInstanceOf(ClosedError);
+    await expect(c.get("a")).rejects.toBeInstanceOf(ClosedError);
   });
 
   test("wrong token", async () => {
@@ -114,10 +179,10 @@ describe("token auth", () => {
 
   test("right token works, redundant auth is fine", async () => {
     const c = await Client.connect({ port: server.port, token: "s3cret" });
-    await c.set([["a", "1"]]);
-    expect(text((await c.get(["a"]))[0]!)).toBe("1");
+    await c.set("a", 1);
+    expect(await c.get<number>("a")).toBe(1);
     await c.auth("s3cret");
-    expect(await c.del(["a"])).toEqual([true]);
+    expect(await c.del("a")).toBe(true);
     c.close();
   });
 });
@@ -138,8 +203,8 @@ describe("desync", () => {
     });
     try {
       const c = await Client.connect({ port: fake.port });
-      await c.set([["a", "1"]]);
-      const err = await c.get(["a"]).catch((e) => e);
+      await c.set("a", 1);
+      const err = await c.get("a").catch((e) => e);
       expect(err).toBeInstanceOf(ClosedError);
       expect(c.isOpen).toBe(false);
     } finally {

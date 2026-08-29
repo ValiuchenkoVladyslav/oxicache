@@ -26,6 +26,12 @@ pub enum Error {
     Decode(#[from] wire::DecodeError),
     #[error("response of {0} bytes exceeds the client limit of {MAX_FRAME}")]
     ResponseTooLarge(usize),
+    #[cfg(feature = "serde")]
+    #[error("serialize: {0}")]
+    Serialize(#[from] rmp_serde::encode::Error),
+    #[cfg(feature = "serde")]
+    #[error("deserialize: {0}")]
+    Deserialize(#[from] rmp_serde::decode::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -125,6 +131,60 @@ impl Client {
             self.call(Op::Del, wire::encode_keys(keys)).await?,
         )?)
     }
+}
+
+/// Typed API, enabled by the `serde` feature. Keys and values are encoded
+/// with MessagePack (`rmp-serde`, compact form), so a `&str` key stored here
+/// is a different key from the same bytes stored through [`Client::set`].
+#[cfg(feature = "serde")]
+impl Client {
+    /// Fetch many keys, decoding each present value as `V`.
+    pub async fn get_typed<K, V, I>(&self, keys: I) -> Result<Vec<Option<V>>>
+    where
+        K: serde::Serialize,
+        V: serde::de::DeserializeOwned,
+        I: IntoIterator<Item = K>,
+    {
+        let keys = encode_all(keys)?;
+        self.get(keys.iter().map(Vec::as_slice))
+            .await?
+            .into_iter()
+            .map(|v| v.map(|v| rmp_serde::from_slice(&v)).transpose())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(Error::from)
+    }
+
+    /// Store many key/value pairs.
+    pub async fn set_typed<K, V, I>(&self, entries: I) -> Result<()>
+    where
+        K: serde::Serialize,
+        V: serde::Serialize,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let entries = entries
+            .into_iter()
+            .map(|(k, v)| Ok((rmp_serde::to_vec(&k)?, rmp_serde::to_vec(&v)?)))
+            .collect::<Result<Vec<_>>>()?;
+        self.set(entries.iter().map(|(k, v)| (k.as_slice(), v.as_slice())))
+            .await
+    }
+
+    /// Delete many keys; returns whether each one existed.
+    pub async fn del_typed<K, I>(&self, keys: I) -> Result<Vec<bool>>
+    where
+        K: serde::Serialize,
+        I: IntoIterator<Item = K>,
+    {
+        let keys = encode_all(keys)?;
+        self.del(keys.iter().map(Vec::as_slice)).await
+    }
+}
+
+#[cfg(feature = "serde")]
+fn encode_all<K: serde::Serialize>(keys: impl IntoIterator<Item = K>) -> Result<Vec<Vec<u8>>> {
+    keys.into_iter()
+        .map(|k| rmp_serde::to_vec(&k).map_err(Error::from))
+        .collect()
 }
 
 /// Writes queued requests, coalescing everything already queued into one flush.
