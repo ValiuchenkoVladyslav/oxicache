@@ -22,7 +22,7 @@ describe("http transport e2e", () => {
 
   test("/health answers with a status only", async () => {
     const res = await fetch(`${server.url}/health`);
-    expect(res.status).toBe(204);
+    expect(res.status).toBe(200);
     expect((await res.arrayBuffer()).byteLength).toBe(0);
   });
 
@@ -140,7 +140,7 @@ describe("http token auth", () => {
   afterAll(() => server.stop());
 
   test("missing or wrong token is Unauthorized, /health needs none", async () => {
-    expect((await fetch(`${server.url}/health`)).status).toBe(204);
+    expect((await fetch(`${server.url}/health`)).status).toBe(200);
     for (const token of [undefined, "s3cre"]) {
       // biome-ignore lint/performance/noAwaitInLoops: each case is checked in turn
       const c = await Client.connect(

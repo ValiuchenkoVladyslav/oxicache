@@ -7,7 +7,7 @@
 //! POST /get   body: keys      -> 200, body: values
 //! POST /set   body: entries   -> 200, empty
 //! POST /del   body: keys      -> 200, body: flags
-//! GET  /health                -> 204, empty (no authentication)
+//! GET  /health                -> 200, empty (no authentication)
 //!
 //! 400 bad request | 401 unauthorized | 404 unknown path | 405 wrong method
 //! 413 too large   (the body is a UTF-8 message, as on TCP)
@@ -144,16 +144,14 @@ async fn accept_loop(
 fn reply(code: StatusCode, body: Bytes, binary: bool) -> Response<Full<Bytes>> {
     let mut res = Response::new(Full::new(body));
     *res.status_mut() = code;
-    if res.status() != StatusCode::NO_CONTENT {
-        res.headers_mut().insert(
-            header::CONTENT_TYPE,
-            header::HeaderValue::from_static(if binary {
-                "application/octet-stream"
-            } else {
-                "text/plain; charset=utf-8"
-            }),
-        );
-    }
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static(if binary {
+            "application/octet-stream"
+        } else {
+            "text/plain; charset=utf-8"
+        }),
+    );
     res
 }
 
@@ -174,7 +172,8 @@ async fn handle(
     token: Option<&[u8]>,
 ) -> Response<Full<Bytes>> {
     let op = match req.uri().path() {
-        "/health" => return reply(StatusCode::NO_CONTENT, Bytes::new(), false),
+        // Status code only, no body: a probe target.
+        "/health" => return reply(StatusCode::OK, Bytes::new(), false),
         "/get" => Op::Get,
         "/set" => Op::Set,
         "/del" => Op::Del,
@@ -296,7 +295,7 @@ mod tests {
         let s = server(None);
         let mut c = connect(&s).await;
         let (st, body) = call(&mut c, "GET", "/health", &[], b"").await;
-        assert_eq!((st, body.len()), (204, 0));
+        assert_eq!((st, body.len()), (200, 0));
         let entries = wire::encode_entries([(&b"k"[..], &b"v"[..])]);
         let (st, body) = call(&mut c, "POST", "/set", &[], &entries).await;
         assert_eq!((st, body.len()), (200, 0));
@@ -387,7 +386,7 @@ mod tests {
     async fn bearer_token_is_required_except_for_health() {
         let s = server(Some(b"s3cret"));
         let mut c = connect(&s).await;
-        assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 204);
+        assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 200);
         let keys = wire::encode_keys([&b"k"[..]]);
         // A refused request's body is never read, so hyper closes the
         // connection after the 401; each attempt gets a fresh one.
@@ -430,7 +429,7 @@ mod tests {
             .await;
         });
         let mut c = TcpStream::connect(addr).await.unwrap();
-        assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 204);
+        assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 200);
         tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), run)
             .await
@@ -450,6 +449,6 @@ mod tests {
         c.read_to_end(&mut rest).await.unwrap();
         assert!(String::from_utf8_lossy(&rest).starts_with("HTTP/1.1 400"));
         let mut c = TcpStream::connect(s.local_addr()).await.unwrap();
-        assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 204);
+        assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 200);
     }
 }

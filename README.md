@@ -47,7 +47,7 @@ the response body is the frame body, and the frame status becomes the HTTP statu
 POST /get   body: keys      -> 200, body: values
 POST /set   body: entries   -> 200, empty
 POST /del   body: keys      -> 200, body: flags
-GET  /health                -> 204, no body; never needs a token
+GET  /health                -> 200, no body; never needs a token
 400 bad request | 401 unauthorized | 404 unknown path | 405 wrong method | 413 too large
 ```
 

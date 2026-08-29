@@ -244,7 +244,7 @@ fn http_front_end_serves_alongside_tcp() {
     );
     let h = r.http_addr();
     assert_ne!(h, r.addr);
-    assert_eq!(http(h, "GET", "/health", None, b""), (204, vec![]));
+    assert_eq!(http(h, "GET", "/health", None, b""), (200, vec![]));
     let entries = wire::encode_entries([(&b"k"[..], &b"v"[..])]);
     assert_eq!(http(h, "POST", "/set", None, &entries).0, 401);
     assert_eq!(
