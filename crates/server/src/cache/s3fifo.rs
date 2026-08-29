@@ -38,6 +38,38 @@ pub struct TooLarge {
     pub capacity: usize,
 }
 
+/// What a write handed to the epoch collector, split by size class because
+/// the cache flushes small retirements eagerly and batches large ones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Retired {
+    /// Entries whose value is shorter than [`NT_MIN`].
+    pub small: usize,
+    /// Entries with values of at least [`NT_MIN`], and their total cost.
+    pub large: usize,
+    pub large_bytes: usize,
+}
+
+impl Retired {
+    #[inline]
+    fn one(e: &Entry) -> Self {
+        let cost = e.cost();
+        if e.value().len() < NT_MIN {
+            Self { small: 1, ..Self::default() }
+        } else {
+            Self { large: 1, large_bytes: cost, small: 0 }
+        }
+    }
+}
+
+impl std::ops::AddAssign for Retired {
+    #[inline]
+    fn add_assign(&mut self, o: Self) {
+        self.small += o.small;
+        self.large += o.large;
+        self.large_bytes += o.large_bytes;
+    }
+}
+
 /// Per-entry metadata stored in front of the key and value bytes.
 pub struct Meta {
     key: Key,
@@ -381,14 +413,14 @@ impl Shard {
         Ok(())
     }
 
-    /// Insert or replace. Returns whether any entry was retired (replaced or
-    /// evicted) under `guard`. Callers are expected to have run
+    /// Insert or replace. Returns what was retired (replaced or evicted)
+    /// under `guard`. Callers are expected to have run
     /// [`check_fits`](Self::check_fits); an oversized entry is stored anyway
     /// and simply evicts everything else.
-    pub fn set(&self, key: &[u8], value: &[u8], hash: u64, guard: &Guard) -> bool {
+    pub fn set(&self, key: &[u8], value: &[u8], hash: u64, guard: &Guard) -> Retired {
         let entry = Entry::new(Key::new(key), value, hash);
         let cost = entry.cost();
-        let mut retired = false;
+        let mut retired = Retired::default();
 
         let mut q = self.q.lock();
         // Replace first: the old entry's budget is released before deciding
@@ -397,21 +429,21 @@ impl Shard {
         // The new entry is not in any queue yet, so eviction cannot reach it.
         if let Some(old) = self.index.insert(&mut q.w, hash, entry.clone(), guard) {
             self.kill(&mut q, &old);
+            retired += Retired::one(&old);
             retire(old, guard);
-            retired = true;
         }
         while q.used + cost > self.capacity {
             // Not identical: eviction order differs, which is the whole point of S3-FIFO.
             #[allow(clippy::if_same_then_else)]
             let evicted = if q.small_bytes >= self.small_capacity {
-                self.evict_small(&mut q, guard) || self.evict_main(&mut q, guard)
+                self.evict_small(&mut q, guard).or_else(|| self.evict_main(&mut q, guard))
             } else {
-                self.evict_main(&mut q, guard) || self.evict_small(&mut q, guard)
+                self.evict_main(&mut q, guard).or_else(|| self.evict_small(&mut q, guard))
             };
-            if !evicted {
+            let Some(r) = evicted else {
                 break;
-            }
-            retired = true;
+            };
+            retired += r;
         }
         q.used += cost;
         if q.ghost.take(hash) {
@@ -424,15 +456,15 @@ impl Shard {
         retired
     }
 
-    pub fn del(&self, hash: u64, key: &[u8], guard: &Guard) -> bool {
+    /// Remove `key`, returning what was retired if it was present.
+    pub fn del(&self, hash: u64, key: &[u8], guard: &Guard) -> Option<Retired> {
         let mut q = self.q.lock();
-        let Some(e) = self.index.remove(&mut q.w, hash, key, guard) else {
-            return false;
-        };
+        let e = self.index.remove(&mut q.w, hash, key, guard)?;
         self.kill(&mut q, &e);
+        let r = Retired::one(&e);
         retire(e, guard);
         self.maybe_compact(&mut q);
-        true
+        Some(r)
     }
 
     pub fn used_bytes(&self) -> usize {
@@ -448,10 +480,10 @@ impl Shard {
         }
     }
 
-    fn evict_small(&self, q: &mut Queues, guard: &Guard) -> bool {
-        let Some(e) = q.small.pop_front() else {
-            return false;
-        };
+    /// Pop the head of the small queue; `Some` reports what was released
+    /// (or handed to the collector), which may be nothing for a promotion.
+    fn evict_small(&self, q: &mut Queues, guard: &Guard) -> Option<Retired> {
+        let e = q.small.pop_front()?;
         let cost = e.cost();
         q.small_bytes -= cost;
         if !e.live().load(Relaxed) {
@@ -459,6 +491,7 @@ impl Shard {
         } else if e.freq().load(Relaxed) > 1 {
             e.freq().store(0, Relaxed);
             q.main.push_back(e);
+            return Some(Retired::default());
         } else {
             if let Some(h) = self.index.remove_if_same(&mut q.w, e.hash(), &e, guard) {
                 retire(h, guard);
@@ -468,18 +501,16 @@ impl Shard {
             let limit = q.main.len();
             q.ghost.push(e.hash(), limit);
         }
-        true
+        Some(Retired::one(&e))
     }
 
-    fn evict_main(&self, q: &mut Queues, guard: &Guard) -> bool {
+    fn evict_main(&self, q: &mut Queues, guard: &Guard) -> Option<Retired> {
         loop {
-            let Some(e) = q.main.pop_front() else {
-                return false;
-            };
+            let e = q.main.pop_front()?;
             let cost = e.cost();
             if !e.live().load(Relaxed) {
                 q.dead_bytes -= cost;
-                return true;
+                return Some(Retired::one(&e));
             }
             let f = e.freq().load(Relaxed);
             if f > 0 {
@@ -492,7 +523,7 @@ impl Shard {
             }
             e.live().store(false, Relaxed);
             q.used -= cost;
-            return true;
+            return Some(Retired::one(&e));
         }
     }
 
@@ -557,7 +588,7 @@ mod tests {
     }
 
     fn del(s: &Shard, k: &[u8]) -> bool {
-        s.del(h(k), k, &epoch::pin())
+        s.del(h(k), k, &epoch::pin()).is_some()
     }
 
     #[test]
