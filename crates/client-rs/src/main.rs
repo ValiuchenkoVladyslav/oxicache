@@ -78,7 +78,7 @@ async fn main() -> Result<()> {
     match args.cmd {
         Cmd::Get { keys } => {
             let client = Client::connect_with_token(args.addr, token).await?;
-            let vals = client.get_multi(keys.iter().map(String::as_bytes)).await?;
+            let vals = client.get_multi(keys.as_slice()).await?;
             for (k, v) in keys.iter().zip(vals) {
                 match v {
                     Some(v) => println!("{k}: {}", String::from_utf8_lossy(&v)),
@@ -100,7 +100,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Del { keys } => {
             let client = Client::connect_with_token(args.addr, token).await?;
-            let flags = client.del_multi(keys.iter().map(String::as_bytes)).await?;
+            let flags = client.del_multi(keys.as_slice()).await?;
             for (k, f) in keys.iter().zip(flags) {
                 println!("{k}: {}", if f { "deleted" } else { "(nil)" });
             }
@@ -194,7 +194,7 @@ async fn bench(
                             ks.iter().map(|k| (*k, value.as_slice())).collect();
                         client.set_multi(pairs.iter().copied()).await?;
                     } else {
-                        let r = client.get_multi(ks.iter().copied()).await?;
+                        let r = client.get_multi(ks.as_slice()).await?;
                         hits.fetch_add(r.iter().flatten().count() as u64, Relaxed);
                     }
                     ops.fetch_add(batch as u64, Relaxed);

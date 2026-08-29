@@ -17,7 +17,7 @@ async fn start() -> (Arc<Server>, Client) {
 #[tokio::test]
 async fn get_set_del_over_tcp() {
     let (_server, client) = start().await;
-    assert_eq!(client.get_multi([&b"a"[..]]).await.unwrap(), vec![None]);
+    assert_eq!(client.get_multi([&b"a"[..]]).await.unwrap(), [None]);
     client
         .set_multi([(&b"a"[..], &b"1"[..]), (&b"b"[..], &[0u8, 1, 2][..])])
         .await
@@ -28,7 +28,7 @@ async fn get_set_del_over_tcp() {
         .unwrap();
     assert_eq!(
         got,
-        vec![
+        [
             Some(Bytes::from_static(b"1")),
             Some(Bytes::from_static(&[0, 1, 2])),
             None
@@ -36,9 +36,9 @@ async fn get_set_del_over_tcp() {
     );
     assert_eq!(
         client.del_multi([&b"a"[..], &b"zz"[..]]).await.unwrap(),
-        vec![true, false]
+        [true, false]
     );
-    assert_eq!(client.get_multi([&b"a"[..]]).await.unwrap(), vec![None]);
+    assert_eq!(client.get_multi([&b"a"[..]]).await.unwrap(), [None]);
 }
 
 #[tokio::test]
@@ -136,10 +136,10 @@ async fn token_auth() {
     c.set_multi([(&b"a"[..], &b"1"[..])]).await.unwrap();
     assert_eq!(
         c.get_multi([&b"a"[..]]).await.unwrap(),
-        vec![Some(Bytes::from_static(b"1"))]
+        [Some(Bytes::from_static(b"1"))]
     );
     c.auth(b"s3cret").await.unwrap();
-    assert_eq!(c.del_multi([&b"a"[..]]).await.unwrap(), vec![true]);
+    assert_eq!(c.del_multi([&b"a"[..]]).await.unwrap(), [true]);
 }
 
 #[tokio::test]
@@ -305,7 +305,7 @@ async fn byte_api_single_and_multi() {
             .iter()
             .map(|v| v.as_deref().map(<[u8]>::to_vec))
             .collect::<Vec<_>>(),
-        vec![Some(b"2".to_vec()), Some(b"3".to_vec()), None]
+        [Some(b"2".to_vec()), Some(b"3".to_vec()), None]
     );
     assert!(c.del("a").await.unwrap());
     assert!(!c.del("a").await.unwrap());
@@ -313,6 +313,6 @@ async fn byte_api_single_and_multi() {
         c.del_multi([&b"b"[..], &b"c"[..], &b"zz"[..]])
             .await
             .unwrap(),
-        vec![true, true, false]
+        [true, true, false]
     );
 }

@@ -75,13 +75,15 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
 
 ### Rust client API
 
-`get`/`set`/`del` act on one key; `get_multi`/`set_multi`/`del_multi` on several. On `Client`
-they take bytes. With `oxicache-client = { features = ["serde"] }`, `client.typed(format)`
-gives a `Typed<F>` whose same-named methods take any `Serialize` key or value and decode into
-any `DeserializeOwned` type. The crate ships no data format and never inspects the bytes:
-`F` is anything implementing the two-method `Format` trait — JSON, MessagePack, postcard, …
-— and only that choice decides what the cache stores (the byte client is still there as
-`typed.client()`):
+`get`/`set`/`del` act on one key; `get_multi`/`set_multi`/`del_multi` on several. Keys are
+any bytes (`&str`, `String`, `&[u8]`, `Vec<u8>`, `[u8; N]`); a batch of keys is a tuple (up to
+16), an array, a `Vec` or a slice, and comes back the same shape — an array for a tuple or
+array, a `Vec` for a `Vec` or slice. `Client::connect` gives a `Client<Raw>` whose values are
+bytes. With `oxicache-client = { features = ["serde"] }`, `client.with_format(f)` gives a
+`Client<F>` with the same method names taking any `Serialize` value and decoding into any
+`DeserializeOwned` type. The crate ships no data format and never inspects the bytes: `F` is
+anything implementing the two-method `Format` trait — JSON, MessagePack, postcard, … — and
+only that choice decides what the cache stores.
 
 ```rust
 struct Json;
@@ -89,24 +91,27 @@ impl Format for Json {
     fn encode<T: Serialize + ?Sized>(&self, v: &T) -> Result<Vec<u8>, BoxError> { Ok(serde_json::to_vec(v)?) }
     fn decode<T: DeserializeOwned>(&self, b: &[u8]) -> Result<T, BoxError> { Ok(serde_json::from_slice(b)?) }
 }
-let client = Client::connect(addr).await?.typed(Json);
+let client = Client::connect(addr).await?.with_format(Json);
 
 #[derive(Serialize, Deserialize)] struct User { id: u64, name: String }
 client.set("user:7", User { id: 7, name: "alice".into() }).await?;
-let user: Option<User> = client.get("user:7").await?;
+let user = client.get::<User>("user:7").await?;                            // Option<User>
 
-// several keys: a tuple gives one value type per key, an array or Vec one type for all
-let (user, hits): (Option<User>, Option<u64>) = client.get_multi(("user:7", "hits:7")).await?;
-let users: [Option<User>; 2] = client.get_multi(["user:7", "user:8"]).await?;
-let users: Vec<Option<User>> = client.get_multi(ids).await?;
+// several keys: name the value types, one per key for a tuple, one for all otherwise;
+// every slot is an Option, None for a missing key
+let (user, hits) = client.get_multi(("user:7", "hits:7")).decode::<(User, u64)>().await?;
+let users = client.get_multi(["user:7", "user:8"]).decode::<User>().await?; // [Option<User>; 2]
+let users = client.get_multi(ids).decode::<User>().await?;                  // Vec<Option<User>>
+let (user, hits): (Option<User>, Option<u64>) =                             // or from the binding
+    client.get_multi(("user:7", "hits:7")).decode().await?;
+let raw = client.get_multi(ids).await?;                                     // Vec<Option<Bytes>>, any client
 client.set_multi([("a", 1), ("b", 2)]).await?;
 let [a, b] = client.del_multi(("a", "b")).await?;
 ```
 
-A tuple of keys must be paired with a tuple of exactly as many value types (up to 16); a
-mismatch does not compile. Keys go through the format too, so `"k"` stored through `Typed` is
-a different key from `b"k"` stored through the byte `Client`. A format failure surfaces as
-`Error::Serialize` / `Error::Deserialize`.
+A tuple of keys must be paired with a tuple of exactly as many value types; a mismatch does
+not compile. A format failure surfaces as `Error::Serialize` / `Error::Deserialize`;
+`client.with_format(Raw)` on the same connection reads the stored bytes as they are.
 
 ## TypeScript client
 
