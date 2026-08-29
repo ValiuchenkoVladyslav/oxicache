@@ -148,3 +148,35 @@ async fn closed_connection_errors() {
     let dead = Client::connect("127.0.0.1:1".parse().unwrap()).await;
     assert!(matches!(dead, Err(Error::Io(_))));
 }
+
+/// A fake server that answers the first request correctly and then sends one
+/// extra, unsolicited OK frame: the client must not hand it to the next caller.
+#[tokio::test]
+async fn unsolicited_frame_closes_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut hdr = [0u8; 5];
+        s.read_exact(&mut hdr).await.unwrap();
+        let mut body = vec![0u8; oxicache_wire::decode_header(&hdr).1];
+        s.read_exact(&mut body).await.unwrap();
+        // Legit SET reply, then a stray one.
+        s.write_all(&oxicache_wire::encode_header(0, 0))
+            .await
+            .unwrap();
+        s.write_all(&oxicache_wire::encode_header(0, 0))
+            .await
+            .unwrap();
+        s.flush().await.unwrap();
+        // Keep the socket open; the client should still fail.
+        let _ = s.read(&mut hdr).await;
+    });
+    let c = Client::connect(addr).await.unwrap();
+    c.set([(&b"a"[..], &b"1"[..])]).await.unwrap();
+    // Without detection this call would receive the stray frame as its own
+    // reply and decode an empty body as a values list.
+    let err = c.get([&b"a"[..]]).await.unwrap_err();
+    assert!(matches!(err, Error::Closed), "{err}");
+}

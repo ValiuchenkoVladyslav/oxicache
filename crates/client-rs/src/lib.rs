@@ -161,8 +161,11 @@ async fn read_loop<R: AsyncRead + Unpin>(mut r: R, mut pending: mpsc::UnboundedR
         loop {
             match reader.next_buffered_owned() {
                 Ok(Some((status, body))) => {
-                    let Some(reply) = pending.recv().await else {
-                        return;
+                    // The writer queues a reply before it sends the request,
+                    // so a response with no reply waiting is unsolicited: the
+                    // stream is desynchronised and matching can't be trusted.
+                    let Ok(reply) = pending.try_recv() else {
+                        return; // dropping `pending` fails every queued caller with Closed
                     };
                     let res = match Status::from_u8(status) {
                         Some(Status::Ok) => Ok(body),
@@ -175,14 +178,14 @@ async fn read_loop<R: AsyncRead + Unpin>(mut r: R, mut pending: mpsc::UnboundedR
                     let fatal = matches!(res, Err(Error::InvalidStatus(_)));
                     let _ = reply.send(res);
                     if fatal {
-                        return; // dropping `pending` fails every queued caller with Closed
+                        return;
                     }
                 }
                 Ok(None) => break,
                 Err(wire::io::FrameTooLarge(n)) => {
                     // Tell the caller why instead of a bare `Closed`; the
                     // stream is desynchronised past this point, so stop.
-                    if let Some(reply) = pending.recv().await {
+                    if let Ok(reply) = pending.try_recv() {
                         let _ = reply.send(Err(Error::ResponseTooLarge(n)));
                     }
                     return;

@@ -121,3 +121,29 @@ describe("token auth", () => {
     c.close();
   });
 });
+
+describe("desync", () => {
+  test("unsolicited frame closes the connection", async () => {
+    const ok = new Uint8Array([0, 0, 0, 0, 0]); // status OK, empty body
+    const fake = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(s) {
+          // Reply to the request, then send one stray frame.
+          s.write(ok);
+          s.write(ok);
+        },
+      },
+    });
+    try {
+      const c = await Client.connect({ port: fake.port });
+      await c.set([["a", "1"]]);
+      const err = await c.get(["a"]).catch((e) => e);
+      expect(err).toBeInstanceOf(ClosedError);
+      expect(c.isOpen).toBe(false);
+    } finally {
+      fake.stop(true);
+    }
+  });
+});
