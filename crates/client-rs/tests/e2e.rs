@@ -1,19 +1,57 @@
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use oxicache_client::{Client, Error};
 use oxicache_server::{Cache, Options, Server};
 use oxicache_wire::Status;
 
-async fn start() -> (Arc<Server>, Client) {
-    let cache = Arc::new(Cache::new(64 << 20, 4));
-    let opts = Options {
-        token: b"t".to_vec(),
-    };
+fn serve(opts: Options) -> Arc<Server> {
+    let cache = Arc::new(Cache::new(
+        NonZeroUsize::new(64 << 20).unwrap(),
+        NonZeroUsize::new(4).unwrap(),
+    ));
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
+    server
+}
+
+async fn start() -> (Arc<Server>, Client) {
+    let server = serve(Options::new(b"t".to_vec()));
     let client = Client::connect(server.local_addr(), "t").await.unwrap();
     (server, client)
+}
+
+#[tokio::test]
+async fn ping_round_trips() {
+    let (_server, client) = start().await;
+    client.ping().await.unwrap();
+    client.set("k", 1u8).await.unwrap();
+    client.ping().await.unwrap();
+    assert_eq!(client.get::<u8>("k").await.unwrap(), Some(1));
+}
+
+#[tokio::test]
+async fn keepalive_outlives_the_server_idle_timeout() {
+    let idle = Duration::from_secs(1);
+    let server = serve(Options::new(b"t".to_vec()).idle_timeout(Some(idle)));
+    let addr = server.local_addr();
+    // Pinging every 200 ms keeps the connection open across 1.5 s of silence;
+    // the margins are wide because a loaded runner can stall timers.
+    let quiet = Client::connect_with(addr, "t", Duration::from_millis(200))
+        .await
+        .unwrap();
+    // The same silence with a heartbeat that never comes due is fatal, which
+    // is what proves the first client survived because of its pings.
+    let silent = Client::connect_with(addr, "t", Duration::from_secs(60))
+        .await
+        .unwrap();
+    quiet.set("k", 1u8).await.unwrap();
+    silent.set("k", 1u8).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(quiet.get::<u8>("k").await.unwrap(), Some(1));
+    assert!(matches!(silent.get::<u8>("k").await, Err(Error::Closed)));
 }
 
 #[tokio::test]
@@ -107,10 +145,11 @@ async fn bad_frame_reports_status() {
 
 #[tokio::test]
 async fn token_auth() {
-    let cache = Arc::new(Cache::new(64 << 20, 1));
-    let opts = Options {
-        token: b"s3cret".to_vec(),
-    };
+    let cache = Arc::new(Cache::new(
+        NonZeroUsize::new(64 << 20).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    ));
+    let opts = Options::new(b"s3cret".to_vec());
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });

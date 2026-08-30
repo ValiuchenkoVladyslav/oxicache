@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { Client, ClosedError, Status, StatusError } from "../src/index";
+import { Client, ClosedError, Op, Status, StatusError } from "../src/index";
 import { tcp } from "../src/transport/tcp";
 import { must } from "./must";
 import { startServer, type TestServer } from "./server";
@@ -189,6 +189,16 @@ describe("tcp transport e2e", () => {
     c.close();
   });
 
+  test("ping round-trips", async () => {
+    const c = await Client.connect(tcp({ port: server.port, token: "any" }));
+    await c.ping();
+    await c.set("p", 1);
+    await Promise.all([c.ping(), c.ping()]);
+    expect(await c.get<number>("p")).toBe(1);
+    c.close();
+    await expect(c.ping()).rejects.toBeInstanceOf(ClosedError);
+  });
+
   test("closed connection rejects in-flight and later calls", async () => {
     const c = await Client.connect(tcp({ port: server.port, token: "any" }));
     const inflight = c.get("x");
@@ -256,6 +266,120 @@ describe("desync", () => {
       const err = await c.get("a").catch((e) => e);
       expect(err).toBeInstanceOf(ClosedError);
       expect(c.isOpen).toBe(false);
+    } finally {
+      fake.stop(true);
+    }
+  });
+});
+
+describe("keepalive", () => {
+  test("keepaliveMs must be positive", async () => {
+    await Promise.all(
+      [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2147483648].map(
+        (keepaliveMs) =>
+          expect(tcp({ port: 1, token: "any", keepaliveMs })).rejects.toThrow(
+            RangeError,
+          ),
+      ),
+    );
+  });
+
+  test("a quiet connection outlives the server idle timeout", async () => {
+    const server = await startServer(["--idle-timeout", "1"]);
+    try {
+      // Pinging every 300 ms keeps the connection open across 1.5 s of
+      // silence; the default interval (100 s) never comes due, so that
+      // client is closed, which is what proves the pings did the work.
+      const quiet = await Client.connect(
+        tcp({ port: server.port, token: "any", keepaliveMs: 300 }),
+      );
+      const silent = await Client.connect(
+        tcp({ port: server.port, token: "any" }),
+      );
+      await quiet.set("k", 1);
+      await silent.set("k", 1);
+      await Bun.sleep(1500);
+      expect(await quiet.get<number>("k")).toBe(1);
+      await expect(silent.get("k")).rejects.toBeInstanceOf(ClosedError);
+      expect(quiet.isOpen).toBe(true);
+      expect(silent.isOpen).toBe(false);
+      quiet.close();
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("PING frames are sent after keepaliveMs without a write", async () => {
+    const ok = new Uint8Array([0, 0, 0, 0, 0]);
+    const ops: number[] = [];
+    const fake = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(s, chunk) {
+          // A chunk may carry several frames; walk them by header length.
+          let buf = chunk;
+          while (buf.length >= 5) {
+            ops.push(must(buf[0]));
+            const len = new DataView(buf.buffer, buf.byteOffset).getUint32(
+              1,
+              true,
+            );
+            buf = buf.subarray(5 + len);
+            s.write(ok);
+          }
+        },
+      },
+    });
+    try {
+      const c = await Client.connect(
+        tcp({ port: fake.port, token: "any", keepaliveMs: 100 }),
+      );
+      await Bun.sleep(400);
+      expect(ops[0]).toBe(Op.Auth);
+      expect(ops.filter((op) => op === Op.Ping).length).toBeGreaterThanOrEqual(
+        2,
+      );
+      expect(c.isOpen).toBe(true);
+      // A call re-arms the clock: no PING follows it within the interval.
+      await c.set("a", 1);
+      const before = ops.length;
+      await Bun.sleep(25);
+      expect(ops.length).toBe(before);
+      c.close();
+      const after = ops.length;
+      await Bun.sleep(250);
+      expect(ops.length).toBe(after); // closing stops the heartbeat
+    } finally {
+      fake.stop(true);
+    }
+  });
+
+  test("a heartbeat the server does not answer is not an error", async () => {
+    const ok = new Uint8Array([0, 0, 0, 0, 0]);
+    let authed = false;
+    const fake = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(s) {
+          if (!authed) {
+            authed = true;
+            s.write(ok); // accept AUTH
+            return;
+          }
+          s.end(); // hang up on the first PING
+        },
+      },
+    });
+    try {
+      const c = await Client.connect(
+        tcp({ port: fake.port, token: "any", keepaliveMs: 20 }),
+      );
+      await Bun.sleep(150);
+      // The failed ping is swallowed; the closure is reported by the next call.
+      expect(c.isOpen).toBe(false);
+      await expect(c.get("a")).rejects.toBeInstanceOf(ClosedError);
     } finally {
       fake.stop(true);
     }

@@ -23,9 +23,15 @@
 //! a tuple of keys (a mismatched count does not compile), a single type for
 //! an array, `Vec` or slice of keys — and every slot comes back as an
 //! `Option`, `None` for a missing key.
+//!
+//! The server closes a connection that stays silent for its idle timeout
+//! (300 s by default), so a client that has sent nothing for
+//! [`KEEPALIVE`](oxicache_wire::KEEPALIVE) (100 s) pings on its own; nothing
+//! is needed from the caller to keep a quiet client connected.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use oxicache_wire::io::{BUF, FrameReader, FrameWriter};
@@ -35,6 +41,7 @@ use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -181,12 +188,26 @@ impl Client {
     /// Connect and authenticate with `token` before returning; a wrong
     /// token is an [`Error::Status`] with `Unauthorized`.
     pub async fn connect(addr: SocketAddr, token: impl AsRef<[u8]>) -> Result<Self> {
+        Self::connect_with(addr, token, wire::KEEPALIVE).await
+    }
+
+    /// [`connect`](Self::connect) with a heartbeat interval other than
+    /// [`KEEPALIVE`](wire::KEEPALIVE): after `keepalive` without a write the
+    /// client pings so the server's idle timeout does not close it. Only
+    /// tests against a server with a short idle timeout need this.
+    #[doc(hidden)]
+    pub async fn connect_with(
+        addr: SocketAddr,
+        token: impl AsRef<[u8]>,
+        keepalive: Duration,
+    ) -> Result<Self> {
+        assert!(!keepalive.is_zero(), "a zero keepalive would ping non-stop");
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         let (r, w) = stream.into_split();
         let (tx, rx) = mpsc::channel::<(Op, Bytes, Reply)>(1024);
         let (pending_tx, pending_rx) = mpsc::unbounded_channel::<Reply>();
-        let writer = tokio::spawn(write_loop(w, rx, pending_tx));
+        let writer = tokio::spawn(write_loop(w, rx, pending_tx, keepalive));
         let reader = tokio::spawn(read_loop(r, pending_rx));
         let client = Self {
             tx,
@@ -205,6 +226,14 @@ impl Client {
             .await
             .map_err(|_| Error::Closed)?;
         rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Round-trip an empty request: `Ok` proves the connection is alive and
+    /// the server is answering. The client also does this on its own after
+    /// [`KEEPALIVE`](wire::KEEPALIVE) of silence.
+    pub async fn ping(&self) -> Result<()> {
+        self.call(Op::Ping, Bytes::new()).await?;
+        Ok(())
     }
 
     /// Fetch one key, decoding its value as `V`; `None` if it is missing.
@@ -341,30 +370,55 @@ impl<K: AsRef<[u8]>, V: DeserializeOwned> Values<V> for &[K] {
     }
 }
 
-/// Writes queued requests, coalescing everything already queued into one flush.
+/// Writes queued requests, coalescing everything already queued into one
+/// flush. After `keepalive` without a write it sends a PING whose reply is
+/// discarded, so the server's idle timeout never fires on a quiet client.
 async fn write_loop<W: AsyncWrite + Unpin>(
     mut w: W,
     mut rx: mpsc::Receiver<(Op, Bytes, Reply)>,
     pending: mpsc::UnboundedSender<Reply>,
+    keepalive: Duration,
 ) {
     // Request bodies were just encoded and are hot; copy them into the
     // coalescing buffer unless they are huge.
     let mut out = FrameWriter::with_inline_limit(BUF);
-    while let Some(mut msg) = rx.recv().await {
-        loop {
-            let (op, body, reply) = msg;
-            if pending.send(reply).is_err() {
-                return;
-            }
-            out.frame(op as u8, body);
-            match rx.try_recv() {
-                Ok(next) => msg = next,
-                Err(_) => break,
+    let idle = tokio::time::sleep(keepalive);
+    tokio::pin!(idle);
+    loop {
+        let msg = tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(msg) => Some(msg),
+                None => return,
+            },
+            () = idle.as_mut() => None,
+        };
+        match msg {
+            Some(mut msg) => loop {
+                let (op, body, reply) = msg;
+                if pending.send(reply).is_err() {
+                    return;
+                }
+                out.frame(op as u8, body);
+                match rx.try_recv() {
+                    Ok(next) => msg = next,
+                    Err(_) => break,
+                }
+            },
+            None => {
+                // The reply goes through the same in-order queue as every
+                // request, so the reader matches it; nobody waits on the
+                // receiver, and a send to it fails silently.
+                let (reply, _discard) = oneshot::channel();
+                if pending.send(reply).is_err() {
+                    return;
+                }
+                out.frame(Op::Ping as u8, Bytes::new());
             }
         }
         if out.flush(&mut w).await.is_err() {
             return;
         }
+        idle.as_mut().reset(Instant::now() + keepalive);
     }
 }
 

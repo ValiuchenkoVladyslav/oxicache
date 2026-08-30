@@ -1,15 +1,19 @@
 /**
  * TCP transport for the Bun runtime: one `Bun.connect` socket, requests
  * pipelined onto it. Everything issued in the same tick goes out in one
- * write and responses are matched to callers in order.
+ * write and responses are matched to callers in order. The server closes a
+ * connection that sends nothing for its idle timeout, so after `keepaliveMs`
+ * without a write the transport pings by itself.
  */
 import type { Socket } from "bun";
 import { ClosedError, StatusError, type Transport } from "../transport.js";
 import {
   type Bin,
   DecodeError,
+  encodePingFrame,
   encodeRawFrame,
   FrameReader,
+  KEEPALIVE_MS,
   Op,
   Status,
   toBytes,
@@ -20,6 +24,12 @@ export interface TcpOptions {
   port: number;
   /** Shared secret; AUTH is sent before `tcp` resolves and a refusal rejects it. */
   token: Bin;
+  /**
+   * Send a PING after this long without a write, so the server's idle
+   * timeout (300 s by default) never closes a quiet connection. Must be
+   * positive; defaults to `KEEPALIVE_MS` (100 s, a third of that timeout).
+   */
+  keepaliveMs?: number;
 }
 
 interface Pending {
@@ -28,6 +38,11 @@ interface Pending {
 }
 
 const utf8 = new TextDecoder();
+
+/** A heartbeat's outcome is not anyone's business: a dead connection is reported by the next call. */
+const ignore = () => {
+  // nothing to do
+};
 
 class TcpTransport implements Transport {
   private readonly pending: Pending[] = [];
@@ -38,16 +53,26 @@ class TcpTransport implements Transport {
   private flushScheduled: boolean = false;
   private closed: Error | null = null;
   private readonly reader: FrameReader;
+  private readonly keepaliveMs: number;
+  private keepalive: ReturnType<typeof setTimeout> | undefined;
   private socket!: Socket<undefined>;
 
   // Explicit rather than a field initialiser: Bun's coverage counts a
   // synthesised constructor as a function it never sees run.
-  private constructor() {
+  private constructor(keepaliveMs: number) {
     this.reader = new FrameReader();
+    this.keepaliveMs = keepaliveMs;
   }
 
   static async connect(opts: TcpOptions): Promise<TcpTransport> {
-    const t = new TcpTransport();
+    const keepaliveMs = opts.keepaliveMs ?? KEEPALIVE_MS;
+    // setTimeout clamps anything above 2^31-1 to 1 ms: a ping storm.
+    if (!(keepaliveMs > 0 && keepaliveMs <= 2147483647)) {
+      throw new RangeError(
+        `keepaliveMs must be in 1..2147483647, got ${keepaliveMs}`,
+      );
+    }
+    const t = new TcpTransport(keepaliveMs);
     // Any way the socket goes away ends with the same bookkeeping.
     const gone = (_s: unknown, err?: unknown) => t.onClose(err);
     t.socket = await Bun.connect({
@@ -82,6 +107,10 @@ class TcpTransport implements Transport {
     if (this.closed) return;
     this.socket.end();
     this.onClose();
+  }
+
+  async ping(): Promise<void> {
+    await this.request(encodePingFrame());
   }
 
   request(frame: Uint8Array): Promise<Uint8Array> {
@@ -128,6 +157,20 @@ class TcpTransport implements Transport {
     this.outboxBytes = 0;
     const n = this.socket.write(data);
     if (n < data.length) this.unsent = data.subarray(Math.max(n, 0));
+    this.armKeepalive();
+  }
+
+  /**
+   * (Re)start the idle clock from this write. The timer is unref'd so a
+   * forgotten client does not keep the process alive; the PING goes through
+   * `request` like any call, so its reply is matched in order and dropped.
+   */
+  private armKeepalive(): void {
+    clearTimeout(this.keepalive);
+    this.keepalive = setTimeout(() => {
+      this.ping().catch(ignore);
+    }, this.keepaliveMs);
+    this.keepalive.unref();
   }
 
   private onData(chunk: Uint8Array): void {
@@ -173,6 +216,7 @@ class TcpTransport implements Transport {
   private onClose(err?: unknown): void {
     if (this.closed) return;
     this.closed = err instanceof ClosedError ? err : new ClosedError(err);
+    clearTimeout(this.keepalive);
     this.outbox = [];
     this.outboxBytes = 0;
     this.unsent = null;

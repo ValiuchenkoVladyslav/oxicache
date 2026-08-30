@@ -60,6 +60,13 @@ describe("http transport e2e", () => {
     c.close(); // idempotent
   });
 
+  test("ping round-trips as POST /ping", async () => {
+    const c = await Client.connect(http({ url: server.url, token: "any" }));
+    await c.ping();
+    c.close();
+    await expect(c.ping()).rejects.toBeInstanceOf(ClosedError);
+  });
+
   test("large values", async () => {
     const c = await Client.connect(http({ url: server.url, token: "any" }));
     const big = new Uint8Array(4 << 20).fill(3);

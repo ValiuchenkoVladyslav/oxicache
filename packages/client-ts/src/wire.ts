@@ -9,6 +9,7 @@
  *   SET(2) entries -> empty
  *   DEL(3) keys    -> u32 count, count × u8 found
  *   AUTH(4) token  -> empty
+ *   PING(5) empty  -> empty
  */
 
 export const HEADER_LEN = 5;
@@ -22,6 +23,8 @@ export enum Op {
   Set = 2,
   Del = 3,
   Auth = 4,
+  /** Keeps a quiet connection open; the server ignores the body. */
+  Ping = 5,
 }
 
 export enum Status {
@@ -31,6 +34,13 @@ export enum Status {
   TooLarge = 3,
   Unauthorized = 4,
 }
+
+/**
+ * How long the TCP transport lets a connection go without a write before it
+ * sends a PING: a third of the server's default idle timeout (300 s), so two
+ * lost or late heartbeats still leave the connection open.
+ */
+export const KEEPALIVE_MS = 100_000;
 
 /** Anything accepted as a key or value. Strings are UTF-8 encoded. */
 export type Bin = string | Uint8Array;
@@ -161,6 +171,11 @@ export function encodeRawFrame(op: Op, body: Uint8Array): Uint8Array {
   w.u32(body.length);
   w.buf.set(body, w.pos);
   return w.buf;
+}
+
+/** A complete PING request: header only. */
+export function encodePingFrame(): Uint8Array {
+  return encodeRawFrame(Op.Ping, new Uint8Array(0));
 }
 
 /** Decode a GET response body; slices are views into `body`. */

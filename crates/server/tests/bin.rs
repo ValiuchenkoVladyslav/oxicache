@@ -1,5 +1,5 @@
 //! The `oxicache-server` binary: argument parsing, startup, serving and
-//! clean shutdown on SIGINT.
+//! clean shutdown on SIGINT or SIGTERM.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -25,6 +25,8 @@ fn cmd(args: &[&str], env: &[(&str, &str)]) -> Command {
         .env_remove("OXICACHE_CAPACITY")
         .env_remove("OXICACHE_SHARDS")
         .env_remove("OXICACHE_TOKEN")
+        .env_remove("OXICACHE_IDLE_TIMEOUT")
+        .env_remove("OXICACHE_MAX_CONNS")
         .env_remove("RUST_LOG")
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
@@ -109,9 +111,13 @@ impl Running {
 
     /// SIGINT, then wait; returns whether it exited cleanly and the whole
     /// output, log and warnings together.
-    fn interrupt(mut self) -> (bool, String) {
+    fn interrupt(self) -> (bool, String) {
+        self.signal("INT")
+    }
+
+    fn signal(mut self, sig: &str) -> (bool, String) {
         let ok = Command::new("kill")
-            .args(["-INT", &self.child.id().to_string()])
+            .args([&format!("-{sig}"), &self.child.id().to_string()])
             .status()
             .unwrap()
             .success();
@@ -171,6 +177,65 @@ fn serves_and_shuts_down_cleanly() {
     assert!(log.contains("cache ready"), "{log}");
     assert!(log.contains("shutting down"), "{log}");
     assert!(log.contains("draining connections"), "{log}");
+}
+
+#[test]
+fn sigterm_drains_and_exits_cleanly() {
+    let r = start(&["--capacity", "1M", "--shards", "1"], &[]);
+    let (conn, status, _) = get(r.addr, b"missing");
+    assert_eq!(status, Status::Ok);
+    let (ok, log) = r.signal("TERM");
+    drop(conn);
+    assert!(ok, "{log}");
+    assert!(log.contains("SIGTERM"), "{log}");
+    assert!(log.contains("draining connections"), "{log}");
+}
+
+#[test]
+fn idle_connections_are_closed() {
+    // Whole seconds on the flag; the shortest timeout is 1 s.
+    let r = start(&["--capacity", "1M", "--idle-timeout", "1"], &[]);
+    let (mut conn, status, _) = get(r.addr, b"k");
+    assert_eq!(status, Status::Ok);
+    let mut rest = Vec::new();
+    conn.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty(), "closed without a frame");
+    let (ok, log) = r.interrupt();
+    assert!(ok, "{log}");
+    assert!(log.contains("idle_timeout=1"), "{log}");
+}
+
+#[test]
+fn connection_limit_holds_the_next_peer_in_the_backlog() {
+    let r = start(
+        &["--capacity", "1M", "--max-conns", "1"],
+        &[("OXICACHE_MAX_CONNS", "5")],
+    );
+    let (first, status, _) = get(r.addr, b"k");
+    assert_eq!(status, Status::Ok);
+    let mut second = TcpStream::connect(r.addr).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    second
+        .write_all(&wire::encode_header(Op::Auth as u8, 1))
+        .unwrap();
+    second.write_all(b"t").unwrap();
+    let mut hdr = [0u8; wire::HEADER_LEN];
+    assert!(
+        second.read_exact(&mut hdr).is_err(),
+        "served over the limit"
+    );
+    drop(first);
+    second
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    second.read_exact(&mut hdr).unwrap();
+    assert_eq!(wire::decode_header(&hdr).0, Status::Ok as u8);
+    let (ok, log) = r.interrupt();
+    assert!(ok, "{log}");
+    assert!(log.contains("--max-conns=1"), "{log}");
+    assert!(log.contains("connection limit reached"), "{log}");
 }
 
 #[test]

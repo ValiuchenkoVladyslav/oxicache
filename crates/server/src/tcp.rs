@@ -8,13 +8,16 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use oxicache_wire::io::{FrameReader, FrameWriter};
 use oxicache_wire::{self as wire, Op, Status};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -35,36 +38,196 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Pause after a failed `accept`, so fd exhaustion does not spin a worker.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Settings for [`Server::bind`].
-#[derive(Clone, Debug)]
+/// Settings for [`Server::bind`] and [`HttpServer::bind`](crate::HttpServer::bind).
+/// Build with [`Options::new`] and the setters; a clone shares the
+/// connection budget with the original, so binding both front ends from one
+/// `Options` gives them one limit between them.
+#[derive(Clone)]
 pub struct Options {
     /// Shared secret every connection must present in an `Auth` frame before
     /// its first request. Must not be empty: there is no unauthenticated
     /// mode.
     pub token: Vec<u8>,
+    /// Close a connection that sends nothing for this long (on HTTP: a
+    /// keep-alive connection that starts no request). `None` never closes.
+    pub idle_timeout: Option<Duration>,
+    /// Cap on open connections across every listener bound with this
+    /// `Options`; `None` is unlimited.
+    pub limit: Option<Arc<ConnLimit>>,
+}
+
+/// Idle timeout every `Options` starts with: three client heartbeats
+/// ([`wire::KEEPALIVE`], 100 s), so a client on the default interval stays
+/// connected even if two pings in a row are lost or late.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(3 * wire::KEEPALIVE.as_secs());
+/// Connection cap every `Options` starts with.
+pub const DEFAULT_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(10_000).unwrap();
+
+impl Options {
+    /// [`DEFAULT_IDLE_TIMEOUT`] and [`DEFAULT_MAX_CONNECTIONS`]; both are
+    /// protective, so an embedder has to opt out of them with `None` rather
+    /// than remember to opt in.
+    pub fn new(token: impl Into<Vec<u8>>) -> Self {
+        Self {
+            token: token.into(),
+            idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            limit: Some(Arc::new(ConnLimit::new(DEFAULT_MAX_CONNECTIONS))),
+        }
+    }
+
+    pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
+    /// Allow at most `max` open connections in total; `None` lifts the cap.
+    pub fn max_connections(mut self, max: Option<NonZeroUsize>) -> Self {
+        self.limit = max.map(|n| Arc::new(ConnLimit::new(n)));
+        self
+    }
+}
+
+/// The token is a secret; a `{:?}` in a log must not print it.
+impl std::fmt::Debug for Options {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Options")
+            .field("token", &"<redacted>")
+            .field("idle_timeout", &self.idle_timeout)
+            .field("limit", &self.limit)
+            .finish()
+    }
+}
+
+/// A budget of open connections. Every listener takes a permit *before*
+/// `accept`, so a full server stops accepting (peers wait in the backlog)
+/// rather than accepting and dropping.
+#[derive(Debug)]
+pub struct ConnLimit {
+    sem: Arc<Semaphore>,
+    max: NonZeroUsize,
+    /// Accepted connections still being served. Distinct from the permits
+    /// in use: a listener parked in `accept` also holds one, and that is
+    /// not an open connection.
+    open: AtomicUsize,
+    /// Accepts that had to wait, for rate-limiting the warning.
+    hits: AtomicU64,
+}
+
+/// One warning per this many blocked accepts, so a saturated server does
+/// not flood the log.
+const LIMIT_WARN_EVERY: u64 = 1000;
+
+impl ConnLimit {
+    pub fn new(max: NonZeroUsize) -> Self {
+        Self {
+            sem: Arc::new(Semaphore::new(max.get())),
+            max,
+            open: AtomicUsize::new(0),
+            hits: AtomicU64::new(0),
+        }
+    }
+
+    pub fn max(&self) -> NonZeroUsize {
+        self.max
+    }
+
+    /// Connections currently open under this budget.
+    pub fn open(&self) -> usize {
+        self.open.load(Ordering::Relaxed)
+    }
+
+    /// Wait for a free slot; the permit is released when dropped.
+    async fn acquire(&self) -> OwnedSemaphorePermit {
+        if let Ok(p) = self.sem.clone().try_acquire_owned() {
+            return p;
+        }
+        // Another listener parked in `accept` may hold the last permit
+        // while a slot is still free; that is not the limit being hit.
+        if self.open() >= self.max.get()
+            && self
+                .hits
+                .fetch_add(1, Ordering::Relaxed)
+                .is_multiple_of(LIMIT_WARN_EVERY)
+        {
+            warn!(max = self.max, "connection limit reached, not accepting");
+        }
+        self.sem
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("never closed")
+    }
+}
+
+/// Take a permit if there is a limit; both accept loops call this before
+/// `accept`.
+pub(crate) async fn admit(limit: Option<&Arc<ConnLimit>>) -> Option<OwnedSemaphorePermit> {
+    match limit {
+        Some(l) => Some(l.acquire().await),
+        None => None,
+    }
+}
+
+/// An accepted connection's slot: counted as open for as long as it lives,
+/// and holding the permit that `admit` took for it.
+pub(crate) struct Slot {
+    _permit: Option<OwnedSemaphorePermit>,
+    limit: Option<Arc<ConnLimit>>,
+}
+
+impl Slot {
+    pub(crate) fn open(
+        limit: Option<&Arc<ConnLimit>>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
+        if let Some(l) = limit {
+            l.open.fetch_add(1, Ordering::Relaxed);
+        }
+        Self {
+            _permit: permit,
+            limit: limit.cloned(),
+        }
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        if let Some(l) = &self.limit {
+            l.open.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 pub struct Server {
     listener: std::net::TcpListener,
     cache: Arc<Cache>,
     token: Arc<[u8]>,
+    idle_timeout: Option<Duration>,
+    limit: Option<Arc<ConnLimit>>,
 }
 
 impl Server {
     /// Bind `addr` serving `cache`; every connection must authenticate with
     /// `opts.token`.
     pub fn bind(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
-        let token = token(opts)?;
+        let token = token(&opts)?;
         let listener = listener(addr).map_err(|source| Error::Bind { addr, source })?;
         Ok(Self {
             listener,
             cache,
             token,
+            idle_timeout: opts.idle_timeout,
+            limit: opts.limit,
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.listener.local_addr().expect("bound listener")
+    }
+
+    /// Connections open under the shared limit, if there is one.
+    pub fn open_connections(&self) -> Option<usize> {
+        self.limit.as_ref().map(|l| l.open())
     }
 
     /// Accept connections on the current runtime until the task is dropped.
@@ -79,7 +242,7 @@ impl Server {
         let l = self.listener.try_clone().expect("clone listener");
         let mut conns = JoinSet::new();
         tokio::select! {
-            _ = accept_loop(l, self.cache.clone(), self.token.clone(), &mut conns) => {}
+            _ = accept_loop(l, self, &mut conns) => {}
             _ = shutdown => {}
         }
         if conns.is_empty() {
@@ -95,11 +258,11 @@ impl Server {
 }
 
 /// Validate the shared secret; shared by both front ends.
-pub(crate) fn token(opts: Options) -> Result<Arc<[u8]>> {
+pub(crate) fn token(opts: &Options) -> Result<Arc<[u8]>> {
     if opts.token.is_empty() {
         return Err(Error::EmptyToken);
     }
-    Ok(Arc::from(opts.token))
+    Ok(Arc::from(opts.token.as_slice()))
 }
 
 /// A non-blocking listening socket with `SO_REUSEADDR`, shared by both front ends.
@@ -113,23 +276,25 @@ pub(crate) fn listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListene
     Ok(socket.into())
 }
 
-async fn accept_loop(
-    listener: std::net::TcpListener,
-    cache: Arc<Cache>,
-    token: Arc<[u8]>,
-    conns: &mut JoinSet<()>,
-) {
+async fn accept_loop(listener: std::net::TcpListener, server: &Server, conns: &mut JoinSet<()>) {
     let listener = TcpListener::from_std(listener).expect("register listener");
     loop {
         // Reap finished tasks so the set does not grow with every connection.
         while conns.try_join_next().is_some() {}
+        let permit = admit(server.limit.as_ref()).await;
         match listener.accept().await {
             Ok((stream, remote)) => {
-                let (cache, token) = (cache.clone(), token.clone());
+                let (cache, token) = (server.cache.clone(), server.token.clone());
+                let idle = server.idle_timeout;
+                let slot = Slot::open(server.limit.as_ref(), permit);
                 conns.spawn(async move {
+                    // Held until the connection is done, whatever the reason.
+                    let _slot = slot;
                     debug!(%remote, "connection open");
-                    if let Err(e) = serve_connection(stream, &cache, &token).await {
-                        debug!(%remote, error = %e, "connection closed");
+                    match serve_connection(stream, &cache, &token, idle).await {
+                        Ok(true) => debug!(%remote, "idle connection closed"),
+                        Ok(false) => {}
+                        Err(e) => debug!(%remote, error = %e, "connection closed"),
                     }
                 });
             }
@@ -141,7 +306,13 @@ async fn accept_loop(
     }
 }
 
-async fn serve_connection(stream: TcpStream, cache: &Cache, token: &[u8]) -> std::io::Result<()> {
+/// Serve one connection to its end; `Ok(true)` means the idle timeout closed it.
+async fn serve_connection(
+    stream: TcpStream,
+    cache: &Cache,
+    token: &[u8],
+    idle: Option<Duration>,
+) -> std::io::Result<bool> {
     stream.set_nodelay(true)?;
     let (mut r, mut w) = stream.into_split();
     let mut authed = false;
@@ -164,21 +335,44 @@ async fn serve_connection(stream: TcpStream, cache: &Cache, token: &[u8]) -> std
                             Bytes::from_static(b"auth required"),
                         );
                         out.flush(&mut w).await?;
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
                     out.frame(Status::TooLarge as u8, Bytes::from(e.to_string()));
                     out.flush(&mut w).await?;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
-        out.flush(&mut w).await?;
-        if !reader.fill(&mut r).await? {
-            return Ok(());
+        // The flush is under the same clock: a peer that stops reading would
+        // otherwise park this task (and its connection slot) forever.
+        let Some(()) = within(idle, out.flush(&mut w)).await? else {
+            return Ok(true);
+        };
+        // The clock restarts at every wait, so a peer only has to move
+        // something within each `idle` window, not finish a request.
+        let Some(filled) = within(idle, reader.fill(&mut r)).await? else {
+            return Ok(true);
+        };
+        if !filled {
+            return Ok(false);
         }
+    }
+}
+
+/// Run `fut` with the idle deadline, if there is one; `None` means it hit it.
+async fn within<T>(
+    idle: Option<Duration>,
+    fut: impl Future<Output = std::io::Result<T>>,
+) -> std::io::Result<Option<T>> {
+    match idle {
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(res) => res.map(Some),
+            Err(_) => Ok(None),
+        },
+        None => fut.await.map(Some),
     }
 }
 
@@ -235,8 +429,10 @@ pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
             out.put_slice(&(keys.len() as u32).to_le_bytes());
             cache.del_many(keys, |found| out.put_slice(&[found as u8]));
         }),
-        // Already authenticated: a no-op.
-        Some(Op::Auth) => {
+        // AUTH here means already authenticated: a no-op. PING is the
+        // client's heartbeat; its body is ignored rather than validated, so
+        // a future client can attach something without being refused.
+        Some(Op::Auth | Op::Ping) => {
             out.header(Status::Ok as u8, 0);
             Ok(())
         }
@@ -270,7 +466,10 @@ mod tests {
 
     #[test]
     fn dispatch_roundtrip() {
-        let cache = Cache::new(1 << 20, 2);
+        let cache = Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+        );
         let big = vec![9u8; wire::io::INLINE_BODY * 2];
         let (st, _) = call(
             &cache,
@@ -302,8 +501,27 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_ping_is_ok_and_ignores_its_body() {
+        let cache = Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        assert_eq!(
+            call(&cache, Op::Ping as u8, Bytes::new()),
+            (Status::Ok, Bytes::new())
+        );
+        assert_eq!(
+            call(&cache, Op::Ping as u8, Bytes::from_static(b"anything")),
+            (Status::Ok, Bytes::new())
+        );
+    }
+
+    #[test]
     fn dispatch_errors() {
-        let cache = Cache::new(1 << 20, 1);
+        let cache = Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
         assert_eq!(call(&cache, 42, Bytes::new()).0, Status::UnknownOp);
         assert_eq!(
             call(&cache, Op::Get as u8, Bytes::from_static(&[9, 0])).0,
@@ -324,7 +542,10 @@ mod tests {
 
     #[test]
     fn oversized_set_is_rejected_whole() {
-        let cache = Cache::new(1 << 20, 1);
+        let cache = Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
         let big = vec![0u8; 1 << 20];
         let (st, _) = call(
             &cache,
@@ -340,32 +561,110 @@ mod tests {
     }
 
     fn opts() -> Options {
-        Options {
-            token: b"t".to_vec(),
-        }
+        Options::new(b"t".to_vec())
     }
 
     fn server() -> Arc<Server> {
-        let cache = Arc::new(Cache::new(1 << 20, 1));
-        Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts()).unwrap())
+        server_with(opts())
+    }
+
+    fn server_with(opts: Options) -> Arc<Server> {
+        let cache = Arc::new(Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        ));
+        Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap())
     }
 
     #[test]
     fn bind_failure_is_reported() {
         let first = server();
-        let cache = Arc::new(Cache::new(1 << 20, 1));
+        let cache = Arc::new(Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        ));
         let err = Server::bind(first.local_addr(), cache.clone(), opts())
             .err()
             .expect("port in use");
         assert!(matches!(err, Error::Bind { addr, .. } if addr == first.local_addr()));
-        let err = Server::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            cache,
-            Options { token: Vec::new() },
-        )
-        .err()
-        .expect("empty token");
+        let err = Server::bind("127.0.0.1:0".parse().unwrap(), cache, Options::new(""))
+            .err()
+            .expect("empty token");
         assert!(matches!(err, Error::EmptyToken), "{err}");
+    }
+
+    /// PING is an op like any other: before AUTH it is refused and the
+    /// connection closed, so it cannot be used to probe without a token.
+    #[tokio::test]
+    async fn ping_before_auth_is_unauthorized() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let s = server();
+        let addr = s.local_addr();
+        tokio::spawn(async move { s.run().await });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(&wire::encode_header(Op::Ping as u8, 0))
+            .await
+            .unwrap();
+        let mut hdr = [0u8; wire::HEADER_LEN];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(wire::decode_header(&hdr).0, Status::Unauthorized as u8);
+        let mut rest = Vec::new();
+        c.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"auth required");
+    }
+
+    /// A peer that sends a batch and then never reads its reply is closed
+    /// by the idle timeout too, so it cannot pin a connection slot.
+    #[tokio::test]
+    async fn stalled_reader_is_closed_after_the_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cache = Arc::new(Cache::new(
+            NonZeroUsize::new(64 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        ));
+        let opts = opts().idle_timeout(Some(Duration::from_millis(200)));
+        let s = Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap();
+        let addr = s.local_addr();
+        tokio::spawn(async move { s.run().await });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        auth(&mut c).await;
+        // Store a value too big for the socket buffers to absorb unread.
+        let big = vec![7u8; 4 << 20];
+        let mut set = Vec::new();
+        set.extend_from_slice(&1u32.to_le_bytes());
+        set.extend_from_slice(&1u32.to_le_bytes());
+        set.push(b'k');
+        set.extend_from_slice(&(big.len() as u32).to_le_bytes());
+        set.extend_from_slice(&big);
+        c.write_all(&wire::encode_header(Op::Set as u8, set.len()))
+            .await
+            .unwrap();
+        c.write_all(&set).await.unwrap();
+        let mut hdr = [0u8; wire::HEADER_LEN];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(wire::decode_header(&hdr), (Status::Ok as u8, 0));
+        // 15 × 4 MiB stays under the response cap but far above what the
+        // socket buffers can absorb unread.
+        let mut get = Vec::new();
+        get.extend_from_slice(&15u32.to_le_bytes());
+        for _ in 0..15 {
+            get.extend_from_slice(&1u32.to_le_bytes());
+            get.push(b'k');
+        }
+        c.write_all(&wire::encode_header(Op::Get as u8, get.len()))
+            .await
+            .unwrap();
+        c.write_all(&get).await.unwrap();
+        // Do not read for a while: the server's flush blocks on our full
+        // receive buffer, gives up, and closes. Draining afterwards must
+        // then end well short of the full 60 MiB reply.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let mut drained = Vec::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut drained))
+            .await
+            .expect("closed by the server")
+            .unwrap_or(drained.len());
+        assert!(n < 15 * big.len(), "reply was not cut short: {n} bytes");
     }
 
     /// Authenticate `c` with the test token, as every client must.
@@ -450,9 +749,63 @@ mod tests {
         assert_eq!(wire::decode_header(&hdr).0, Status::BadRequest as u8);
     }
 
+    #[tokio::test]
+    async fn idle_connection_is_closed_after_the_timeout() {
+        use tokio::io::AsyncReadExt;
+        let s = server_with(opts().idle_timeout(Some(Duration::from_millis(200))));
+        let addr = s.local_addr();
+        tokio::spawn(async move { s.run().await });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        auth(&mut c).await;
+        let start = std::time::Instant::now();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut rest))
+            .await
+            .expect("closed by the server")
+            .unwrap();
+        assert!(rest.is_empty());
+        assert!(start.elapsed() >= Duration::from_millis(150), "not before");
+    }
+
+    #[tokio::test]
+    async fn connections_over_the_limit_wait_for_a_slot() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let s = server_with(opts().max_connections(NonZeroUsize::new(1)));
+        let addr = s.local_addr();
+        let srv = s.clone();
+        tokio::spawn(async move { srv.run().await });
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        auth(&mut first).await;
+        assert_eq!(s.open_connections(), Some(1));
+        // The second lands in the backlog: connected, but nobody answers.
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second
+            .write_all(&wire::encode_header(Op::Auth as u8, 1))
+            .await
+            .unwrap();
+        second.write_all(b"t").await.unwrap();
+        let mut hdr = [0u8; wire::HEADER_LEN];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), second.read_exact(&mut hdr))
+                .await
+                .is_err(),
+            "served while the limit is reached"
+        );
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(5), second.read_exact(&mut hdr))
+            .await
+            .expect("served once a slot frees up")
+            .unwrap();
+        assert_eq!(wire::decode_header(&hdr).0, Status::Ok as u8);
+        assert_eq!(s.open_connections(), Some(1));
+    }
+
     #[test]
     fn oversized_response_is_refused() {
-        let cache = Cache::new(256 << 20, 1);
+        let cache = Cache::new(
+            NonZeroUsize::new(256 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
         let v = vec![0u8; MAX_RESPONSE / 2];
         cache.set(b"a", &v).unwrap();
         cache.set(b"b", &v).unwrap();

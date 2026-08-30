@@ -15,7 +15,7 @@ runtimes without sockets), tokio multi-threaded runtime. No persistence.
 
 ## Protocol
 
-Three commands, all batch-only (a single op is a batch of one), as length-prefixed frames
+Three commands, all batch-only (a single op is a batch of one), plus AUTH and PING, as length-prefixed frames
 on a TCP connection. Requests on one connection are answered in order, so clients pipeline
 freely. Values are opaque bytes. Integers are little-endian.
 
@@ -28,6 +28,7 @@ op 1 GET  body: keys     -> u32 count, count × (u8 0 | u8 1, u32 len, value)
 op 2 SET  body: entries  -> empty
 op 3 DEL  body: keys     -> u32 count, count × u8 found
 op 4 AUTH body: token    -> empty
+op 5 PING body: empty    -> empty
 status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized (body = message)
 ```
 
@@ -39,6 +40,11 @@ closed. There is no unauthenticated mode on either side: the Rust
 `OXICACHE_TOKEN` (it also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
 tunnel.
 
+A connection that sends nothing for `--idle-timeout` (default 300 s) is closed, so both TCP
+clients PING on their own after 100 s without a write — a third of that default, so two lost
+heartbeats still leave the connection open. PING is authenticated like everything else and
+its body is ignored.
+
 ### HTTP
 
 With `--http-addr` (or `OXICACHE_HTTP_ADDR`) the server also listens for HTTP/1.1, carrying the
@@ -49,6 +55,7 @@ the response body is the frame body, and the frame status becomes the HTTP statu
 POST /get   body: keys      -> 200, body: values
 POST /set   body: entries   -> 200, empty
 POST /del   body: keys      -> 200, body: flags
+POST /ping                  -> 200, empty
 GET  /health                -> 200, no body; never needs a token
 400 bad request | 401 unauthorized | 404 unknown path | 405 wrong method | 413 too large
 ```
@@ -65,9 +72,13 @@ cargo run --release -p oxicache-server -- --addr 0.0.0.0:4433 --http-addr 0.0.0.
 # --shards N      independent S3-FIFO shards (default: CPUs)
 # --token T       the shared secret (or OXICACHE_TOKEN in the environment); required
 # --http-addr A   also serve the HTTP API on A (off unless given)
+# --idle-timeout S close a connection that sends nothing for S seconds (default 300)
+# --max-conns N   at most N open connections, TCP and HTTP together (default 10000);
+#                 beyond it the listeners stop accepting until one closes
 # every server flag has an environment variable: OXICACHE_ADDR, OXICACHE_HTTP_ADDR,
-# OXICACHE_CAPACITY, OXICACHE_SHARDS, OXICACHE_TOKEN; a flag wins over a differing
-# variable, with a warning
+# OXICACHE_CAPACITY, OXICACHE_SHARDS, OXICACHE_TOKEN, OXICACHE_IDLE_TIMEOUT,
+# OXICACHE_MAX_CONNS; a flag wins over a differing variable, with a warning
+# SIGINT or SIGTERM stops accepting and drains open connections before exit
 
 cargo run --release -p oxicache-client -- set a 1 b 2
 cargo run --release -p oxicache-client -- get a b c
@@ -108,6 +119,9 @@ let [a, b] = client.del_multi(("a", "b")).await?;
 A tuple of keys must be paired with a tuple of exactly as many value types; a mismatch does
 not compile. An encoding failure surfaces as `Error::Serialize`, a stored value that is not
 the named type as `Error::Deserialize`; the connection stays usable after either.
+`client.ping()` round-trips an empty request; the client also pings by itself after 100 s
+(`oxicache_wire::KEEPALIVE`) without a write, so a quiet connection survives the server's
+300 s idle timeout.
 
 ## TypeScript client
 
@@ -156,6 +170,10 @@ keys it is a tuple with exactly one type per key. A non-OK status rejects with `
 (`.status` is the `Status` enum), a closed transport with `ClosedError`. On TCP, calls issued in
 the same tick are coalesced into one write; on HTTP each call is its own request and a refused
 one does not end the transport. `http({ fetch })` takes a custom `fetch` for agents or tests.
+`c.ping()` round-trips an empty request (`POST /ping` on HTTP). The TCP transport also pings
+by itself after `keepaliveMs` (default 100 000, a third of the server's 300 s idle timeout)
+without a write, on an unref'd timer, so a quiet connection stays open without keeping the
+process alive; HTTP needs no heartbeat, since each call is its own request.
 
 ## Development
 
@@ -192,8 +210,14 @@ The pre-commit hook (`.husky/pre-commit`) runs `cargo fmt --check`, `clippy -D w
   One listener; accepted connections are spread over the runtime's worker threads. The
   HTTP front end (hyper, HTTP/1.1) is a second listener over the same dispatch, one request
   per exchange; bodies are bounded to the frame limit before and while reading.
-  Frames are capped at 64 MiB each way; there is no connection limit or idle timeout,
-  so put the server on a private network.
+  Frames are capped at 64 MiB each way. `--max-conns` is one semaphore shared by both
+  listeners, taken before `accept` so an over-limit peer waits in the kernel backlog
+  instead of being accepted and dropped; `--idle-timeout` closes a TCP connection that
+  sends nothing for that long (hyper's per-request header timeout does the same for
+  HTTP keep-alive). Defaults: 10 000 connections, 300 s idle; the library `Options` can
+  lift either with `None`, the binary cannot. TCP clients send a PING after 100 s without
+  a write (`oxicache_wire::KEEPALIVE`; the server default is three of them), so a quiet
+  connection is not mistaken for a dead one. Still put the server on a private network.
 - 64-bit targets only: index slots pack a 48-bit entry address next to a 16-bit tag.
 - The client pipelines calls from any number of tasks onto one connection (writer task
   coalesces queued frames into one flush; reader task matches responses in order).

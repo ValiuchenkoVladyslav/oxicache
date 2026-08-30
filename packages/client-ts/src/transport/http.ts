@@ -4,7 +4,7 @@
  * runtimes, lambdas); nothing here touches Bun's socket API.
  */
 import { ClosedError, StatusError, type Transport } from "../transport.js";
-import { HEADER_LEN, Op, Status } from "../wire.js";
+import { encodePingFrame, HEADER_LEN, Op, Status } from "../wire.js";
 
 export interface HttpOptions {
   /** Base URL of the server's HTTP listener, e.g. `http://127.0.0.1:4434`. */
@@ -23,6 +23,7 @@ const PATH: Readonly<Record<Op, string>> = {
   [Op.Set]: "/set",
   [Op.Del]: "/del",
   [Op.Auth]: "",
+  [Op.Ping]: "/ping",
 };
 
 /** HTTP status codes the server uses for each frame status. */
@@ -71,6 +72,10 @@ class HttpTransport implements Transport {
     if (status === undefined)
       throw new Error(`server returned HTTP ${res.status}: ${message}`);
     throw new StatusError(status, message);
+  }
+
+  async ping(): Promise<void> {
+    await this.request(encodePingFrame());
   }
 
   get isOpen(): boolean {

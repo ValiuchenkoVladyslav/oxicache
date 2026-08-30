@@ -438,6 +438,11 @@ export class Client {
     return many ? flags : (flags[0] ?? false);
   }
 
+  /** Round-trip an empty request: resolves once the server has answered. */
+  ping(): Promise<void> {
+    return this.transport.ping();
+  }
+
   /** Whether the transport is still usable. */
   get isOpen(): boolean {
     return this.transport.isOpen;

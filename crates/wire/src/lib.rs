@@ -19,12 +19,19 @@
 //! op SET(2)   body: entries   -> empty
 //! op DEL(3)   body: keys      -> u32 count, count × u8 found
 //! op AUTH(4)  body: token     -> empty
+//! op PING(5)  body: ignored   -> empty
 //! ```
 //!
 //! A non-OK status carries a UTF-8 message as its body. When the server is
 //! started with a token, AUTH must be the first request on a connection;
 //! any other request before a successful AUTH is answered with
 //! `Unauthorized` and the connection is closed.
+//!
+//! PING exists because the server closes a connection that sends nothing
+//! for its idle timeout: a client that may sit quiet sends one every
+//! [`KEEPALIVE`] to stay connected.
+
+use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -42,6 +49,8 @@ pub enum Op {
     Set = 2,
     Del = 3,
     Auth = 4,
+    /// Keeps a quiet connection open; the body is ignored.
+    Ping = 5,
 }
 
 impl Op {
@@ -51,6 +60,7 @@ impl Op {
             2 => Some(Op::Set),
             3 => Some(Op::Del),
             4 => Some(Op::Auth),
+            5 => Some(Op::Ping),
             _ => None,
         }
     }
@@ -122,6 +132,11 @@ pub const MAX_FRAME: usize = 64 << 20;
 /// of empty keys encodes ~16.7 M of them, and the server's per-request
 /// scratch space grows with that count.
 pub const MAX_ITEMS: usize = 1 << 16;
+/// How long a client lets a connection go without sending anything before
+/// it sends a PING. A third of the server's default idle timeout
+/// (`oxicache_server::DEFAULT_IDLE_TIMEOUT` is defined as three of these),
+/// so the connection survives two lost or late heartbeats.
+pub const KEEPALIVE: Duration = Duration::from_secs(100);
 
 #[inline]
 fn need(buf: &Bytes, n: usize) -> Result<()> {

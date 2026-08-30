@@ -6,4 +6,4 @@ pub mod tcp;
 pub use cache::Cache;
 pub use error::{Error, Result};
 pub use http::HttpServer;
-pub use tcp::{Options, Server};
+pub use tcp::{ConnLimit, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, Options, Server};

@@ -1,15 +1,17 @@
 //! The `oxicache-cli` binary against an in-process server.
 
+use std::num::NonZeroUsize;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
 use oxicache_server::{Cache, Options, Server};
 
 async fn start(token: &[u8]) -> Arc<Server> {
-    let cache = Arc::new(Cache::new(64 << 20, 2));
-    let opts = Options {
-        token: token.to_vec(),
-    };
+    let cache = Arc::new(Cache::new(
+        NonZeroUsize::new(64 << 20).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+    ));
+    let opts = Options::new(token.to_vec());
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });

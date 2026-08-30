@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use oxicache_client::{Client, Error};
@@ -6,10 +7,11 @@ use oxicache_server::{Cache, Options, Server};
 use serde::{Deserialize, Serialize};
 
 async fn start() -> (Arc<Server>, Client) {
-    let cache = Arc::new(Cache::new(64 << 20, 2));
-    let opts = Options {
-        token: b"t".to_vec(),
-    };
+    let cache = Arc::new(Cache::new(
+        NonZeroUsize::new(64 << 20).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+    ));
+    let opts = Options::new(b"t".to_vec());
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });

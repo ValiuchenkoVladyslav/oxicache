@@ -32,6 +32,8 @@ export interface Transport {
    * dead transport with `ClosedError`.
    */
   request(frame: Uint8Array): Promise<Uint8Array>;
+  /** Round-trip an empty request; resolves once the server has answered. */
+  ping(): Promise<void>;
   /** Whether requests can still be made. */
   readonly isOpen: boolean;
   /** Release the transport; in-flight and later requests reject with `ClosedError`. */

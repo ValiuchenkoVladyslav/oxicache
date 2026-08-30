@@ -7,6 +7,7 @@
 //! POST /get   body: keys      -> 200, body: values
 //! POST /set   body: entries   -> 200, empty
 //! POST /del   body: keys      -> 200, body: flags
+//! POST /ping                  -> 200, empty
 //! GET  /health                -> 200, empty (no authentication)
 //!
 //! 400 bad request | 401 unauthorized | 404 unknown path | 405 wrong method
@@ -28,7 +29,7 @@ use hyper::body::{Body, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, header};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use oxicache_wire::io::FrameWriter;
 use oxicache_wire::{self as wire, Op, Status};
 use tokio::net::TcpListener;
@@ -38,7 +39,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::Cache;
 use crate::error::{Error, Result};
-use crate::tcp::{self, MAX_FRAME, Options};
+use crate::tcp::{self, ConnLimit, MAX_FRAME, Options};
 
 /// How long in-flight requests get to finish at shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -48,23 +49,32 @@ pub struct HttpServer {
     listener: std::net::TcpListener,
     cache: Arc<Cache>,
     token: Arc<[u8]>,
+    idle_timeout: Option<Duration>,
+    limit: Option<Arc<ConnLimit>>,
 }
 
 impl HttpServer {
     /// Bind `addr` serving `cache`; every request except `/health` must
     /// carry `opts.token`.
     pub fn bind(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
-        let token = tcp::token(opts)?;
+        let token = tcp::token(&opts)?;
         let listener = tcp::listener(addr).map_err(|source| Error::Bind { addr, source })?;
         Ok(Self {
             listener,
             cache,
             token,
+            idle_timeout: opts.idle_timeout,
+            limit: opts.limit,
         })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
         self.listener.local_addr().expect("bound listener")
+    }
+
+    /// Connections open under the shared limit, if there is one.
+    pub fn open_connections(&self) -> Option<usize> {
+        self.limit.as_ref().map(|l| l.open())
     }
 
     /// Accept connections on the current runtime until the task is dropped.
@@ -80,7 +90,7 @@ impl HttpServer {
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut conns = JoinSet::new();
         tokio::select! {
-            _ = accept_loop(l, self.cache.clone(), self.token.clone(), stop_rx, &mut conns) => {}
+            _ = accept_loop(l, self, stop_rx, &mut conns) => {}
             _ = shutdown => {}
         }
         if conns.is_empty() {
@@ -98,25 +108,36 @@ impl HttpServer {
 
 async fn accept_loop(
     listener: std::net::TcpListener,
-    cache: Arc<Cache>,
-    token: Arc<[u8]>,
+    server: &HttpServer,
     stop: watch::Receiver<bool>,
     conns: &mut JoinSet<()>,
 ) {
     let listener = TcpListener::from_std(listener).expect("register listener");
     loop {
         while conns.try_join_next().is_some() {}
+        let permit = tcp::admit(server.limit.as_ref()).await;
         match listener.accept().await {
             Ok((stream, remote)) => {
-                let (cache, token, mut stop) = (cache.clone(), token.clone(), stop.clone());
+                let (cache, token, mut stop) =
+                    (server.cache.clone(), server.token.clone(), stop.clone());
+                let idle = server.idle_timeout;
+                let slot = tcp::Slot::open(server.limit.as_ref(), permit);
                 conns.spawn(async move {
+                    let _slot = slot;
                     debug!(%remote, "http connection open");
                     let _ = stream.set_nodelay(true);
                     let svc = service_fn(move |req| {
                         let (cache, token) = (cache.clone(), token.clone());
                         async move { Ok::<_, hyper::Error>(handle(req, &cache, &token).await) }
                     });
-                    let conn = http1::Builder::new().serve_connection(TokioIo::new(stream), svc);
+                    // hyper re-arms its header timeout for every request on
+                    // a keep-alive connection, so it doubles as the idle
+                    // timeout. `None` is passed explicitly: with a timer
+                    // installed hyper would otherwise fall back to its own
+                    // 30 s default.
+                    let mut builder = http1::Builder::new();
+                    builder.timer(TokioTimer::new()).header_read_timeout(idle);
+                    let conn = builder.serve_connection(TokioIo::new(stream), svc);
                     tokio::pin!(conn);
                     let res = tokio::select! {
                         r = conn.as_mut() => r,
@@ -170,6 +191,7 @@ async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response
         "/get" => Op::Get,
         "/set" => Op::Set,
         "/del" => Op::Del,
+        "/ping" => Op::Ping,
         p => return text(StatusCode::NOT_FOUND, format!("unknown path {p}")),
     };
     if req.method() != Method::POST {
@@ -216,19 +238,26 @@ async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     fn opts() -> Options {
-        Options {
-            token: b"s3cret".to_vec(),
-        }
+        Options::new(b"s3cret".to_vec())
     }
 
     fn server() -> Arc<HttpServer> {
-        let cache = Arc::new(Cache::new(1 << 20, 1));
-        Arc::new(HttpServer::bind("127.0.0.1:0".parse().unwrap(), cache, opts()).unwrap())
+        server_with(opts())
+    }
+
+    fn server_with(opts: Options) -> Arc<HttpServer> {
+        let cache = Arc::new(Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        ));
+        Arc::new(HttpServer::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap())
     }
 
     const AUTH: [(&str, &str); 1] = [("Authorization", "Bearer s3cret")];
@@ -381,6 +410,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ping_needs_a_token_and_answers_empty() {
+        let s = server();
+        let mut c = connect(&s).await;
+        assert_eq!(call(&mut c, "POST", "/ping", &[], b"").await.0, 401);
+        let mut c = connect(&s).await;
+        let (st, body) = call(&mut c, "POST", "/ping", &AUTH, b"").await;
+        assert_eq!((st, &body[..]), (200, &b""[..]));
+        assert_eq!(call(&mut c, "GET", "/ping", &[], b"").await.0, 405);
+    }
+
+    #[tokio::test]
     async fn bearer_token_is_required_except_for_health() {
         let s = server();
         let mut c = connect(&s).await;
@@ -408,18 +448,17 @@ mod tests {
     #[test]
     fn bind_failure_is_reported() {
         let first = server();
-        let cache = Arc::new(Cache::new(1 << 20, 1));
+        let cache = Arc::new(Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        ));
         let err = HttpServer::bind(first.local_addr(), cache.clone(), opts())
             .err()
             .expect("port in use");
         assert!(matches!(err, Error::Bind { addr, .. } if addr == first.local_addr()));
-        let err = HttpServer::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            cache,
-            Options { token: Vec::new() },
-        )
-        .err()
-        .expect("empty token");
+        let err = HttpServer::bind("127.0.0.1:0".parse().unwrap(), cache, Options::new(""))
+            .err()
+            .expect("empty token");
         assert!(matches!(err, Error::EmptyToken));
     }
 
@@ -444,6 +483,64 @@ mod tests {
         let mut rest = Vec::new();
         c.read_to_end(&mut rest).await.unwrap();
         assert!(rest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn idle_keepalive_connection_is_closed_after_the_timeout() {
+        let s = server_with(opts().idle_timeout(Some(Duration::from_millis(200))));
+        let mut c = connect(&s).await;
+        assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 200);
+        let start = std::time::Instant::now();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut rest))
+            .await
+            .expect("closed by the server")
+            .unwrap();
+        assert!(rest.is_empty());
+        assert!(start.elapsed() >= Duration::from_millis(150), "not before");
+    }
+
+    #[tokio::test]
+    async fn connection_limit_is_shared_with_the_tcp_front_end() {
+        let opts = opts().max_connections(NonZeroUsize::new(1));
+        let cache = Arc::new(Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        ));
+        let t = Arc::new(
+            tcp::Server::bind("127.0.0.1:0".parse().unwrap(), cache.clone(), opts.clone()).unwrap(),
+        );
+        let h = Arc::new(HttpServer::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
+        let (ts, hs) = (t.clone(), h.clone());
+        tokio::spawn(async move { ts.run().await });
+        tokio::spawn(async move { hs.run().await });
+        // One TCP connection uses up the whole budget...
+        let mut over_tcp = TcpStream::connect(t.local_addr()).await.unwrap();
+        over_tcp
+            .write_all(&wire::encode_header(Op::Auth as u8, 6))
+            .await
+            .unwrap();
+        over_tcp.write_all(b"s3cret").await.unwrap();
+        let mut hdr = [0u8; wire::HEADER_LEN];
+        over_tcp.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(h.open_connections(), Some(1));
+        // ...so HTTP is not answered until it closes.
+        let mut c = TcpStream::connect(h.local_addr()).await.unwrap();
+        c.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), c.read(&mut buf))
+                .await
+                .is_err()
+        );
+        drop(over_tcp);
+        let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .expect("served once the slot frees up")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
     }
 
     #[tokio::test]

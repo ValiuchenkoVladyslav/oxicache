@@ -9,6 +9,7 @@ mod table;
 
 use std::cell::Cell;
 use std::hash::{BuildHasher, Hasher};
+use std::num::NonZeroUsize;
 
 use crossbeam_epoch as epoch;
 use s3fifo::Retired;
@@ -25,9 +26,9 @@ pub struct Cache {
 impl Cache {
     /// Build a cache with `capacity` bytes split across `shards` (rounded up
     /// to a power of two) independent S3-FIFO shards.
-    pub fn new(capacity: usize, shards: usize) -> Self {
-        let n = shards.max(1).next_power_of_two();
-        let per = capacity / n;
+    pub fn new(capacity: NonZeroUsize, shards: NonZeroUsize) -> Self {
+        let n = shards.get().next_power_of_two();
+        let per = capacity.get() / n;
         Self {
             shards: (0..n).map(|_| Shard::new(per)).collect(),
             shift: 64 - n.trailing_zeros(),
@@ -213,7 +214,10 @@ mod tests {
 
     #[test]
     fn spreads_across_shards() {
-        let c = Cache::new(64 << 20, 12);
+        let c = Cache::new(
+            NonZeroUsize::new(64 << 20).unwrap(),
+            NonZeroUsize::new(12).unwrap(),
+        );
         assert_eq!(c.shards.len(), 16);
         for i in 0..10_000u32 {
             c.set(i.to_string().as_bytes(), b"v").unwrap();
@@ -233,7 +237,10 @@ mod tests {
 
     #[test]
     fn get_many_in_order() {
-        let c = Cache::new(1 << 20, 1);
+        let c = Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
         c.set(b"k", b"v").unwrap();
         let seen: Vec<Option<Vec<u8>>> = c.get_many([&b"k"[..], &b"x"[..], &b"k"[..]], |es| {
             es.iter()
@@ -245,7 +252,10 @@ mod tests {
 
     #[test]
     fn size_accounting() {
-        let c = Cache::new(1 << 20, 1);
+        let c = Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
         assert!(c.is_empty());
         assert_eq!(c.used_bytes(), 0);
         c.set(b"k", b"v").unwrap();
@@ -257,7 +267,10 @@ mod tests {
     /// reach the flush threshold and hand the bag to the collector.
     #[test]
     fn large_retirements_are_batched_then_flushed() {
-        let c = Cache::new(64 << 20, 1);
+        let c = Cache::new(
+            NonZeroUsize::new(64 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        );
         let big = vec![1u8; 2048];
         for _ in 0..(FLUSH_ENTRIES + 8) {
             c.set(b"k", &big).unwrap();

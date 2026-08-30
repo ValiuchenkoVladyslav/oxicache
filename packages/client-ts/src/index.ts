@@ -19,6 +19,7 @@ export {
   type Bin,
   DecodeError,
   HEADER_LEN,
+  KEEPALIVE_MS,
   MAX_FRAME,
   MAX_ITEMS,
   Op,
