@@ -519,3 +519,37 @@ All three overlap; no variant separates from the noise. The profile stays as it 
 `target-cpu=native` was already rejected earlier (ring dispatches on CPU features at
 runtime), and the allocator question was settled in the first round. The one untried lever
 left is PGO/BOLT, which would need a representative training workload and a two-phase build.
+
+## Round 13: client-side copies and codec scaffolding (2026-08-30)
+
+A findings pass over both clients and the wire codec (the server's own hot path was
+covered in rounds 6–9). Same harness: 2 s warm-up, 6 s runs, min of 3 alternating runs,
+server user+sys from `/proc`, client task-clock from `perf stat`.
+
+Rust client (same baseline server binary, alternating client binaries):
+
+| change | measurement | verdict |
+|---|---|---|
+| batch bodies presized (`BatchEncoder` starts at 512 B instead of 4 B; `Batch::with_capacity` when the size is known — the bench sizes read and write batches separately) and SET values serialised straight into the request/batch buffer (`BatchEncoder::set_with` / `put_set_key`) instead of an `rmp_serde::to_vec_named` `Vec` copied in; bench harness reuses its key/slot scratch across iterations | 16-key 128 B: client 8.8–9.4 → 5.9 µs/req, 400k → 470k req/s (+17 %, every pair); 16-key 1 KiB 50/50: client 26 → 21 µs/req, req/s +2 %; single-key unchanged (1.3 µs/req both) | kept |
+| client writer `inline_limit` 64 KiB → 4 KiB: request bodies of 4 KiB and up ride as `writev` iovec entries instead of being copied into the coalescing chunk | 1 KiB 50/50: client 21.4 → 19.5 µs/req (−9 %, every pair), req/s +6 %; 4 KiB 90 % writes: req/s +2.2…+3.1 % (every pair) | kept |
+
+Server (same new client, alternating server binaries):
+
+| change | measurement | verdict |
+|---|---|---|
+| batch GET/DEL/SET runs collected into per-batch scratch `Vec`s with exact length, replacing the `once + from_fn` run iterators whose size hint of 1 made `get_many`'s scratch regrow 1→2→…→16 per run | 16-key 128 B: 6.2 → 5.6 µs/req (−9 %, every pair — recovers the round-12 slip), +2…5 % req/s; 1 KiB and 4 KiB neutral-to-positive | kept |
+| `FrameReader::fill` reserves the rest of a pending frame in one step once at least half of it has arrived; bounded by the bytes already received, so round 9's no-trust-the-header property holds | 4 KiB 90 % writes (66 KiB frames): req/s +2.5 % every pair, server CPU/req −3 % avg; the mechanism matters most for frames well past 64 KiB | kept |
+| HTTP responses through `FrameWriter::take_bytes` (no copy for a single-piece response, one exact-size copy otherwise) instead of `take`'s per-piece `to_vec` + unsized collect | not measured — there is no HTTP bench; strictly fewer copies and allocations per response | kept |
+
+TypeScript client (same baseline server, alternating checkouts, bun 1.3.14):
+
+| change | measurement | verdict |
+|---|---|---|
+| shared msgpack `Encoder`/`Decoder` instances (the per-call `encode()` helper constructs an Encoder with a fresh 2 KiB buffer every time); frame encoders store header bytes directly — no per-frame `Writer` + `DataView` — with string keys UTF-8-encoded into a reused scratch; batch replies decoded into results in one pass (no intermediate `Reply` objects); `FrameReader` parses frames in place from a socket chunk when nothing is accumulated (one copy per response byte instead of two); keepalive as one persistent timer instead of a `clearTimeout`/`setTimeout` pair per flush | 16-key 128 B batches: 21.5k → 27.3k req/s (+28 %), client CPU 64 → 46 µs/req; single-key 128 B: 204k → 294k req/s (+43 %), client CPU 5.9 → 3.8 µs/req; every pair | kept |
+
+The 1 KiB and 4 KiB profiles show the round-4 equilibrium effect throughout: a cheaper
+client shifts loopback packing, so server CPU/req moves ±4 % between client builds even
+under identical server binaries; req/s and client CPU are the comparable numbers above.
+
+Protocol-v1 leftovers dropped along the way: `decodeValues`/`decodeFlags` and the v1
+protocol comment in `wire.ts`, stale `_multi` doc comments in the Rust client.
