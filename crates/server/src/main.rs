@@ -2,7 +2,7 @@
 //! only and never reads its command line:
 //!
 //! ```text
-//! OXICACHE_ADDR          address to listen on (default 0.0.0.0:4433)
+//! OXICACHE_TCP_ADDR      address the TCP front end listens on (default 0.0.0.0:4433)
 //! OXICACHE_HTTP_ADDR     address for the HTTP front end, same protocol plus /health (default: off)
 //! OXICACHE_CAPACITY      memory budget for cached entries, e.g. 512M, 4G (default 1G)
 //! OXICACHE_SHARDS        independent cache shards (default: available CPUs)
@@ -27,12 +27,12 @@ use tracing::info;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-const DEFAULT_ADDR: &str = "0.0.0.0:4433";
+const DEFAULT_TCP_ADDR: &str = "0.0.0.0:4433";
 const DEFAULT_CAPACITY: &str = "1G";
 
 /// All configuration, read from `OXICACHE_*` variables only.
 struct Config {
-    addr: SocketAddr,
+    tcp_addr: SocketAddr,
     http_addr: Option<SocketAddr>,
     capacity: NonZeroUsize,
     shards: NonZeroUsize,
@@ -45,7 +45,9 @@ struct Config {
 impl Config {
     fn from_env() -> Result<Self> {
         Ok(Self {
-            addr: Self::env("OXICACHE_ADDR", Some(DEFAULT_ADDR), |s| Ok(s.parse()?))?,
+            tcp_addr: Self::env("OXICACHE_TCP_ADDR", Some(DEFAULT_TCP_ADDR), |s| {
+                Ok(s.parse()?)
+            })?,
             http_addr: Self::env_opt("OXICACHE_HTTP_ADDR", |s| Ok(s.parse()?))?,
             capacity: Self::env(
                 "OXICACHE_CAPACITY",
@@ -153,7 +155,7 @@ async fn main() -> Result<()> {
                 .transpose()
                 .map_err(|e| format!("OXICACHE_TLS_CERT: {e}"))?,
         );
-    let server = Server::bind(args.addr, cache.clone(), opts.clone())?;
+    let server = Server::bind(args.tcp_addr, cache.clone(), opts.clone())?;
     let http = args
         .http_addr
         .map(|a| HttpServer::bind(a, cache, opts))

@@ -20,7 +20,7 @@ struct Running {
 fn cmd(args: &[&str], env: &[(&str, &str)]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_oxicache-server"));
     c.args(args)
-        .env_remove("OXICACHE_ADDR")
+        .env_remove("OXICACHE_TCP_ADDR")
         .env_remove("OXICACHE_HTTP_ADDR")
         .env_remove("OXICACHE_CAPACITY")
         .env_remove("OXICACHE_SHARDS")
@@ -58,7 +58,7 @@ fn plain(s: &str) -> String {
 /// waits for the child when dropped, so a failure here leaves no zombie.)
 #[allow(clippy::zombie_processes)]
 fn start(env: &[(&str, &str)]) -> Running {
-    let mut full = vec![("OXICACHE_ADDR", "127.0.0.1:0")];
+    let mut full = vec![("OXICACHE_TCP_ADDR", "127.0.0.1:0")];
     if !env.iter().any(|(k, _)| *k == "OXICACHE_TOKEN") {
         full.push(("OXICACHE_TOKEN", "t"));
     }
@@ -270,7 +270,7 @@ fn rejects_bad_values_naming_the_variable() {
         assert!(err.contains("OXICACHE_CAPACITY"), "{cap}: {err}");
     }
     for (var, bad) in [
-        ("OXICACHE_ADDR", "nowhere"),
+        ("OXICACHE_TCP_ADDR", "nowhere"),
         ("OXICACHE_HTTP_ADDR", "nowhere"),
         ("OXICACHE_SHARDS", "0"),
         ("OXICACHE_SHARDS", "many"),
@@ -360,7 +360,7 @@ fn http_bind_failure_is_fatal() {
     let err = fails(
         &[],
         &[
-            ("OXICACHE_ADDR", "127.0.0.1:0"),
+            ("OXICACHE_TCP_ADDR", "127.0.0.1:0"),
             ("OXICACHE_TOKEN", "t"),
             ("OXICACHE_CAPACITY", "1M"),
             ("OXICACHE_HTTP_ADDR", &r.addr.to_string()),

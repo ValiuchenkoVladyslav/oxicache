@@ -79,7 +79,7 @@ OXICACHE_TOKEN=s3cret OXICACHE_HTTP_ADDR=0.0.0.0:4434 OXICACHE_CAPACITY=1G cargo
 
 | variable | default | meaning |
 |---|---|---|
-| `OXICACHE_ADDR` | `0.0.0.0:4433` | address to listen on |
+| `OXICACHE_TCP_ADDR` | `0.0.0.0:4433` | address the TCP front end listens on |
 | `OXICACHE_HTTP_ADDR` | unset (HTTP off) | also serve the HTTP API on this address |
 | `OXICACHE_CAPACITY` | `1G` | memory budget for cached entries; `K`/`M`/`G` suffixes |
 | `OXICACHE_SHARDS` | available CPUs | independent S3-FIFO shards |

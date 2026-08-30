@@ -103,7 +103,7 @@ export async function startServer(
     stderr: "ignore",
     env: {
       ...process.env,
-      OXICACHE_ADDR: `127.0.0.1:${port}`,
+      OXICACHE_TCP_ADDR: `127.0.0.1:${port}`,
       OXICACHE_HTTP_ADDR: `127.0.0.1:${httpPort}`,
       OXICACHE_CAPACITY: "64M",
       OXICACHE_SHARDS: "2",
