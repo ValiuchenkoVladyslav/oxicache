@@ -140,6 +140,7 @@ class Link {
   private readonly reader: FrameReader;
   private readonly keepaliveMs: number;
   private keepalive: ReturnType<typeof setTimeout> | undefined;
+  private lastWrite = 0;
   private socket!: Socket;
 
   // Explicit rather than a field initialiser: Bun's coverage counts a
@@ -231,17 +232,30 @@ class Link {
   }
 
   /**
-   * (Re)start the idle clock from this write. The timer is unref'd so a
-   * forgotten client does not keep the process alive; the PING is queued
-   * like any call, so its reply is matched in order and dropped. It is not
-   * retried: a heartbeat must never be what reconnects.
+   * (Re)start the idle clock from this write. One persistent timer checks
+   * the last write when it fires, instead of a clearTimeout/setTimeout
+   * pair on every flush. The timer is unref'd so a forgotten client does
+   * not keep the process alive; the PING is queued like any call, so its
+   * reply is matched in order and dropped. It is not retried: a heartbeat
+   * must never be what reconnects.
    */
   private armKeepalive(): void {
-    clearTimeout(this.keepalive);
-    this.keepalive = setTimeout(() => {
-      this.call(encodePingFrame(), false).catch(ignore);
-    }, this.keepaliveMs);
-    this.keepalive.unref();
+    this.lastWrite = Date.now();
+    this.keepalive ??= this.keepaliveTimer(this.keepaliveMs);
+  }
+
+  private keepaliveTimer(ms: number): ReturnType<typeof setTimeout> {
+    const t = setTimeout(() => {
+      const left = this.lastWrite + this.keepaliveMs - Date.now();
+      if (left > 0) {
+        this.keepalive = this.keepaliveTimer(left);
+      } else {
+        this.keepalive = undefined;
+        this.call(encodePingFrame(), false).catch(ignore);
+      }
+    }, ms);
+    t.unref();
+    return t;
   }
 
   private onData(chunk: Uint8Array): void {
@@ -250,7 +264,8 @@ class Link {
     try {
       for (let f = this.reader.next(); f !== null; f = this.reader.next()) {
         const status = f.tag;
-        if (!(status in Status))
+        // Statuses are dense from Ok: anything past the last is unknown.
+        if (status > Status.NotFound)
           throw new DecodeError(`invalid status byte ${status}`);
         const p = this.takePending();
         if (p === undefined)
@@ -291,6 +306,7 @@ class Link {
     if (this.lost) return;
     this.lost = new ClosedError(err);
     clearTimeout(this.keepalive);
+    this.keepalive = undefined;
     this.outbox = [];
     this.outboxBytes = 0;
     const waiting = this.pending.slice(this.head);

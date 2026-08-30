@@ -1,4 +1,4 @@
-import { decode, ExtensionCodec, encode } from "@msgpack/msgpack";
+import { Decoder, Encoder, ExtensionCodec } from "@msgpack/msgpack";
 
 /** Leaf types a value may contain. */
 export type Primitive =
@@ -50,14 +50,19 @@ codec.register({
   decode: (data: Uint8Array) => BigInt(utf8d.decode(data)),
 });
 
-const options = { extensionCodec: codec } as const;
+// Shared instances: the per-call `encode`/`decode` helpers construct a
+// fresh Encoder (with its 2 KiB buffer) or Decoder on every value, which
+// costs more than small values themselves. Reentrant use is safe — the
+// library clones itself when entered twice.
+const encoder = new Encoder({ extensionCodec: codec });
+const decoder = new Decoder({ extensionCodec: codec });
 
 /** Encode a value as MessagePack (plain, readable by any decoder; `bigint` via {@link BIGINT_EXT}). */
 export function encodeValue(value: unknown): Uint8Array {
-  return encode(value, options);
+  return encoder.encode(value);
 }
 
 /** Decode MessagePack produced by {@link encodeValue} (or any other encoder). */
 export function decodeValue<T>(bytes: Uint8Array): T {
-  return decode(bytes, options) as T;
+  return decoder.decode(bytes) as T;
 }

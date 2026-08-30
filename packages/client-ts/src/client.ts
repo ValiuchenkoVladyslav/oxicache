@@ -15,14 +15,13 @@ import {
   type BatchItem,
   type Bin,
   DecodeError,
-  decodeReplies,
   encodeBatchFrame,
   encodeDelFrame,
   encodeGetFrame,
   encodePingFrame,
   encodeSetFrame,
   Op,
-  type Reply,
+  Reader,
   Status,
 } from "./wire.js";
 
@@ -138,16 +137,22 @@ export class Client {
     ops: O,
   ): Promise<BatchResults<O>> {
     const frame = encodeBatchFrame(ops as readonly BatchItem[]);
-    const replies = decodeReplies((await this.transport.request(frame)).body);
-    if (replies.length !== ops.length) {
+    // Replies are turned into results in one pass over the response body,
+    // with no intermediate reply objects.
+    const r = new Reader((await this.transport.request(frame)).body);
+    const n = r.u32();
+    if (n !== ops.length) {
       throw new DecodeError(
-        `server answered ${replies.length} replies for ${ops.length} ops`,
+        `server answered ${n} replies for ${ops.length} ops`,
       );
     }
-    return ops.map((o, i) =>
-      // biome-ignore lint/style/noNonNullAssertion: same length as ops, just checked
-      result(o, replies[i]!, i),
-    ) as BatchResults<O>;
+    const out = new Array<unknown>(n);
+    for (let i = 0; i < n; i++) {
+      // biome-ignore lint/style/noNonNullAssertion: i < n === ops.length
+      out[i] = result(ops[i]!, r.u8(), r.blob(), i);
+    }
+    r.finish();
+    return out as BatchResults<O>;
   }
 
   /** Round-trip an empty request; resolves once the server has answered. */
@@ -167,8 +172,12 @@ export class Client {
 }
 
 /** One batch reply as its op's result. */
-function result(o: BatchOp, r: Reply, i: number): unknown {
-  const { status, body } = r;
+function result(
+  o: BatchOp,
+  status: number,
+  body: Uint8Array,
+  i: number,
+): unknown {
   if (!isAnswer(status) || (o.op === Op.Set && status !== Status.Ok)) {
     throw new StatusError(status as Status, `item ${i}: ${utf8.decode(body)}`);
   }
