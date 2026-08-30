@@ -502,3 +502,20 @@ process (visible from the host under rootless podman):
   `pasta` userspace proxy. 16-key profile: 312k req/s vs ~430k, pasta burns 1.4 µs/req of
   its own (0.45 cores at this load) and the server's own CPU/req rises to ~8.2 µs (worse
   batching through the relay). Use `--network host` for a cache, as the README says.
+
+## Release profile check (2026-08-30)
+
+Is `lto = "fat"`, `codegen-units = 1`, `panic = "abort"` (opt-level 3 by default) optimal?
+The two untried knobs, measured min-of-3 alternating on the 16-key 128 B and 1 KiB 50/50
+profiles, same harness:
+
+| variant | 16-key 128 B (total µs/req) | 1 KiB 50/50 |
+|---|---|---|
+| current (fat, opt 3) | 6.40–6.51 | 38.6–40.7 |
+| opt-level = 2 | 6.21–6.67 | 38.2–41.0 |
+| lto = "thin" | 6.20–6.66 | 38.4–39.6 |
+
+All three overlap; no variant separates from the noise. The profile stays as it is —
+`target-cpu=native` was already rejected earlier (ring dispatches on CPU features at
+runtime), and the allocator question was settled in the first round. The one untried lever
+left is PGO/BOLT, which would need a representative training workload and a two-phase build.
