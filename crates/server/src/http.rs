@@ -45,6 +45,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::Cache;
 use crate::error::{Error, Result};
+use crate::metrics::Metrics;
 use crate::tcp::{self, AUTH_TIMEOUT, ConnLimit, MAX_FRAME, Options};
 
 /// How long in-flight requests get to finish at shutdown.
@@ -58,6 +59,7 @@ pub struct HttpServer {
     idle_timeout: Option<Duration>,
     limit: Option<Arc<ConnLimit>>,
     tls: Option<TlsAcceptor>,
+    metrics: Arc<Metrics>,
 }
 
 impl HttpServer {
@@ -73,6 +75,7 @@ impl HttpServer {
             idle_timeout: opts.idle_timeout,
             limit: opts.limit,
             tls: opts.tls.map(TlsAcceptor::from),
+            metrics: opts.metrics,
         })
     }
 
@@ -134,20 +137,23 @@ async fn accept_loop(
                 let (cache, token, stop) =
                     (server.cache.clone(), server.token.clone(), stop.clone());
                 let (idle, tls) = (server.idle_timeout, server.tls.clone());
+                let (limit, metrics) = (server.limit.clone(), server.metrics.clone());
                 let slot = tcp::Slot::open(server.limit.as_ref(), permit);
                 conns.spawn(async move {
                     let _slot = slot;
                     debug!(%remote, "http connection open");
                     let _ = stream.set_nodelay(true);
                     let res = match tls {
-                        None => serve(stream, cache, token, idle, stop).await,
+                        None => serve(stream, cache, token, limit, metrics, idle, stop).await,
                         // The handshake is under the same hard cap as AUTH
                         // on TCP: a peer that never finishes one does not
                         // get to sit on a slot.
                         Some(acceptor) => {
                             match tokio::time::timeout(AUTH_TIMEOUT, acceptor.accept(stream)).await
                             {
-                                Ok(Ok(stream)) => serve(stream, cache, token, idle, stop).await,
+                                Ok(Ok(stream)) => {
+                                    serve(stream, cache, token, limit, metrics, idle, stop).await
+                                }
                                 Ok(Err(e)) => Err(e.into()),
                                 Err(_) => {
                                     debug!(%remote, "tls handshake timed out");
@@ -175,12 +181,17 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     cache: Arc<Cache>,
     token: Arc<[u8]>,
+    limit: Option<Arc<ConnLimit>>,
+    metrics: Arc<Metrics>,
     idle: Option<Duration>,
     mut stop: watch::Receiver<bool>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let svc = service_fn(move |req| {
         let (cache, token) = (cache.clone(), token.clone());
-        async move { Ok::<_, hyper::Error>(handle(req, &cache, &token).await) }
+        let (limit, metrics) = (limit.clone(), metrics.clone());
+        async move {
+            Ok::<_, hyper::Error>(handle(req, &cache, &token, limit.as_deref(), &metrics).await)
+        }
     });
     // hyper re-arms its header timeout for every request on a keep-alive
     // connection, so it doubles as the idle timeout. `None` is passed
@@ -235,10 +246,33 @@ fn authorized(req: &Request<Incoming>, token: &[u8]) -> bool {
         .is_some_and(|t| tcp::ct_eq(token, t))
 }
 
-async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response<Full<Bytes>> {
+async fn handle(
+    req: Request<Incoming>,
+    cache: &Cache,
+    token: &[u8],
+    limit: Option<&ConnLimit>,
+    metrics: &Metrics,
+) -> Response<Full<Bytes>> {
     let op = match req.uri().path() {
         // Status code only, no body: a probe target.
         "/health" => return closing(reply(StatusCode::OK, Bytes::new(), false)),
+        // The one authenticated GET; the token gates it like any other path.
+        "/metrics" => {
+            if req.method() != Method::GET {
+                return closing(text(StatusCode::METHOD_NOT_ALLOWED, "use GET"));
+            }
+            if !authorized(&req, token) {
+                metrics
+                    .auth_failures
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return closing(text(StatusCode::UNAUTHORIZED, "auth required"));
+            }
+            return reply(
+                StatusCode::OK,
+                Bytes::from(metrics.render(cache, limit)),
+                false,
+            );
+        }
         "/get" => Op::Get,
         "/set" => Op::Set,
         "/del" => Op::Del,
@@ -250,6 +284,9 @@ async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response
         return closing(text(StatusCode::METHOD_NOT_ALLOWED, "use POST"));
     }
     if !authorized(&req, token) {
+        metrics
+            .auth_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return closing(text(StatusCode::UNAUTHORIZED, "auth required"));
     }
     // Refuse by the announced length before reading anything, and by the
@@ -273,7 +310,7 @@ async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response
         Err(e) => return text(StatusCode::BAD_REQUEST, e.to_string()),
     };
     let mut out = FrameWriter::new();
-    tcp::dispatch(op as u8, &body, cache, &mut out);
+    tcp::dispatch(op as u8, &body, cache, metrics, &mut out);
     let raw = out.take_bytes();
     let (status, len) = wire::decode_header(raw[..wire::HEADER_LEN].try_into().expect("header"));
     debug_assert_eq!(raw.len(), wire::HEADER_LEN + len);
@@ -512,6 +549,52 @@ mod tests {
         let right = [("Authorization", "Bearer s3cret")];
         assert_eq!(call(&mut c, "POST", "/get", &right, keys).await.0, 404);
         assert_eq!(call(&mut c, "POST", "/get", &right, keys).await.0, 404);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_authenticated_and_count_operations() {
+        let s = server();
+        // Refused without the token (and counted); wrong method refused.
+        let mut c = connect(&s).await;
+        assert_eq!(call(&mut c, "GET", "/metrics", &[], b"").await.0, 401);
+        let mut c = TcpStream::connect(s.local_addr()).await.unwrap();
+        assert_eq!(call(&mut c, "POST", "/metrics", &AUTH, b"").await.0, 405);
+        // A hit, a miss, a delete each way, and a SET that does not fit.
+        let mut c = TcpStream::connect(s.local_addr()).await.unwrap();
+        let set = wire::encode_set(b"k", b"v");
+        assert_eq!(call(&mut c, "POST", "/set", &AUTH, &set).await.0, 200);
+        assert_eq!(call(&mut c, "POST", "/get", &AUTH, b"k").await.0, 200);
+        assert_eq!(call(&mut c, "POST", "/get", &AUTH, b"x").await.0, 404);
+        assert_eq!(call(&mut c, "POST", "/del", &AUTH, b"k").await.0, 200);
+        assert_eq!(call(&mut c, "POST", "/del", &AUTH, b"k").await.0, 404);
+        let big = wire::encode_set(b"big", &vec![0u8; 2 << 20]);
+        assert_eq!(call(&mut c, "POST", "/set", &AUTH, &big).await.0, 413);
+        let (st, body) = call(&mut c, "GET", "/metrics", &AUTH, b"").await;
+        assert_eq!(st, 200);
+        let text = String::from_utf8(body).unwrap();
+        let build = format!(
+            "oxicache_build_info{{version=\"{}\"}} 1",
+            env!("CARGO_PKG_VERSION")
+        );
+        for line in [
+            "oxicache_get_hits_total 1",
+            "oxicache_get_misses_total 1",
+            "oxicache_del_hits_total 1",
+            "oxicache_del_misses_total 1",
+            "oxicache_set_too_large_total 1",
+            "oxicache_auth_failures_total 1",
+            "oxicache_evictions_total 0",
+            "oxicache_items 0",
+            "oxicache_used_bytes 0",
+            "oxicache_capacity_bytes 1048576",
+            "oxicache_max_connections 10000",
+            "oxicache_accept_waits_total 0",
+            "oxicache_open_connections",
+            "oxicache_uptime_seconds",
+            build.as_str(),
+        ] {
+            assert!(text.contains(line), "missing {line} in:\n{text}");
+        }
     }
 
     #[test]

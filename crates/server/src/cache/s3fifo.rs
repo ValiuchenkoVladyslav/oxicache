@@ -13,7 +13,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::ptr::NonNull;
 use std::sync::atomic::{
-    AtomicBool, AtomicU8, AtomicUsize,
+    AtomicBool, AtomicU8, AtomicU64, AtomicUsize,
     Ordering::{Acquire, Relaxed, Release},
 };
 
@@ -353,17 +353,55 @@ struct Queues {
     dead_bytes: usize,
 }
 
+/// Per-shard operation counters, summed by [`Cache::stats`](super::Cache::stats).
+/// On a line pair of their own (the alignment, inside the 128-aligned
+/// [`Shard`]) so the hits readers write never touch the index or queue lines.
+#[derive(Default)]
+#[repr(align(128))]
+pub(super) struct ShardStats {
+    pub(super) get_hits: AtomicU64,
+    pub(super) get_misses: AtomicU64,
+    pub(super) del_hits: AtomicU64,
+    pub(super) del_misses: AtomicU64,
+    pub(super) evictions: AtomicU64,
+}
+
+impl ShardStats {
+    /// Add a batch's worth of GET outcomes; zeros skip the shared line.
+    #[inline]
+    pub(super) fn count_gets(&self, hits: u64, misses: u64) {
+        if hits > 0 {
+            self.get_hits.fetch_add(hits, Relaxed);
+        }
+        if misses > 0 {
+            self.get_misses.fetch_add(misses, Relaxed);
+        }
+    }
+
+    /// Add a batch's worth of DEL outcomes; zeros skip the shared line.
+    #[inline]
+    pub(super) fn count_dels(&self, hits: u64, misses: u64) {
+        if hits > 0 {
+            self.del_hits.fetch_add(hits, Relaxed);
+        }
+        if misses > 0 {
+            self.del_misses.fetch_add(misses, Relaxed);
+        }
+    }
+}
+
 /// Aligned so consecutive shards in the cache's slice never share a cache
 /// line (at 128 bytes, also not an adjacent-line prefetch pair): one shard's
 /// writer counters must not evict the line another shard's readers need.
 /// Field order keeps the index's reader-hot line first and the mutex, queues
-/// and budgets (writer-only) after it.
+/// and budgets (writer-only) after it, with the stats line last.
 #[repr(C, align(128))]
 pub struct Shard {
     index: Index,
     q: Mutex<Queues>,
     capacity: usize,
     small_capacity: usize,
+    pub(super) stats: ShardStats,
 }
 
 impl Shard {
@@ -385,6 +423,7 @@ impl Shard {
             }),
             capacity,
             small_capacity: capacity / 10,
+            stats: ShardStats::default(),
         }
     }
 
@@ -507,6 +546,7 @@ impl Shard {
             }
             e.live().store(false, Relaxed);
             q.used -= cost;
+            self.stats.evictions.fetch_add(1, Relaxed);
             let limit = q.main.len();
             q.ghost.push(e.hash(), limit);
         }
@@ -532,6 +572,7 @@ impl Shard {
             }
             e.live().store(false, Relaxed);
             q.used -= cost;
+            self.stats.evictions.fetch_add(1, Relaxed);
             return Some(Retired::one(&e));
         }
     }
@@ -725,6 +766,22 @@ mod tests {
         assert_eq!(std::mem::size_of::<Shard>() % 128, 0);
         assert_eq!(std::mem::offset_of!(Shard, index), 0);
         assert!(std::mem::offset_of!(Shard, q) >= 256);
+    }
+
+    #[test]
+    fn evictions_count_capacity_pressure_only() {
+        let cap = 100 * (ENTRY_OVERHEAD + 10 + 100);
+        let s = shard(cap);
+        for i in 0..1000 {
+            set(&s, i, 100);
+        }
+        let evicted = s.stats.evictions.load(Relaxed);
+        assert!(evicted >= 800, "{evicted}");
+        // A same-size replacement and a delete are not evictions.
+        let before = s.stats.evictions.load(Relaxed);
+        set(&s, 999, 100);
+        assert!(del(&s, &key(999)));
+        assert_eq!(s.stats.evictions.load(Relaxed), before);
     }
 
     #[test]

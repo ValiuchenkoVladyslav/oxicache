@@ -10,6 +10,7 @@ mod table;
 use std::cell::Cell;
 use std::hash::{BuildHasher, Hasher};
 use std::num::NonZeroUsize;
+use std::sync::atomic::Ordering::Relaxed;
 
 use crossbeam_epoch as epoch;
 use s3fifo::Retired;
@@ -21,6 +22,22 @@ pub struct Cache {
     shards: Box<[Shard]>,
     shift: u32,
     hasher: rapidhash::fast::RandomState,
+    capacity: usize,
+}
+
+/// A point-in-time sum of the per-shard counters, plus the configured budget.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stats {
+    pub get_hits: u64,
+    pub get_misses: u64,
+    pub del_hits: u64,
+    pub del_misses: u64,
+    /// Live entries evicted to make room, as distinct from deleted or
+    /// replaced ones: sustained growth here means the capacity is short.
+    pub evictions: u64,
+    pub items: usize,
+    pub used_bytes: usize,
+    pub capacity: usize,
 }
 
 impl Cache {
@@ -33,6 +50,7 @@ impl Cache {
             shards: (0..n).map(|_| Shard::new(per)).collect(),
             shift: 64 - n.trailing_zeros(),
             hasher: rapidhash::fast::RandomState::default(),
+            capacity: capacity.get(),
         }
     }
 
@@ -56,7 +74,11 @@ impl Cache {
     pub fn get(&self, key: &[u8]) -> Option<Entry> {
         let (shard, hash) = self.locate(key);
         let guard = epoch::pin();
-        let e = shard.get(hash, key, &guard)?;
+        let Some(e) = shard.get(hash, key, &guard) else {
+            shard.stats.get_misses.fetch_add(1, Relaxed);
+            return None;
+        };
+        shard.stats.get_hits.fetch_add(1, Relaxed);
         e.touch();
         Some(Entry::clone(&e))
     }
@@ -85,13 +107,20 @@ impl Cache {
             shard.prefetch_entries(*hash, &guard);
         }
         let mut found: Vec<Option<EntryRef<'_>>> = Vec::with_capacity(located.len());
-        for (shard, hash, k) in located {
-            let e = shard.get(hash, k, &guard);
+        // Tallied locally and added once per batch: a per-key increment on
+        // the shared counter lines costs ~4 % server CPU on batch loads.
+        let mut hits = 0;
+        for (shard, hash, k) in &located {
+            let e = shard.get(*hash, k, &guard);
             if let Some(e) = &e {
+                hits += 1;
                 e.prefetch();
                 e.touch();
             }
             found.push(e);
+        }
+        if let Some((shard, _, _)) = located.first() {
+            shard.stats.count_gets(hits, found.len() as u64 - hits);
         }
         f(&found)
     }
@@ -138,19 +167,46 @@ impl Cache {
     {
         let guard = epoch::pin();
         let mut retired = Retired::default();
+        let (mut hits, mut total) = (0, 0);
+        let mut last = None;
         for k in keys {
             let (shard, hash) = self.locate(k);
             let found = shard.del(hash, k, &guard);
             if let Some(r) = found {
+                hits += 1;
                 retired += r;
             }
+            total += 1;
+            last = Some(shard);
             f(found.is_some());
+        }
+        if let Some(shard) = last {
+            shard.stats.count_dels(hits, total - hits);
         }
         collect(&guard, retired);
     }
 
     pub fn len(&self) -> usize {
         self.shards.iter().map(Shard::len).sum()
+    }
+
+    /// Sum the per-shard counters. Point-in-time, not a snapshot: counters
+    /// keep moving while they are read.
+    pub fn stats(&self) -> Stats {
+        let mut s = Stats {
+            capacity: self.capacity,
+            ..Stats::default()
+        };
+        for shard in &self.shards {
+            s.get_hits += shard.stats.get_hits.load(Relaxed);
+            s.get_misses += shard.stats.get_misses.load(Relaxed);
+            s.del_hits += shard.stats.del_hits.load(Relaxed);
+            s.del_misses += shard.stats.del_misses.load(Relaxed);
+            s.evictions += shard.stats.evictions.load(Relaxed);
+            s.items += shard.len();
+            s.used_bytes += shard.used_bytes();
+        }
+        s
     }
 
     pub fn is_empty(&self) -> bool {
@@ -248,6 +304,28 @@ mod tests {
                 .collect()
         });
         assert_eq!(seen, vec![Some(b"v".to_vec()), None, Some(b"v".to_vec())]);
+    }
+
+    #[test]
+    fn stats_sum_across_shards() {
+        let c = Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        c.set(b"a", b"1").unwrap();
+        c.set(b"b", b"2").unwrap();
+        assert!(c.get(b"a").is_some());
+        assert!(c.get(b"nope").is_none());
+        c.get_many([&b"a"[..], &b"b"[..], &b"x"[..]], |_| ());
+        assert!(c.del(b"a"));
+        assert!(!c.del(b"a"));
+        let s = c.stats();
+        assert_eq!((s.get_hits, s.get_misses), (3, 2));
+        assert_eq!((s.del_hits, s.del_misses), (1, 1));
+        assert_eq!(s.items, 1);
+        assert_eq!(s.capacity, 1 << 20);
+        assert!(s.used_bytes > 0);
+        assert_eq!(s.evictions, 0);
     }
 
     #[test]

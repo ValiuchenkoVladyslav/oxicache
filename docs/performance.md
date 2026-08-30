@@ -553,3 +553,22 @@ under identical server binaries; req/s and client CPU are the comparable numbers
 
 Protocol-v1 leftovers dropped along the way: `decodeValues`/`decodeFlags` and the v1
 protocol comment in `wire.ts`, stale `_multi` doc comments in the Rust client.
+
+## Metrics counters (2026-08-31)
+
+`GET /metrics` (Prometheus text) added per-shard relaxed counters to the engine —
+get/del hits and misses, evictions — on a 128-aligned stats line per shard, plus
+front-end counters (auth failures, refused SETs) off the hot path. The first cut
+incremented a shard counter per key and cost +3–5 % server CPU/req on all three
+profiles (12 threads write the same per-shard lines); `get_many`/`del_many` now tally
+locally and add once per batch, which measures neutral. Three alternating pairs,
+quiet machine, min-of-3 (baseline → with metrics):
+
+| profile | baseline | with metrics |
+|---|---|---|
+| 8×16, 16-key batch, 128 B | 5.34–5.57 µs/req | 5.40–5.45 µs/req |
+| 8×16, single key, 128 B | 1.24–1.26 µs/req | 1.24 µs/req |
+| 8×16, 16-key batch, 1 KiB 50/50 | 36.91–37.74 µs/req | 36.07–36.99 µs/req |
+
+Deltas flip sign between pairs on every profile; the per-key variant's regression was
+outside that band and is the shape to avoid in future counters.

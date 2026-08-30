@@ -70,6 +70,7 @@ POST /del    body: key                  -> 200, empty (deleted) | 404, empty
 POST /batch  body: items                -> 200, body: replies
 POST /ping                              -> 200, empty
 GET  /health                            -> 200, no body; never needs a token
+GET  /metrics                           -> 200, body: Prometheus text metrics
 400 bad request | 401 unauthorized | 404 unknown path (with a message) | 405 wrong method | 413 too large
 ```
 
@@ -79,6 +80,21 @@ so no connection stays open without the token. Both listeners serve one
 cache, so a value written over TCP is readable over HTTP. Keep-alive is on; with
 `OXICACHE_TLS_CERT` the listener is `https://`. There is no CORS handling — put a reverse proxy
 in front for that.
+
+### Metrics
+
+`GET /metrics` (authenticated like every other path) answers in the Prometheus text
+format. Counters: `oxicache_get_hits_total` / `oxicache_get_misses_total` and
+`oxicache_del_hits_total` / `oxicache_del_misses_total` (per-key inside batches),
+`oxicache_evictions_total` (live entries evicted to make room — sustained growth means
+the capacity is short; deletes and replacements do not count),
+`oxicache_set_too_large_total`, `oxicache_auth_failures_total` and
+`oxicache_accept_waits_total` (accepts that waited on `OXICACHE_MAX_CONNS`). Gauges:
+`oxicache_used_bytes` / `oxicache_capacity_bytes`, `oxicache_items`,
+`oxicache_open_connections` / `oxicache_max_connections`, `oxicache_uptime_seconds`,
+and `oxicache_build_info{version="…"}`. Only the HTTP listener serves them, so a
+TCP-only deployment sets `OXICACHE_HTTP_ADDR` (on localhost or a private interface,
+say) to be scrapeable.
 
 ## Run
 

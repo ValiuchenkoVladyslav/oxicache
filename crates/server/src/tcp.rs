@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::{Cache, Entry};
 use crate::error::{Error, Result};
+use crate::metrics::Metrics;
 
 /// Largest request body accepted from an authenticated peer.
 pub const MAX_FRAME: usize = wire::MAX_FRAME;
@@ -66,6 +67,9 @@ pub struct Options {
     /// [`tls::server_config`](crate::tls::server_config)); `None` is plain
     /// TCP. The handshake counts against the [`AUTH_TIMEOUT`].
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// Operation counters, served at `GET /metrics` by the HTTP front end.
+    /// A clone shares them, like the connection budget.
+    pub metrics: Arc<Metrics>,
 }
 
 /// Idle timeout every `Options` starts with: three client heartbeats
@@ -85,6 +89,7 @@ impl Options {
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             limit: Some(Arc::new(ConnLimit::new(DEFAULT_MAX_CONNECTIONS))),
             tls: None,
+            metrics: Arc::new(Metrics::new()),
         }
     }
 
@@ -153,6 +158,11 @@ impl ConnLimit {
     /// Connections currently open under this budget.
     pub fn open(&self) -> usize {
         self.open.load(Ordering::Relaxed)
+    }
+
+    /// Accepts that had to wait for a free slot.
+    pub fn waits(&self) -> u64 {
+        self.hits.load(Ordering::Relaxed)
     }
 
     /// Wait for a free slot; the permit is released when dropped.
@@ -224,6 +234,7 @@ pub struct Server {
     idle_timeout: Option<Duration>,
     limit: Option<Arc<ConnLimit>>,
     tls: Option<TlsAcceptor>,
+    metrics: Arc<Metrics>,
 }
 
 impl Server {
@@ -239,6 +250,7 @@ impl Server {
             idle_timeout: opts.idle_timeout,
             limit: opts.limit,
             tls: opts.tls.map(TlsAcceptor::from),
+            metrics: opts.metrics,
         })
     }
 
@@ -312,12 +324,13 @@ async fn accept_loop(listener: std::net::TcpListener, server: &Server, conns: &m
             Ok((stream, remote)) => {
                 let (cache, token) = (server.cache.clone(), server.token.clone());
                 let (idle, tls) = (server.idle_timeout, server.tls.clone());
+                let metrics = server.metrics.clone();
                 let slot = Slot::open(server.limit.as_ref(), permit);
                 conns.spawn(async move {
                     // Held until the connection is done, whatever the reason.
                     let _slot = slot;
                     debug!(%remote, "connection open");
-                    let res = serve(stream, tls, &cache, &token, idle).await;
+                    let res = serve(stream, tls, &cache, &token, idle, &metrics).await;
                     match res {
                         Ok(true) => debug!(%remote, "idle connection closed"),
                         Ok(false) => {}
@@ -343,20 +356,21 @@ async fn serve(
     cache: &Cache,
     token: &[u8],
     idle: Option<Duration>,
+    metrics: &Metrics,
 ) -> std::io::Result<bool> {
     stream.set_nodelay(true)?;
     let auth_deadline = Instant::now() + AUTH_TIMEOUT;
     match tls {
         None => {
             let (r, w) = stream.into_split();
-            serve_connection(r, w, auth_deadline, cache, token, idle).await
+            serve_connection(r, w, auth_deadline, cache, token, idle, metrics).await
         }
         Some(acceptor) => {
             let Some(stream) = by(Some(auth_deadline), acceptor.accept(stream)).await? else {
                 return Ok(true);
             };
             let (r, w) = tokio::io::split(Drained(stream));
-            serve_connection(r, w, auth_deadline, cache, token, idle).await
+            serve_connection(r, w, auth_deadline, cache, token, idle, metrics).await
         }
     }
 }
@@ -444,6 +458,7 @@ async fn serve_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     cache: &Cache,
     token: &[u8],
     idle: Option<Duration>,
+    metrics: &Metrics,
 ) -> std::io::Result<bool> {
     let mut authed = false;
     let mut reader = FrameReader::new(MAX_AUTH_FRAME);
@@ -452,7 +467,7 @@ async fn serve_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         // Serve every complete frame already buffered, then flush once.
         loop {
             match reader.next_buffered() {
-                Ok(Some((op, body))) if authed => dispatch(op, body, cache, &mut out),
+                Ok(Some((op, body))) if authed => dispatch(op, body, cache, metrics, &mut out),
                 Ok(Some((op, body))) => {
                     let ok = op == Op::Auth as u8 && ct_eq(token, body);
                     if ok {
@@ -460,6 +475,7 @@ async fn serve_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                         reader.set_max_frame(MAX_FRAME);
                         out.header(Status::Ok as u8, 0);
                     } else {
+                        metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
                         out.frame(
                             Status::Unauthorized as u8,
                             Bytes::from_static(b"auth required"),
@@ -520,7 +536,7 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Route a request to the cache and append the response frame to `out`.
-pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
+pub fn dispatch(op: u8, body: &[u8], cache: &Cache, metrics: &Metrics, out: &mut FrameWriter) {
     match Op::from_u8(op) {
         Some(Op::Get) => match cache.get(body) {
             Some(e) if e.value().len() > MAX_RESPONSE => out.frame(
@@ -538,7 +554,10 @@ pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
             // request body is released as soon as this returns.
             Ok((k, v)) => match cache.set(k, v) {
                 Ok(()) => out.header(Status::Ok as u8, 0),
-                Err(e) => out.frame(Status::TooLarge as u8, Bytes::from(e.to_string())),
+                Err(e) => {
+                    metrics.set_too_large.fetch_add(1, Ordering::Relaxed);
+                    out.frame(Status::TooLarge as u8, Bytes::from(e.to_string()))
+                }
             },
             Err(e) => out.frame(Status::BadRequest as u8, Bytes::from(e.to_string())),
         },
@@ -550,7 +569,7 @@ pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
             } as u8,
             0,
         ),
-        Some(Op::Batch) => batch(body, cache, out),
+        Some(Op::Batch) => batch(body, cache, metrics, out),
         // AUTH here means already authenticated: a no-op. PING is the
         // client's heartbeat; its body is ignored rather than validated, so
         // a future client can attach something without being refused.
@@ -580,7 +599,7 @@ fn value(e: &Entry, out: &mut FrameWriter) {
 /// Runs of the same op go to the cache together (one epoch pin, prefetched
 /// lookups), which is what makes a batch of GETs cheaper than the same GETs
 /// pipelined.
-fn batch(body: &[u8], cache: &Cache, out: &mut FrameWriter) {
+fn batch(body: &[u8], cache: &Cache, metrics: &Metrics, out: &mut FrameWriter) {
     let items = match wire::frames(body) {
         Ok(items) => items,
         Err(e) => return out.frame(Status::BadRequest as u8, Bytes::from(e.to_string())),
@@ -643,6 +662,7 @@ fn batch(body: &[u8], cache: &Cache, out: &mut FrameWriter) {
                             match cache.set(k, v) {
                                 Ok(()) => out.header(Status::Ok as u8, 0),
                                 Err(e) => {
+                                    metrics.set_too_large.fetch_add(1, Ordering::Relaxed);
                                     out.frame(Status::TooLarge as u8, Bytes::from(e.to_string()))
                                 }
                             }
@@ -687,7 +707,7 @@ mod tests {
 
     fn call(cache: &Cache, op: u8, body: Bytes) -> (Status, Bytes) {
         let mut out = FrameWriter::new();
-        dispatch(op, &body, cache, &mut out);
+        dispatch(op, &body, cache, &Metrics::new(), &mut out);
         let raw = out.take();
         let (status, len) = wire::decode_header(raw[..wire::HEADER_LEN].try_into().unwrap());
         assert_eq!(raw.len(), wire::HEADER_LEN + len);
@@ -909,6 +929,25 @@ mod tests {
             .err()
             .expect("empty token");
         assert!(matches!(err, Error::EmptyToken), "{err}");
+    }
+
+    /// A refused token is counted; the counter is shared through `Options`.
+    #[tokio::test]
+    async fn wrong_token_counts_an_auth_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let s = server();
+        let addr = s.local_addr();
+        let srv = s.clone();
+        tokio::spawn(async move { srv.run().await });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(&wire::encode_header(Op::Auth as u8, 5))
+            .await
+            .unwrap();
+        c.write_all(b"wrong").await.unwrap();
+        let mut hdr = [0u8; wire::HEADER_LEN];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(wire::decode_header(&hdr).0, Status::Unauthorized as u8);
+        assert_eq!(s.metrics.auth_failures.load(Ordering::Relaxed), 1);
     }
 
     /// PING is an op like any other: before AUTH it is refused and the
