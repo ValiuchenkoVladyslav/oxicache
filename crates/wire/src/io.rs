@@ -115,10 +115,20 @@ impl FrameReader {
         // Grow towards a pending large frame geometrically rather than
         // reserving its full claimed length up front: a peer that announces
         // a maximal frame and sends nothing must not pin that much memory.
+        // Once at least half of the frame has arrived, reserve the rest in
+        // one step — the remainder reads into place with no further
+        // tail-copying growth, and the reservation stays bounded by what
+        // the peer has already sent.
         let pending = self.need.saturating_sub(self.buf.len());
-        let want = pending.min(self.buf.capacity().max(BUF)).max(BUF / 4);
+        let half_arrived = pending > 0 && self.buf.len() >= pending;
+        let want = if half_arrived {
+            pending
+        } else {
+            pending.min(self.buf.capacity().max(BUF)).max(BUF / 4)
+        };
         if self.buf.capacity() - self.buf.len() < want {
-            self.buf.reserve(want.max(BUF));
+            self.buf
+                .reserve(if half_arrived { want } else { want.max(BUF) });
         }
         Ok(r.read_buf(&mut self.buf).await? != 0)
     }
@@ -339,6 +349,29 @@ impl FrameWriter {
         self.len = 0;
         v
     }
+
+    /// Drain queued output as one contiguous `Bytes`: no copy at all when
+    /// everything already sits in one piece (the usual lone response frame),
+    /// one exact-sized copy otherwise.
+    pub fn take_bytes(&mut self) -> Bytes {
+        let total = self.len;
+        self.len = 0;
+        if self.pieces.is_empty() {
+            return self.chunk.split().freeze();
+        }
+        if self.pieces.len() == 1 && self.chunk.is_empty() {
+            return match self.pieces.pop().expect("one piece") {
+                Piece::Own(b) => b.freeze(),
+                Piece::Shared(b) => b,
+            };
+        }
+        let mut out = BytesMut::with_capacity(total);
+        for p in self.pieces.drain(..) {
+            out.put_slice(&p);
+        }
+        out.put_slice(&self.chunk.split());
+        out.freeze()
+    }
 }
 
 /// Keep freed memory in the process instead of returning it to the kernel.
@@ -430,6 +463,26 @@ mod tests {
         let mut r = FrameReader::new(10);
         r.buf.put_slice(&encode_header(1, 11));
         assert_eq!(r.next_buffered(), Err(FrameTooLarge(11)));
+    }
+
+    #[test]
+    fn take_bytes_skips_the_flatten() {
+        // Everything in the chunk: handed over without a copy.
+        let mut w = FrameWriter::new();
+        w.frame(1, Bytes::from_static(b"small"));
+        let out = w.take_bytes();
+        assert_eq!(out[0], 1);
+        assert_eq!(&out[HEADER_LEN..], b"small");
+        assert!(w.is_empty());
+        // A referenced body splits the queue into header + shared pieces:
+        // one exact-sized copy.
+        let big = Bytes::from(vec![7u8; INLINE_BODY * 2]);
+        w.frame(2, big.clone());
+        let out = w.take_bytes();
+        assert_eq!(out.len(), HEADER_LEN + big.len());
+        assert_eq!(&out[HEADER_LEN..], &big[..]);
+        assert!(w.is_empty());
+        assert!(w.take_bytes().is_empty());
     }
 
     #[test]

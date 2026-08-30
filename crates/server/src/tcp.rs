@@ -587,14 +587,22 @@ fn batch(body: &[u8], cache: &Cache, out: &mut FrameWriter) {
     };
     let mark = out.begin(Status::Ok as u8);
     out.put_slice(&(items.len() as u32).to_le_bytes());
+    // Scratch for the runs below. Collecting a run before the cache call
+    // gives it an exact length; the unknown-length iterators used before
+    // made the cache's own scratch grow from a size hint of 1.
+    let mut keys: Vec<&[u8]> = Vec::new();
+    let mut entries: Vec<(&[u8], &[u8])> = Vec::new();
     let mut items = items.peekable();
     while let Some((op, b)) = items.next() {
         match Op::from_u8(op) {
             Some(Op::Get) => {
-                let run = std::iter::once(b).chain(std::iter::from_fn(|| {
-                    items.next_if(|(o, _)| *o == op).map(|(_, k)| k)
-                }));
-                cache.get_many(run, |found| {
+                keys.clear();
+                keys.reserve(items.len() + 1);
+                keys.push(b);
+                while let Some((_, k)) = items.next_if(|(o, _)| *o == op) {
+                    keys.push(k);
+                }
+                cache.get_many(keys.iter().copied(), |found| {
                     for e in found {
                         match e {
                             Some(e) => value(e, out),
@@ -606,7 +614,8 @@ fn batch(body: &[u8], cache: &Cache, out: &mut FrameWriter) {
             Some(Op::Set) => {
                 // A run ends at the first item that does not parse; that
                 // one is refused on its own and the next run starts after it.
-                let mut entries = Vec::new();
+                entries.clear();
+                entries.reserve(items.len() + 1);
                 let mut bad = None;
                 match wire::set_body(b) {
                     Ok(kv) => entries.push(kv),
@@ -645,10 +654,13 @@ fn batch(body: &[u8], cache: &Cache, out: &mut FrameWriter) {
                 }
             }
             Some(Op::Del) => {
-                let run = std::iter::once(b).chain(std::iter::from_fn(|| {
-                    items.next_if(|(o, _)| *o == op).map(|(_, k)| k)
-                }));
-                cache.del_many(run, |found| {
+                keys.clear();
+                keys.reserve(items.len() + 1);
+                keys.push(b);
+                while let Some((_, k)) = items.next_if(|(o, _)| *o == op) {
+                    keys.push(k);
+                }
+                cache.del_many(keys.iter().copied(), |found| {
                     out.header(if found { Status::Ok } else { Status::NotFound } as u8, 0)
                 });
             }

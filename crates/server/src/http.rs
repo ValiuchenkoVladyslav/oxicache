@@ -274,7 +274,7 @@ async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response
     };
     let mut out = FrameWriter::new();
     tcp::dispatch(op as u8, &body, cache, &mut out);
-    let raw = Bytes::from(out.take());
+    let raw = out.take_bytes();
     let (status, len) = wire::decode_header(raw[..wire::HEADER_LEN].try_into().expect("header"));
     debug_assert_eq!(raw.len(), wire::HEADER_LEN + len);
     let body = raw.slice(wire::HEADER_LEN..);
