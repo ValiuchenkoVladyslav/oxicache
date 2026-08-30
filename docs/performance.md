@@ -306,3 +306,97 @@ with the slab allocator, when the entry layout changes anyway); 8 `Acquire` load
 bucket in `Table::find` (free on x86, costs `ldar`s on aarch64 — unmeasurable here);
 `path.contains` in `find_path` (O(n²) over ≤ 256 hops, only at 7/8 load); grouping
 `set_many` by shard (16 entries over 16 shards already take ~one lock each).
+
+## Round 10: io_uring and kTLS study (2026-08-30)
+
+Question: would io_uring (fewer syscalls, zero-copy send) or kTLS (kernel-side record
+crypto) buy anything? Everything below was re-measured today on the same box (Linux 6.18,
+`tls` module available, io_uring enabled): server user/sys CPU per request from `/proc`,
+min of 3 alternating 6 s runs after a 2 s warm-up, syscalls per request counted with an
+`LD_PRELOAD` shim around `recv`/`writev`/`epoll_wait`, user-side profile from `perf record
+-e cycles:u` (no root, so no kernel symbols).
+
+### Baseline: plain vs TLS (rustls 0.23 / ring, tokio-rustls 0.26)
+
+| profile | plain (user / sys) | TLS (user / sys) | TLS cost | syscalls per request, plain → TLS |
+|---|---|---|---|---|
+| A: 8×16, 128 B, 10 % writes | 4.3 / 2.5 = 6.8 µs, 404k | 5.8 / 4.9 = 10.7 µs, 309k | +57 % | recv 0.18 → 0.21, writev 0.17 → **0.58**, epoll 0.09 |
+| B: 8×16, 1 KiB, 50 % writes | 25 / 17.5 = 43 µs, 99k | 36 / 12.8 = 49 µs, 87k | +14 % | recv 0.18 → **0.68**, writev 0.35 → 0.85 |
+| C: 12×32, 4 KiB, 90 % writes | 66 / 55 = 120 µs, 27k | 93 / 57 = 150 µs, 24k | +25 % | recv 0.41 → **2.1**, writev 0.37 → 0.96 |
+| D: 64×2, 128 B, 10 % writes | 5.1 / 5.9 = 11.0 µs, 256k | 6.9 / 8.1 = 15.0 µs, 216k | +37 % | recv 0.61, writev 0.61 → **1.0** |
+
+Plain TCP makes about half a syscall per request: pipelining already amortises `recv`
+and `writev` over ~5 requests, and `epoll_wait` over ~11. The kernel time that remains
+(2.5 µs on A for ~2.5 KiB out + 0.5 KiB in) is loopback TCP itself.
+
+Where TLS spends its extra time, from `perf` (user side): ring's AES-GCM is ~10 % of user
+time on A (≈ 0.6 µs) and ~9.5 % on C (≈ 9 µs, decrypting 32 KiB of `set` bodies per
+request); the rest of the user delta is rustls record framing, tokio-rustls glue and the
+extra copy rustls makes between its deframer buffer and ours. The **larger** part of the
+small-request overhead was kernel time, and the syscall counts say why: `writev` per
+request tripled. No `EAGAIN` or partial writes were involved (counted: zero) — the server
+was simply flushing three times per `recv`.
+
+### Cause and fix: one record per `poll_read`
+
+tokio-rustls's `poll_read` goes through rustls's `Reader::fill_buf`, which hands out one
+decrypted record per call, and a client writes each request as its own record. So under
+TLS the connection loop in `tcp.rs` saw one or two requests per wake, flushed, and polled
+again — even though rustls had already decrypted the whole `recv`. `Drained` in
+`crates/server/src/tcp.rs` wraps the handshaken stream and, after the inner read has done
+its I/O, copies the rest of the decrypted plaintext out through `ServerConnection::reader()`
+synchronously (no syscall). Plain TCP is untouched.
+
+| profile | TLS before | TLS with `Drained` | plain, for reference |
+|---|---|---|---|
+| A | 10.7 µs, 309k | **8.6 µs** (5.8 / 2.9), 345k (−20 % CPU) | 6.8 µs, 404k |
+| B | 49 µs | 49 µs (neutral: a 16 KiB body is one record per request anyway) | 43 µs |
+| C | 150 µs | 150 µs (neutral) | 120 µs |
+| D | 15.0 µs, 216k | **13.0 µs** (6.8 / 6.2), 231k (−13 %) | 11.0 µs, 256k |
+
+`writev` per request on A: 0.58 → 0.22 (plain: 0.17); sys time is back to the plain
+level. What TLS still costs after this is user-side: +1.8 µs on A, +6 on B, +30 on C.
+
+### kTLS
+
+kTLS (`setsockopt(SOL_TLS)` after a rustls handshake; the `ktls` crate, 6.0.2 from April
+2025, does exactly this on top of tokio-rustls and needs the kernel `tls` module, TLS 1.3
+AES-GCM/ChaCha20 which we already restrict to) would move AES-GCM into the kernel and
+remove rustls's per-record buffer copy: reads would land in our buffer once, as with plain
+TCP. It does not remove the crypto — the kernel's `gcm(aes)` (VAES/AVX2 on this CPU since
+6.11) costs about what ring costs per byte, and software kTLS RX is widely reported as
+break-even or worse than user-space rustls, because each record goes through the async
+crypto API with an `aead_request` allocation. The wins kTLS is known for — `sendfile` /
+`splice` of file data through an encrypted socket — do not apply: nothing here comes
+from a file.
+
+Upper bound of what it could take back, from the numbers above: the copy and framing
+share of the remaining TLS delta, i.e. perhaps 1 µs of A's 8.6 and 10–15 µs of C's 150
+(5–10 % of TLS-mode CPU, nothing in plain mode), against: a second I/O path in `tcp.rs`
+and `http.rs` (control messages for alerts and `KeyUpdate` arrive as `EMSGSIZE`/`cmsg`
+and must be handled by hand; `close_notify` on shutdown), a kernel-module dependency
+(`modprobe tls`), TLS 1.3 `KeyUpdate` and 0-RTT caveats, and a client whose TLS path is
+`node:tls`/rustls and gains nothing. Not worth it at these request sizes; revisit only if
+TLS mode ever carries multi-megabyte values, where the copy dominates.
+
+### io_uring
+
+Syscalls are already ~0.45 per request on the read-heavy profiles and ~0.9 on the 4 KiB
+one; at a few hundred nanoseconds each that is 2–4 % of A and under 1 % of C. io_uring
+removes the syscall entry/exit and the `epoll_wait`, not the TCP stack, which is where the
+sys time is. `IORING_OP_SEND_ZC` needs sends of ~10 KiB and up to beat a copy; ours are
+2–11 KiB. Multishot `recv` with provided-buffer rings would also displace the single
+reusable read buffer that request bodies are borrowed from (round 7's zero-copy bodies),
+so it is a redesign of `FrameReader`, not a drop-in. The runtime options are
+`tokio-uring` (maintenance mode), `monoio`/`glommio` (thread-per-core, would replace
+tokio wholesale — tokio itself is ~2 % of the profile, `--per-core` already exists for
+the scheduling side), or `luring` from loona (an io_uring layer *on top of* tokio, last
+commit April 2025, README calls the project experimental, no published numbers). The
+tarweb write-up demonstrates zero syscalls per request with io_uring + kTLS but reports
+no benchmarks, and needed a kernel patch for `setsockopt` through io_uring at the time
+(`SOCKET_URING_OP_SETSOCKOPT` landed in 6.7).
+
+Decision: neither. The measurable TLS overhead that was syscall-shaped is gone with
+`Drained`; what is left is crypto and copies at sizes where the kernel does them no
+cheaper. If a future profile shows syscalls above ~2 per request (many connections, no
+pipelining), the cheap first step is `--per-core` plus `SO_BUSY_POLL`, not io_uring.

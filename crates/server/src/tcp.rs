@@ -355,9 +355,83 @@ async fn serve(
             let Some(stream) = by(Some(auth_deadline), acceptor.accept(stream)).await? else {
                 return Ok(true);
             };
-            let (r, w) = tokio::io::split(stream);
+            let (r, w) = tokio::io::split(Drained(stream));
             serve_connection(r, w, auth_deadline, cache, token, idle).await
         }
+    }
+}
+
+/// A TLS stream whose reads return every decrypted byte rustls holds, not
+/// one record. tokio-rustls's `poll_read` hands out a single plaintext
+/// chunk per call (rustls `Reader::fill_buf`), and a client sends each
+/// request as its own record, so without this the loop in
+/// [`serve_connection`] saw one or two requests per wake and flushed after
+/// each: three `writev`s per `recv` instead of one. After the inner read
+/// has done its I/O, the rest of the already-decrypted plaintext is copied
+/// out synchronously; no extra syscall.
+struct Drained(tokio_rustls::server::TlsStream<TcpStream>);
+
+impl AsyncRead for Drained {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::io::Read;
+        let before = buf.filled().len();
+        std::task::ready!(std::pin::Pin::new(&mut self.0).poll_read(cx, buf))?;
+        if buf.filled().len() == before {
+            return std::task::Poll::Ready(Ok(()));
+        }
+        let (_, conn) = self.0.get_mut();
+        while buf.remaining() > 0 {
+            // SAFETY: `Reader::read` only writes into the slice and reports
+            // how much it wrote; nothing reads the uninitialised tail.
+            let spare = unsafe {
+                let s = buf.unfilled_mut();
+                std::slice::from_raw_parts_mut(s.as_mut_ptr().cast::<u8>(), s.len())
+            };
+            match conn.reader().read(spare) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => unsafe {
+                    buf.assume_init(n);
+                    buf.advance(n);
+                },
+            }
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for Drained {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
     }
 }
 
