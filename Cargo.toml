@@ -8,18 +8,12 @@ edition = "2024"
 rust-version = "1.87"
 license = "MIT"
 
+# Only what more than one crate uses; each crate adds the tokio features it needs.
 [workspace.dependencies]
 oxicache-wire = { path = "crates/wire" }
-oxicache-server = { path = "crates/server" }
-
 bytes = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "signal", "io-util"] }
 thiserror = "2"
-clap = { version = "4", features = ["derive", "env"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rapidhash = { version = "4.5", default-features = false, features = ["std"] }
-parking_lot = "0.12"
+tokio = { version = "1", features = ["io-util"] }
 
 [profile.release]
 lto = "fat"

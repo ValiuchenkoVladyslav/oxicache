@@ -12,13 +12,13 @@ path = "src/main.rs"
 [dependencies]
 oxicache-wire.workspace = true
 bytes.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 thiserror.workspace = true
-clap.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
 serde = "1"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 
 [dev-dependencies]
-oxicache-server.workspace = true
+oxicache-server = { path = "../server" }
 serde = { version = "1", features = ["derive"] }

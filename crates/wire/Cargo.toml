@@ -8,5 +8,8 @@ description = "Binary wire format shared by the oxicache server and client"
 [dependencies]
 bytes.workspace = true
 thiserror.workspace = true
-tokio = { version = "1", features = ["io-util"] }
+tokio.workspace = true
 libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
