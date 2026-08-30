@@ -49,7 +49,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use oxicache_wire::io::{BUF, FrameReader, FrameWriter};
 use oxicache_wire::{self as wire, Op, Status};
 use serde::Serialize;
@@ -162,10 +162,8 @@ pub struct Client {
     inner: Arc<Inner>,
 }
 
-/// A batch of keys for the `_multi` methods: a tuple `(K1, K2, …)` of up to
-/// 16 keys, an array `[K; N]`, a `Vec<K>` or a `&[K]`, each key any
-/// `AsRef<[u8]>`. Tuples and arrays give arrays back, vectors and slices
-/// give vectors.
+/// An error no reconnect can fix: once seen, the client is dead and every
+/// call fails with it.
 #[derive(Clone)]
 enum Fatal {
     /// The token was refused on (re)connect: rotated or wrong, and no
@@ -595,9 +593,13 @@ impl Client {
 
     /// Store `value` under `key`, replacing what was there.
     pub async fn set<V: Serialize>(&self, key: impl AsRef<[u8]>, value: V) -> Result<()> {
-        let value = encode(&value)?;
-        self.call(Op::Set, wire::encode_set(key.as_ref(), &value))
-            .await?;
+        let key = key.as_ref();
+        // The value is serialised straight into the request body; no
+        // intermediate buffer.
+        let mut body = BytesMut::with_capacity(wire::set_size(key, &[]));
+        wire::put_set_key(&mut body, key);
+        rmp_serde::encode::write_named(&mut (&mut body).writer(), &value)?;
+        self.call(Op::Set, body.freeze()).await?;
         Ok(())
     }
 
@@ -647,6 +649,14 @@ impl Batch {
         Self::default()
     }
 
+    /// With room for `bytes` of encoded items (headers included) before the
+    /// buffer grows; worth using when the batch's size is roughly known.
+    pub fn with_capacity(bytes: usize) -> Self {
+        Self {
+            enc: wire::BatchEncoder::with_capacity(bytes),
+        }
+    }
+
     /// Items so far.
     pub fn len(&self) -> usize {
         self.enc.len()
@@ -669,11 +679,13 @@ impl Batch {
         self.slot()
     }
 
-    /// Store `value` under `key`; encoding happens now, so a value that
-    /// cannot be serialised is refused here rather than at send time.
+    /// Store `value` under `key`; encoding happens now, straight into the
+    /// batch buffer, so a value that cannot be serialised is refused here
+    /// rather than at send time.
     pub fn set<V: Serialize>(&mut self, key: impl AsRef<[u8]>, value: V) -> Result<Slot<()>> {
-        let value = encode(&value)?;
-        self.enc.set(key.as_ref(), &value);
+        self.enc.set_with(key.as_ref(), |out| {
+            rmp_serde::encode::write_named(&mut out.writer(), &value)
+        })?;
         Ok(self.slot())
     }
 
@@ -793,13 +805,6 @@ impl Reply for bool {
     }
 }
 
-fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
-    Ok(rmp_serde::to_vec_named(value)?)
-}
-
-/// What `get_multi::<Vs, _>` over this key batch returns: `(Option<V1>, …)`
-/// for a tuple of keys with `Vs = (V1, …)`, `[Option<V>; N]` or
-/// `Vec<Option<V>>` for an array, `Vec` or slice of keys with `Vs = V`.
 /// A flush this small waits one scheduler turn for more requests to
 /// coalesce (see `write_loop`); a larger one goes out at once.
 const YIELD_BELOW: usize = BUF / 4;
@@ -812,9 +817,10 @@ async fn write_loop<W: AsyncWrite + Unpin>(
     mut stop: oneshot::Receiver<()>,
     lost: Arc<OnceLock<Lost>>,
 ) {
-    // Request bodies were just encoded and are hot; copy them into the
-    // coalescing buffer unless they are huge.
-    let mut out = FrameWriter::with_inline_limit(BUF);
+    // Small request bodies were just encoded and are hot, so copying them
+    // into the coalescing buffer is cheap; from 4 KiB up, riding as a
+    // `writev` iovec entry beats the copy (measured in round 13).
+    let mut out = FrameWriter::with_inline_limit(4 << 10);
     let idle = tokio::time::sleep(keepalive);
     tokio::pin!(idle);
     loop {

@@ -147,9 +147,15 @@ pub fn set_size(key: &[u8], value: &[u8]) -> usize {
 /// Append a SET body to `out`.
 #[inline]
 pub fn put_set(out: &mut BytesMut, key: &[u8], value: &[u8]) {
+    put_set_key(out, key);
+    out.put_slice(value);
+}
+
+/// Append the `u32 klen, key` prefix of a SET body; the value follows it.
+#[inline]
+pub fn put_set_key(out: &mut BytesMut, key: &[u8]) {
     out.put_u32_le(key.len() as u32);
     out.put_slice(key);
-    out.put_slice(value);
 }
 
 /// A SET body.
@@ -180,7 +186,9 @@ impl Default for BatchEncoder {
 
 impl BatchEncoder {
     pub fn new() -> Self {
-        Self::with_capacity(0)
+        // Room for a typical batch of small items without regrowing from
+        // nothing; callers that know their size use `with_capacity`.
+        Self::with_capacity(512)
     }
 
     /// With room for `bytes` of items before the buffer grows.
@@ -213,6 +221,27 @@ impl BatchEncoder {
     pub fn set(&mut self, key: &[u8], value: &[u8]) {
         self.item(Op::Set, set_size(key, value));
         put_set(&mut self.out, key, value);
+    }
+
+    /// A SET item whose value bytes are produced by `value` straight into
+    /// the buffer — no intermediate allocation — under a length patched
+    /// afterwards. An error rolls the item back completely.
+    pub fn set_with<E>(
+        &mut self,
+        key: &[u8],
+        value: impl FnOnce(&mut BytesMut) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        let at = self.out.len();
+        self.item(Op::Set, 0);
+        put_set_key(&mut self.out, key);
+        if let Err(e) = value(&mut self.out) {
+            self.out.truncate(at);
+            self.count -= 1;
+            return Err(e);
+        }
+        let len = ((self.out.len() - at - HEADER_LEN) as u32).to_le_bytes();
+        self.out[at + 1..at + HEADER_LEN].copy_from_slice(&len);
+        Ok(())
     }
 
     pub fn del(&mut self, key: &[u8]) {
@@ -350,6 +379,32 @@ mod tests {
             ]
         );
         assert_eq!(frames(&BatchEncoder::new().finish()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn set_with_writes_in_place() {
+        let mut b = BatchEncoder::new();
+        b.get(b"a");
+        b.set_with(b"k", |out| {
+            out.put_slice(b"value");
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        assert_eq!(b.len(), 2);
+        // A failed item leaves no trace.
+        assert_eq!(b.set_with(b"bad", |_| Err("no")), Err("no"));
+        assert_eq!(b.len(), 2);
+        b.del(b"z");
+        let body = b.finish();
+        let items: Vec<_> = frames(&body).unwrap().collect();
+        assert_eq!(
+            items,
+            vec![
+                (Op::Get as u8, &b"a"[..]),
+                (Op::Set as u8, &encode_set(b"k", b"value")[..]),
+                (Op::Del as u8, &b"z"[..]),
+            ]
+        );
     }
 
     #[test]

@@ -273,13 +273,20 @@ async fn bench(
                     rng ^= rng << 17;
                     rng
                 };
+                // Reused across iterations: the bench client caps the whole
+                // loopback run, so per-request allocations here cost
+                // throughput. The batch buffers are sized for headers, keys
+                // and encoded values with room to spare.
+                let write_bytes = batch * (key_len + value_size + 24);
+                let read_bytes = batch * (key_len + 8);
+                let mut ks: Vec<&[u8]> = Vec::with_capacity(batch);
+                let mut slots = Vec::with_capacity(batch);
                 while Instant::now() < deadline {
-                    let ks: Vec<&[u8]> = (0..batch)
-                        .map(|_| {
-                            let i = next() as usize % keyspace * key_len;
-                            &keys[i..i + key_len]
-                        })
-                        .collect();
+                    ks.clear();
+                    for _ in 0..batch {
+                        let i = next() as usize % keyspace * key_len;
+                        ks.push(&keys[i..i + key_len]);
+                    }
                     let write = (next() % 10_000) as f64 / 10_000.0 < write_ratio;
                     // Skip over each value without building it: the bench
                     // measures the cache, not deserialisation.
@@ -291,16 +298,20 @@ async fn bench(
                             hits.fetch_add(1, Relaxed);
                         }
                     } else {
-                        let mut b = Batch::new();
+                        let mut b =
+                            Batch::with_capacity(if write { write_bytes } else { read_bytes });
                         if write {
                             for k in &ks {
                                 b.set(k, value.as_str())?;
                             }
                             client.batch(b).await?;
                         } else {
-                            let slots: Vec<_> = ks.iter().map(|k| b.get::<Skip>(k)).collect();
+                            slots.clear();
+                            for k in &ks {
+                                slots.push(b.get::<Skip>(k));
+                            }
                             let out = client.batch(b).await?;
-                            for s in slots {
+                            for &s in &slots {
                                 if out.get(s)?.is_some() {
                                     hits.fetch_add(1, Relaxed);
                                 }
