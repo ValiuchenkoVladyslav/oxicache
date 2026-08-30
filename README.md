@@ -37,7 +37,7 @@ first request on every connection, and anything else (PING included) gets status
 connection is closed. A TCP connection that has not authenticated within 30 s of being
 accepted is dropped; that cap is fixed, not a setting. There is no unauthenticated mode on
 either side: the Rust
-`Client::connect(addr, format, token)` and the TS transports (`tcp({ …, token })`,
+`Client::connect(addr, token)` and the TS transports (`tcp({ …, token })`,
 `http({ …, token })`) take the token as a required argument, and the CLI requires `--token` /
 `OXICACHE_TOKEN` (it also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
 tunnel.
@@ -133,6 +133,18 @@ the named type as `Error::Deserialize`; the connection stays usable after either
 (`oxicache_wire::KEEPALIVE`) without a write, so a quiet connection survives the server's
 300 s idle timeout.
 
+A connection lost to the server or the network (EOF, reset, any socket I/O error — the
+server's idle close, a restart) is reconnected lazily: nothing happens in the background, the
+next call re-connects and re-authenticates, and the calls that were in flight are re-issued
+once on the new connection (every op is idempotent); if that connection is lost too they fail
+with `Error::Closed`. Concurrent callers wait on the one attempt; failed attempts back off
+from 100 ms, doubling to 5 s, reset after a success, and a call that arrives during the wait
+waits too. Nothing else reconnects: a refused token on reconnect (rotated) makes the client
+dead — every later call fails with that `Unauthorized` error — and so does a server that
+answers out of protocol (unsolicited frame, invalid status byte). A status error, a
+`Serialize`/`Deserialize` failure or a `ResponseTooLarge` reply is the call's alone and leaves
+the client usable. Dropping the last clone closes the connection.
+
 ## TypeScript client
 
 `packages/client-ts` is a `Client` over a pluggable `Transport`, each transport on its own
@@ -185,6 +197,16 @@ by itself after `keepaliveMs` (default 100 000, a third of the server's 300 s id
 without a write, on an unref'd timer, so a quiet connection stays open without keeping the
 process alive; HTTP needs no heartbeat, since each call is its own request.
 
+The TCP transport reconnects lazily when the connection is lost (closed by the server or the
+network: idle timeout, restart, reset): the next call re-connects and re-authenticates, and
+in-flight calls are re-issued once on the new connection, failing with `ClosedError` if that
+one is lost too. Concurrent callers wait on the one attempt, with a 100 ms → 5 s exponential
+backoff between failed attempts (reset after a success); `isOpen` is false while the
+connection is down. It never reconnects on a refused token (the transport is dead and every
+later call rejects with that `StatusError`), on a protocol desync (an invalid status byte or
+an unsolicited frame — dead with `ClosedError`), on any other `StatusError` or encode error
+(the call fails, the connection stays), or after `close()`, which is final.
+
 ## Development
 
 ```sh
@@ -231,3 +253,7 @@ The pre-commit hook (`.husky/pre-commit`) runs `cargo fmt --check`, `clippy -D w
 - 64-bit targets only: index slots pack a 48-bit entry address next to a 16-bit tag.
 - The client pipelines calls from any number of tasks onto one connection (writer task
   coalesces queued frames into one flush; reader task matches responses in order).
+- Both TCP clients reconnect on connection loss only: lazily, on the next call, one shared
+  attempt at a time, with a 100 ms → 5 s backoff; in-flight calls are re-issued once on the
+  new connection. Never on an auth, status, encode or protocol error, and never after
+  `close()`.

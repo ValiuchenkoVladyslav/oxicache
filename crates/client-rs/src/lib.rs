@@ -28,9 +28,18 @@
 //! (300 s by default), so a client that has sent nothing for
 //! [`KEEPALIVE`](oxicache_wire::KEEPALIVE) (100 s) pings on its own; nothing
 //! is needed from the caller to keep a quiet client connected.
+//!
+//! A lost connection — closed by the server (idle timeout, restart) or the
+//! network — is reconnected lazily by the next call, which re-authenticates
+//! and re-issues the calls that were in flight once (every op is
+//! idempotent). Failed attempts back off from 100 ms to 5 s. A refused token
+//! or a server that does not speak the protocol is permanent: the client is
+//! dead and every call fails with that error. Status, encoding and decoding
+//! errors are the call's alone; the connection stays.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -40,7 +49,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::Instant;
 
 #[derive(Debug, thiserror::Error)]
@@ -70,13 +79,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Largest response body accepted from the server.
 const MAX_FRAME: usize = wire::MAX_FRAME;
 
-type Reply = oneshot::Sender<Result<Bytes>>;
+/// Wait before the second reconnect attempt in a row; the first is immediate.
+const BACKOFF_MIN: Duration = Duration::from_millis(100);
+/// Every failed attempt doubles the wait, up to this.
+const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-/// One connection.
+type Reply = oneshot::Sender<Result<Bytes>>;
+type Request = (Op, Bytes, Reply);
+
+/// A connection to one server, kept alive across losses: cheap to clone,
+/// shared by any number of tasks. See the crate docs for what is retried.
 #[derive(Clone)]
 pub struct Client {
-    tx: mpsc::Sender<(Op, Bytes, Reply)>,
-    _conn: Arc<Connection>,
+    inner: Arc<Inner>,
 }
 
 /// A batch of keys for the `_multi` methods: a tuple `(K1, K2, …)` of up to
@@ -171,16 +186,317 @@ impl<K: AsRef<[u8]>> Keys for &[K] {
     }
 }
 
-/// Aborts the I/O tasks when the last clone is dropped.
-struct Connection {
+/// Why a client stopped for good. Kept as data rather than an [`Error`]
+/// because every later call has to report it again and `Error` is not
+/// `Clone`.
+#[derive(Clone)]
+enum Fatal {
+    /// The token was refused on (re)connect: rotated or wrong, and no
+    /// amount of reconnecting will change the server's mind.
+    Unauthorized(String),
+    /// The server sent a status byte the protocol does not have.
+    InvalidStatus(u8),
+    /// The server sent a frame nobody asked for: matching can't be trusted.
+    Desync,
+}
+
+impl Fatal {
+    fn error(&self) -> Error {
+        match self {
+            Self::Unauthorized(message) => Error::Status {
+                status: Status::Unauthorized,
+                message: message.clone(),
+            },
+            Self::InvalidStatus(b) => Error::InvalidStatus(*b),
+            Self::Desync => Error::Closed,
+        }
+    }
+
+    /// Whether a failed connect + AUTH is worth trying again.
+    fn of(err: &Error) -> Option<Self> {
+        match err {
+            Error::Status {
+                status: Status::Unauthorized,
+                message,
+            } => Some(Self::Unauthorized(message.clone())),
+            Error::InvalidStatus(b) => Some(Self::InvalidStatus(*b)),
+            _ => None,
+        }
+    }
+}
+
+/// Why a connection ended, recorded by the I/O task that ended it before
+/// the callers waiting on it are woken, so they know whether to reconnect.
+#[derive(Clone)]
+enum Lost {
+    /// EOF, reset, I/O error, oversized response: the next call reconnects.
+    Transient,
+    Fatal(Fatal),
+}
+
+/// A transient reason a connect + AUTH failed, kept in a form every caller
+/// waiting on that attempt can be handed (an [`Error`] is not `Clone`).
+#[derive(Clone)]
+enum Setback {
+    Io(std::io::ErrorKind, String),
+    /// The server hung up before answering AUTH.
+    Closed,
+    /// A status other than `Unauthorized` to AUTH; not our server's doing,
+    /// but not proof of a different protocol either.
+    Status(Status, String),
+    ResponseTooLarge(usize),
+}
+
+impl Setback {
+    fn error(&self) -> Error {
+        match self {
+            Self::Io(kind, message) => Error::Io(std::io::Error::new(*kind, message.clone())),
+            Self::Closed => Error::Closed,
+            Self::Status(status, message) => Error::Status {
+                status: *status,
+                message: message.clone(),
+            },
+            Self::ResponseTooLarge(n) => Error::ResponseTooLarge(*n),
+        }
+    }
+}
+
+/// Why a connect + AUTH failed: for good, or for now.
+enum Failed {
+    Fatal(Fatal),
+    Setback(Setback),
+}
+
+impl Failed {
+    /// Every error AUTH can produce; decoding and counting never happen
+    /// on an empty reply, so those variants read as a hang-up.
+    fn of(err: Error) -> Self {
+        if let Some(fatal) = Fatal::of(&err) {
+            return Self::Fatal(fatal);
+        }
+        Self::Setback(match err {
+            Error::Io(e) => Setback::Io(e.kind(), e.to_string()),
+            Error::Status { status, message } => Setback::Status(status, message),
+            Error::ResponseTooLarge(n) => Setback::ResponseTooLarge(n),
+            _ => Setback::Closed,
+        })
+    }
+
+    fn error(&self) -> Error {
+        match self {
+            Self::Fatal(f) => f.error(),
+            Self::Setback(s) => s.error(),
+        }
+    }
+}
+
+/// One live socket: the channel to its writer task and the tasks
+/// themselves, aborted when the connection is replaced or the client
+/// dropped.
+struct Conn {
+    tx: mpsc::Sender<Request>,
+    lost: Arc<OnceLock<Lost>>,
     writer: tokio::task::JoinHandle<()>,
     reader: tokio::task::JoinHandle<()>,
 }
 
-impl Drop for Connection {
+impl Conn {
+    /// Connect and authenticate; the tasks are running when this returns.
+    async fn open(
+        addr: SocketAddr,
+        token: &Bytes,
+        keepalive: Duration,
+    ) -> std::result::Result<Arc<Self>, Failed> {
+        let conn = Self::connect(addr, keepalive).await.map_err(Failed::of)?;
+        match conn.send(Op::Auth, token.clone()).await {
+            Ok(_) => Ok(conn),
+            // Hung up during AUTH: the reader knows whether the server
+            // was speaking another protocol, which is as final as a refused
+            // token.
+            Err(Error::Closed) => Err(match conn.verdict() {
+                Lost::Fatal(f) => Failed::Fatal(f),
+                Lost::Transient => Failed::Setback(Setback::Closed),
+            }),
+            Err(e) => Err(Failed::of(e)),
+        }
+    }
+
+    async fn connect(addr: SocketAddr, keepalive: Duration) -> Result<Arc<Self>> {
+        let stream = TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        let (r, w) = stream.into_split();
+        let (tx, rx) = mpsc::channel::<Request>(1024);
+        let (pending_tx, pending_rx) = mpsc::unbounded_channel::<Reply>();
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let lost = Arc::new(OnceLock::new());
+        let writer = tokio::spawn(write_loop(
+            w,
+            rx,
+            pending_tx,
+            keepalive,
+            stop_rx,
+            lost.clone(),
+        ));
+        let reader = tokio::spawn(read_loop(r, pending_rx, stop_tx, lost.clone()));
+        Ok(Arc::new(Self {
+            tx,
+            lost,
+            writer,
+            reader,
+        }))
+    }
+
+    /// Queue one request and wait for its reply. `Closed` means this
+    /// connection is gone, nothing else does.
+    async fn send(&self, op: Op, body: Bytes) -> Result<Bytes> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send((op, body, reply))
+            .await
+            .map_err(|_| Error::Closed)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// Why this connection ended, if it has; `None` while it is live.
+    fn lost(&self) -> Option<Lost> {
+        self.lost.get().cloned()
+    }
+
+    /// A connection whose caller saw `Closed` is gone even if neither task
+    /// has said why yet.
+    fn verdict(&self) -> Lost {
+        self.lost().unwrap_or(Lost::Transient)
+    }
+}
+
+impl Drop for Conn {
     fn drop(&mut self) {
         self.writer.abort();
         self.reader.abort();
+    }
+}
+
+/// What a call finds when it starts.
+enum Link {
+    Up(Arc<Conn>),
+    /// Lost; the next call reconnects.
+    Down,
+    Dead(Fatal),
+}
+
+/// When the next reconnect may start, and how long the one after it waits
+/// if this one fails too.
+struct Backoff {
+    delay: Duration,
+    not_before: Instant,
+    /// What the last attempt failed with, for callers that were waiting on
+    /// it; `None` after a success.
+    last: Option<Setback>,
+}
+
+impl Backoff {
+    /// Ready now: the attempt after a loss is immediate, only repeated
+    /// failures wait.
+    fn fresh() -> Self {
+        Self {
+            delay: BACKOFF_MIN,
+            not_before: Instant::now(),
+            last: None,
+        }
+    }
+
+    fn failed(&mut self, setback: Setback) {
+        self.not_before = Instant::now() + self.delay;
+        self.delay = (self.delay * 2).min(BACKOFF_MAX);
+        self.last = Some(setback);
+    }
+}
+
+/// The connection supervisor. `link` is all the hot path touches (one read
+/// lock, one `Arc` clone); `slow` is taken only to reconnect, so concurrent
+/// callers that find the link down wait for the one attempt in progress.
+struct Inner {
+    addr: SocketAddr,
+    token: Bytes,
+    keepalive: Duration,
+    link: RwLock<Link>,
+    slow: Mutex<Backoff>,
+    /// Bumped when an attempt ends, so a caller that queued on `slow`
+    /// while one was running can tell it happened and share its outcome
+    /// instead of making its own.
+    attempts: AtomicU64,
+    reconnects: AtomicU64,
+}
+
+impl Inner {
+    /// The connection to use, `None` if a reconnect is needed first.
+    fn current(&self) -> Result<Option<Arc<Conn>>> {
+        match &*self.link.read().unwrap_or_else(PoisonError::into_inner) {
+            // A connection whose end is already known is not worth a call
+            // that would only come back `Closed`.
+            Link::Up(c) if c.lost().is_none() => Ok(Some(c.clone())),
+            Link::Up(_) | Link::Down => Ok(None),
+            Link::Dead(f) => Err(f.error()),
+        }
+    }
+
+    fn set_link(&self, link: Link) {
+        *self.link.write().unwrap_or_else(PoisonError::into_inner) = link;
+    }
+
+    /// Get a live connection after `failed` (the one the caller was on, or
+    /// `None` if it found the link down) stopped answering: the one another
+    /// caller already opened, or a new one. Errors are the attempt's, and
+    /// a fatal one is remembered for every later call.
+    async fn recover(&self, failed: Option<&Arc<Conn>>) -> Result<Arc<Conn>> {
+        let seen = self.attempts.load(Ordering::Acquire);
+        let mut backoff = self.slow.lock().await;
+        // Under `slow` the link is settled: the caller that got here first
+        // has already replaced or condemned it, or failed trying.
+        let settled = match &*self.link.read().unwrap_or_else(PoisonError::into_inner) {
+            Link::Up(c) => match (c.lost(), failed) {
+                (Some(Lost::Fatal(f)), _) => Some(Err(f)),
+                (Some(Lost::Transient), _) => None,
+                // The writer saw the loss and nobody has recorded why yet.
+                (None, Some(f)) if Arc::ptr_eq(c, f) => None,
+                (None, _) => Some(Ok(c.clone())),
+            },
+            Link::Down => None,
+            Link::Dead(f) => Some(Err(f.clone())),
+        };
+        match settled {
+            Some(Ok(conn)) => return Ok(conn),
+            Some(Err(fatal)) => {
+                self.set_link(Link::Dead(fatal.clone()));
+                return Err(fatal.error());
+            }
+            None => self.set_link(Link::Down),
+        }
+        // An attempt ended while this caller was queued: its failure is
+        // this caller's too, rather than the start of a second one.
+        if self.attempts.load(Ordering::Acquire) != seen
+            && let Some(last) = &backoff.last
+        {
+            return Err(last.error());
+        }
+        tokio::time::sleep_until(backoff.not_before).await;
+        let outcome = Conn::open(self.addr, &self.token, self.keepalive).await;
+        self.attempts.fetch_add(1, Ordering::Release);
+        match outcome {
+            Ok(conn) => {
+                self.set_link(Link::Up(conn.clone()));
+                *backoff = Backoff::fresh();
+                self.reconnects.fetch_add(1, Ordering::Relaxed);
+                Ok(conn)
+            }
+            Err(failed) => {
+                match &failed {
+                    Failed::Fatal(fatal) => self.set_link(Link::Dead(fatal.clone())),
+                    Failed::Setback(setback) => backoff.failed(setback.clone()),
+                }
+                Err(failed.error())
+            }
+        }
     }
 }
 
@@ -202,30 +518,47 @@ impl Client {
         keepalive: Duration,
     ) -> Result<Self> {
         assert!(!keepalive.is_zero(), "a zero keepalive would ping non-stop");
-        let stream = TcpStream::connect(addr).await?;
-        stream.set_nodelay(true)?;
-        let (r, w) = stream.into_split();
-        let (tx, rx) = mpsc::channel::<(Op, Bytes, Reply)>(1024);
-        let (pending_tx, pending_rx) = mpsc::unbounded_channel::<Reply>();
-        let writer = tokio::spawn(write_loop(w, rx, pending_tx, keepalive));
-        let reader = tokio::spawn(read_loop(r, pending_rx));
-        let client = Self {
-            tx,
-            _conn: Arc::new(Connection { writer, reader }),
-        };
-        client
-            .call(Op::Auth, Bytes::copy_from_slice(token.as_ref()))
-            .await?;
-        Ok(client)
+        let token = Bytes::copy_from_slice(token.as_ref());
+        let conn = Conn::open(addr, &token, keepalive)
+            .await
+            .map_err(|f| f.error())?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                addr,
+                token,
+                keepalive,
+                link: RwLock::new(Link::Up(conn)),
+                slow: Mutex::new(Backoff::fresh()),
+                attempts: AtomicU64::new(0),
+                reconnects: AtomicU64::new(0),
+            }),
+        })
     }
 
+    /// How many times the connection has been re-established.
+    #[doc(hidden)]
+    pub fn reconnects(&self) -> u64 {
+        self.inner.reconnects.load(Ordering::Relaxed)
+    }
+
+    /// One request, re-issued once if the connection it was on is lost;
+    /// `body` is a refcounted `Bytes`, so keeping it for that is free.
     async fn call(&self, op: Op, body: Bytes) -> Result<Bytes> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send((op, body, reply))
-            .await
-            .map_err(|_| Error::Closed)?;
-        rx.await.map_err(|_| Error::Closed)?
+        let inner = &self.inner;
+        let mut conn = match inner.current()? {
+            Some(conn) => conn,
+            None => inner.recover(None).await?,
+        };
+        let mut retried = false;
+        loop {
+            match conn.send(op, body.clone()).await {
+                Err(Error::Closed) if !retried => {
+                    conn = inner.recover(Some(&conn)).await?;
+                    retried = true;
+                }
+                res => return res,
+            }
+        }
     }
 
     /// Round-trip an empty request: `Ok` proves the connection is alive and
@@ -373,11 +706,16 @@ impl<K: AsRef<[u8]>, V: DeserializeOwned> Values<V> for &[K] {
 /// Writes queued requests, coalescing everything already queued into one
 /// flush. After `keepalive` without a write it sends a PING whose reply is
 /// discarded, so the server's idle timeout never fires on a quiet client.
+/// Stops as soon as the reader does (`stop` resolves when the reader
+/// drops its end), so the socket is closed the moment the connection is
+/// known to be gone rather than at the next write.
 async fn write_loop<W: AsyncWrite + Unpin>(
     mut w: W,
-    mut rx: mpsc::Receiver<(Op, Bytes, Reply)>,
+    mut rx: mpsc::Receiver<Request>,
     pending: mpsc::UnboundedSender<Reply>,
     keepalive: Duration,
+    mut stop: oneshot::Receiver<()>,
+    lost: Arc<OnceLock<Lost>>,
 ) {
     // Request bodies were just encoded and are hot; copy them into the
     // coalescing buffer unless they are huge.
@@ -391,6 +729,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                 None => return,
             },
             () = idle.as_mut() => None,
+            _ = &mut stop => return,
         };
         match msg {
             Some(mut msg) => loop {
@@ -416,24 +755,36 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             }
         }
         if out.flush(&mut w).await.is_err() {
+            // Dropping the write half shuts the socket down for writing, so
+            // the reader sees EOF and fails the callers still queued.
+            let _ = lost.set(Lost::Transient);
             return;
         }
         idle.as_mut().reset(Instant::now() + keepalive);
     }
 }
 
-/// Reads responses and hands each to the oldest pending caller.
-async fn read_loop<R: AsyncRead + Unpin>(mut r: R, mut pending: mpsc::UnboundedReceiver<Reply>) {
+/// Reads responses and hands each to the oldest pending caller. Records
+/// why it stopped before it returns, because returning drops `pending`
+/// and that is what wakes the callers who then ask.
+async fn read_loop<R: AsyncRead + Unpin>(
+    mut r: R,
+    mut pending: mpsc::UnboundedReceiver<Reply>,
+    stop: oneshot::Sender<()>,
+    lost: Arc<OnceLock<Lost>>,
+) {
+    // Dropped on return, which is what stops the writer.
+    let _stop = stop;
     let mut reader = FrameReader::new(MAX_FRAME);
-    loop {
-        loop {
+    let why = loop {
+        let stop = loop {
             match reader.next_buffered_owned() {
                 Ok(Some((status, body))) => {
                     // The writer queues a reply before it sends the request,
                     // so a response with no reply waiting is unsolicited: the
                     // stream is desynchronised and matching can't be trusted.
                     let Ok(reply) = pending.try_recv() else {
-                        return; // dropping `pending` fails every queued caller with Closed
+                        break Some(Lost::Fatal(Fatal::Desync));
                     };
                     let res = match Status::from_u8(status) {
                         Some(Status::Ok) => Ok(body),
@@ -443,26 +794,35 @@ async fn read_loop<R: AsyncRead + Unpin>(mut r: R, mut pending: mpsc::UnboundedR
                         }),
                         None => Err(Error::InvalidStatus(status)),
                     };
-                    let fatal = matches!(res, Err(Error::InvalidStatus(_)));
+                    let fatal = match &res {
+                        Err(Error::InvalidStatus(b)) => Some(Lost::Fatal(Fatal::InvalidStatus(*b))),
+                        _ => None,
+                    };
                     let _ = reply.send(res);
-                    if fatal {
-                        return;
+                    if fatal.is_some() {
+                        break fatal;
                     }
                 }
-                Ok(None) => break,
+                Ok(None) => break None,
                 Err(wire::io::FrameTooLarge(n)) => {
                     // Tell the caller why instead of a bare `Closed`; the
-                    // stream is desynchronised past this point, so stop.
+                    // stream is desynchronised past this point, so stop. The
+                    // fault is the client's limit, not the protocol, so the
+                    // next call may reconnect.
                     if let Ok(reply) = pending.try_recv() {
                         let _ = reply.send(Err(Error::ResponseTooLarge(n)));
                     }
-                    return;
+                    break Some(Lost::Transient);
                 }
             }
+        };
+        if let Some(why) = stop {
+            break why;
         }
         match reader.fill(&mut r).await {
             Ok(true) => {}
-            _ => return,
+            _ => break Lost::Transient,
         }
-    }
+    };
+    let _ = lost.set(why);
 }

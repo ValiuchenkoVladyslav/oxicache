@@ -74,19 +74,22 @@ export interface TestServer {
   /** Base URL of the HTTP listener. */
   url: string;
   proc: Subprocess;
-  stop(): void;
+  /** Kill the server; resolves once it has exited and its ports are free again. */
+  stop(): Promise<void>;
 }
 
 /**
  * Start a server on random loopback ports (TCP and HTTP) and wait until it is
  * listening. The server is configured by `OXICACHE_*` variables only; `env`
  * adds to or overrides the defaults, and the token is `any` unless it sets one.
+ * `port` pins the TCP port, so a server can be restarted where a client
+ * expects it.
  */
 export async function startServer(
   env: Record<string, string> = {},
+  port = freePort(),
 ): Promise<TestServer> {
   await build();
-  const port = freePort();
   const httpPort = freePort();
   const proc = Bun.spawn([bin], {
     cwd: root,
@@ -102,11 +105,14 @@ export async function startServer(
       ...env,
     },
   });
-  const stop = () => proc.kill();
+  const stop = async () => {
+    proc.kill();
+    await proc.exited;
+  };
   try {
     await waitForListen(port, () => proc.exitCode === null);
   } catch (e) {
-    stop();
+    await stop();
     throw e;
   }
   return { port, httpPort, url: `http://127.0.0.1:${httpPort}`, proc, stop };

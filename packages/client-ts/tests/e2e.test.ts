@@ -1,8 +1,99 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { Client, ClosedError, Op, Status, StatusError } from "../src/index";
+import type { Socket } from "bun";
+import {
+  Client,
+  ClosedError,
+  DecodeError,
+  Op,
+  Status,
+  StatusError,
+} from "../src/index";
 import { tcp } from "../src/transport/tcp";
+import { type Frame, FrameReader } from "../src/wire";
 import { must } from "./must";
 import { startServer, type TestServer } from "./server";
+
+/** A complete response frame. */
+function frame(status: number, body: number[] = []): Uint8Array {
+  const f = new Uint8Array(5 + body.length);
+  f[0] = status;
+  new DataView(f.buffer).setUint32(1, body.length, true);
+  f.set(body, 5);
+  return f;
+}
+
+const ok = frame(Status.Ok);
+/** The reply to a one-key GET whose value is the MessagePack `1`. */
+const oneValue = frame(Status.Ok, [1, 0, 0, 0, 1, 1, 0, 0, 0, 1]);
+
+type Conn = Socket<{ n: number; reader: FrameReader }>;
+
+/** Default connection hook: nothing to do on accept. */
+const ignore = () => {
+  // nothing to do
+};
+
+/** Resolves once `cond` holds, polling every few ms; fails after 2 s. */
+async function until(cond: () => boolean): Promise<void> {
+  const deadline = Date.now() + 2000;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error("condition never held");
+    // biome-ignore lint/performance/noAwaitInLoops: polling is sequential by nature
+    await Bun.sleep(5);
+  }
+}
+
+/**
+ * A fake whose first connection hangs up on its first request and which
+ * then drops every further connection on accept: reconnects fail with the
+ * server "down", and every attempt shows up in the accept count.
+ */
+function goesDown() {
+  return fakeServer(
+    (s, _n, f) => {
+      if (f.tag === Op.Auth) s.write(ok);
+      else s.end();
+    },
+    (s, n) => {
+      if (n > 0) s.end();
+    },
+  );
+}
+
+/**
+ * A scripted server: `onFrame` gets every request frame with the ordinal
+ * of the connection it came on (0 for the first), so a test can behave
+ * differently before and after a reconnect and count accepts.
+ */
+function fakeServer(
+  onFrame: (s: Conn, n: number, f: Frame) => void,
+  onOpen: (s: Conn, n: number) => void = ignore,
+) {
+  let accepts = 0;
+  const l = Bun.listen<{ n: number; reader: FrameReader }>({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      open(s) {
+        s.data = { n: accepts++, reader: new FrameReader() };
+        onOpen(s, s.data.n);
+      },
+      data(s, chunk) {
+        const r = s.data.reader;
+        r.push(chunk);
+        for (let f = r.next(); f !== null; f = r.next())
+          onFrame(s, s.data.n, f);
+      },
+    },
+  });
+  return {
+    port: l.port,
+    get accepts() {
+      return accepts;
+    },
+    stop: () => l.stop(true),
+  };
+}
 
 interface User {
   id: number;
@@ -17,7 +108,9 @@ describe("tcp transport e2e", () => {
   beforeAll(async () => {
     server = await startServer();
   });
-  afterAll(() => server.stop());
+  afterAll(async () => {
+    await server.stop();
+  });
 
   test("single key in, single value out", async () => {
     const c = await Client.connect(tcp({ port: server.port, token: "any" }));
@@ -224,7 +317,9 @@ describe("token auth", () => {
   beforeAll(async () => {
     server = await startServer({ OXICACHE_TOKEN: "s3cret" });
   });
-  afterAll(() => server.stop());
+  afterAll(async () => {
+    await server.stop();
+  });
 
   test("wrong token", async () => {
     const err = await Client.connect(
@@ -243,24 +338,12 @@ describe("token auth", () => {
   });
 });
 
-describe("desync", () => {
+describe("desync is permanent", () => {
   test("unsolicited frame closes the connection", async () => {
-    const ok = new Uint8Array([0, 0, 0, 0, 0]); // status OK, empty body
-    let authed = false;
-    const fake = Bun.listen({
-      hostname: "127.0.0.1",
-      port: 0,
-      socket: {
-        data(s) {
-          if (!authed) {
-            authed = true;
-            s.write(ok); // accept AUTH
-            return;
-          }
-          // Reply to the request and send one stray frame in one write.
-          s.write(new Uint8Array([...ok, ...ok]));
-        },
-      },
+    const fake = fakeServer((s, _n, f) => {
+      if (f.tag === Op.Auth) s.write(ok);
+      // Reply to the request and send one stray frame in one write.
+      else s.write(new Uint8Array([...ok, ...ok]));
     });
     try {
       const c = await Client.connect(tcp({ port: fake.port, token: "any" }));
@@ -268,8 +351,254 @@ describe("desync", () => {
       const err = await c.get("a").catch((e) => e);
       expect(err).toBeInstanceOf(ClosedError);
       expect(c.isOpen).toBe(false);
+      // A server that does not speak the protocol is not reconnected to.
+      await expect(c.get("a")).rejects.toBeInstanceOf(ClosedError);
+      expect(fake.accepts).toBe(1);
     } finally {
-      fake.stop(true);
+      fake.stop();
+    }
+  });
+
+  test("an invalid status byte kills the transport", async () => {
+    const fake = fakeServer((s, _n, f) => {
+      s.write(f.tag === Op.Auth ? ok : frame(9));
+    });
+    try {
+      const c = await Client.connect(tcp({ port: fake.port, token: "any" }));
+      const err = await c.get("a").catch((e) => e);
+      expect(err).toBeInstanceOf(DecodeError);
+      expect((err as Error).message).toBe("invalid status byte 9");
+      const later = await c.get("a").catch((e) => e);
+      expect(later).toBeInstanceOf(ClosedError);
+      expect((later as Error).cause).toBe(err);
+      expect(fake.accepts).toBe(1);
+      expect(c.isOpen).toBe(false);
+    } finally {
+      fake.stop();
+    }
+  });
+});
+
+describe("reconnect", () => {
+  test("a server restart is repaired by the next call", async () => {
+    let server = await startServer();
+    const t = await tcp({ port: server.port, token: "any" });
+    const c = await Client.connect(t);
+    await c.set("k", 1);
+    await server.stop();
+    // Down: the call fails with the connection error, not a status.
+    const err = await c.get("k").catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(StatusError);
+    expect(c.isOpen).toBe(false);
+    server = await startServer({}, server.port);
+    try {
+      // Back: the next call reconnects (the cache is new, so the key is gone).
+      expect(await c.get("k")).toBeNull();
+      await c.set("k", 2);
+      expect(await c.get<number>("k")).toBe(2);
+      expect(t.reconnects).toBe(1);
+      expect(c.isOpen).toBe(true);
+      c.close();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test("in-flight calls are retried once", async () => {
+    // Connection 0 hangs up on the first GET; every later one answers it.
+    const fake = fakeServer((s, n, f) => {
+      if (f.tag === Op.Auth) s.write(ok);
+      else if (n === 0) s.end();
+      else s.write(oneValue);
+    });
+    try {
+      const t = await tcp({ port: fake.port, token: "any" });
+      const c = await Client.connect(t);
+      // Two calls lost together share the one reconnect.
+      expect(await Promise.all([c.get("a"), c.get("b")])).toEqual([1, 1]);
+      expect(fake.accepts).toBe(2);
+      expect(t.reconnects).toBe(1);
+      c.close();
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("a retried call is not retried again", async () => {
+    // Every connection hangs up on its first request.
+    const fake = fakeServer((s, _n, f) => {
+      if (f.tag === Op.Auth) s.write(ok);
+      else s.end();
+    });
+    try {
+      const t = await tcp({ port: fake.port, token: "any" });
+      const c = await Client.connect(t);
+      await expect(c.get("a")).rejects.toBeInstanceOf(ClosedError);
+      expect(fake.accepts).toBe(2);
+      expect(t.reconnects).toBe(1);
+      expect(c.isOpen).toBe(false);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("a rotated token kills the client", async () => {
+    // Connection 0 hangs up on the first GET; every later AUTH is refused.
+    const unauthorized = frame(Status.Unauthorized, [...Buffer.from("nope")]);
+    const fake = fakeServer((s, n, f) => {
+      if (n === 0) {
+        if (f.tag === Op.Auth) s.write(ok);
+        else s.end();
+      } else {
+        s.write(unauthorized);
+      }
+    });
+    try {
+      const c = await Client.connect(tcp({ port: fake.port, token: "any" }));
+      const err = await c.get("a").catch((e) => e);
+      expect(err).toBeInstanceOf(StatusError);
+      expect((err as StatusError).status).toBe(Status.Unauthorized);
+      // The second call does not even try: the answer would be the same.
+      await expect(c.get("a")).rejects.toBe(err);
+      expect(fake.accepts).toBe(2);
+      expect(c.isOpen).toBe(false);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("status errors do not reconnect", async () => {
+    let requests = 0;
+    const fake = fakeServer((s, _n, f) => {
+      if (f.tag === Op.Auth) s.write(ok);
+      else if (requests++ === 0)
+        s.write(frame(Status.BadRequest, [...Buffer.from("bad")]));
+      else s.write(oneValue);
+    });
+    try {
+      const t = await tcp({ port: fake.port, token: "any" });
+      const c = await Client.connect(t);
+      const err = await c.get("a").catch((e) => e);
+      expect(err).toBeInstanceOf(StatusError);
+      expect((err as StatusError).status).toBe(Status.BadRequest);
+      expect(await c.get<number>("a")).toBe(1);
+      expect(fake.accepts).toBe(1);
+      expect(t.reconnects).toBe(0);
+      c.close();
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("close during a reconnect is final", async () => {
+    // Connection 0 hangs up on the first GET; connection 1 takes its time
+    // to answer AUTH, so the transport can be closed while it waits.
+    const fake = fakeServer((s, n, f) => {
+      if (n === 0) {
+        if (f.tag === Op.Auth) s.write(ok);
+        else s.end();
+      } else {
+        setTimeout(() => s.write(ok), 100);
+      }
+    });
+    try {
+      const c = await Client.connect(tcp({ port: fake.port, token: "any" }));
+      const inflight = c.get("a");
+      await until(() => !c.isOpen);
+      c.close();
+      await expect(inflight).rejects.toBeInstanceOf(ClosedError);
+      await Bun.sleep(150);
+      expect(fake.accepts).toBe(2);
+      expect(c.isOpen).toBe(false);
+      await expect(c.get("a")).rejects.toBeInstanceOf(ClosedError);
+      expect(fake.accepts).toBe(2);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("failed reconnects back off", async () => {
+    const fake = fakeServer((s) => s.write(ok));
+    const c = await Client.connect(tcp({ port: fake.port, token: "any" }));
+    fake.stop(); // hangs up and stops listening
+    // The first attempt is immediate and refused; each failure starts the
+    // next backoff step (100 ms, then 200 ms). The clock for a step is
+    // anchored before the call whose failure starts it, so a loaded machine
+    // can only lengthen what is measured, never shorten it.
+    let before = Date.now();
+    await expect(c.ping()).rejects.toThrow("Failed to connect");
+    for (const wait of [100, 200]) {
+      const next = Date.now();
+      // biome-ignore lint/performance/noAwaitInLoops: the waits are sequential by design
+      await expect(c.ping()).rejects.toThrow("Failed to connect");
+      expect(Date.now() - before).toBeGreaterThanOrEqual(wait);
+      before = next;
+    }
+    expect(c.isOpen).toBe(false);
+  });
+
+  test("close during the backoff wait is final, at once", async () => {
+    const fake = fakeServer((s) => s.write(ok));
+    const c = await Client.connect(tcp({ port: fake.port, token: "any" }));
+    fake.stop();
+    // Three refusals put the next wait at 400 ms; close() ends it early.
+    for (let i = 0; i < 3; i++) {
+      // biome-ignore lint/performance/noAwaitInLoops: the failures are sequential by design
+      await expect(c.ping()).rejects.toThrow("Failed to connect");
+    }
+    const t0 = Date.now();
+    const waiting = c.ping();
+    await Bun.sleep(10);
+    c.close();
+    await expect(waiting).rejects.toBeInstanceOf(ClosedError);
+    expect(Date.now() - t0).toBeLessThan(200);
+  });
+
+  test("concurrent callers share one failed attempt", async () => {
+    const fake = goesDown();
+    try {
+      const c = await Client.connect(tcp({ port: fake.port, token: "any" }));
+      // The in-flight call's retry is the first attempt (accept 1).
+      await expect(c.ping()).rejects.toBeInstanceOf(ClosedError);
+      expect(fake.accepts).toBe(2);
+      // Eight callers at once: one attempt, one backoff wait, one failure
+      // reported to all of them.
+      const t0 = Date.now();
+      const results = await Promise.allSettled(
+        Array.from({ length: 8 }, () => c.ping()),
+      );
+      for (const r of results) {
+        expect(r.status).toBe("rejected");
+        expect((r as PromiseRejectedResult).reason).toBeInstanceOf(ClosedError);
+      }
+      expect(Date.now() - t0).toBeLessThan(500);
+      expect(fake.accepts).toBe(3);
+    } finally {
+      fake.stop();
+    }
+  });
+
+  test("a call arriving during the backoff joins the attempt", async () => {
+    const fake = goesDown();
+    try {
+      const c = await Client.connect(tcp({ port: fake.port, token: "any" }));
+      await expect(c.ping()).rejects.toBeInstanceOf(ClosedError);
+      // The backoff clock starts at that failure: the next attempt is no
+      // sooner than 100 ms after it. A call 20 ms into the wait neither
+      // fails fast nor connects on its own; it fails with the attempt. (The
+      // clock is anchored here, not after the sleep, so a stretched sleep
+      // on a loaded machine cannot shrink the window being asserted.)
+      const failed = Date.now();
+      expect(fake.accepts).toBe(2);
+      const early = c.ping().catch((e) => e);
+      await Bun.sleep(20);
+      await expect(c.ping()).rejects.toBeInstanceOf(ClosedError);
+      expect(Date.now() - failed).toBeGreaterThanOrEqual(90);
+      expect(await early).toBeInstanceOf(ClosedError);
+      expect(fake.accepts).toBe(3);
+    } finally {
+      fake.stop();
     }
   });
 });
@@ -291,23 +620,30 @@ describe("keepalive", () => {
     try {
       // Pinging every 300 ms keeps the connection open across 1.5 s of
       // silence; the default interval (100 s) never comes due, so that
-      // client is closed, which is what proves the pings did the work.
-      const quiet = await Client.connect(
-        tcp({ port: server.port, token: "any", keepaliveMs: 300 }),
-      );
-      const silent = await Client.connect(
-        tcp({ port: server.port, token: "any" }),
-      );
+      // client loses its connection, which is what proves the pings did
+      // the work ...
+      const quietT = await tcp({
+        port: server.port,
+        token: "any",
+        keepaliveMs: 300,
+      });
+      const silentT = await tcp({ port: server.port, token: "any" });
+      const quiet = await Client.connect(quietT);
+      const silent = await Client.connect(silentT);
       await quiet.set("k", 1);
       await silent.set("k", 1);
       await Bun.sleep(1500);
       expect(await quiet.get<number>("k")).toBe(1);
-      await expect(silent.get("k")).rejects.toBeInstanceOf(ClosedError);
-      expect(quiet.isOpen).toBe(true);
       expect(silent.isOpen).toBe(false);
+      // ... and the next call on it reconnects without being told.
+      expect(await silent.get<number>("k")).toBe(1);
+      expect(silent.isOpen).toBe(true);
+      expect(quietT.reconnects).toBe(0);
+      expect(silentT.reconnects).toBe(1);
       quiet.close();
+      silent.close();
     } finally {
-      server.stop();
+      await server.stop();
     }
   });
 
@@ -358,32 +694,24 @@ describe("keepalive", () => {
   });
 
   test("a heartbeat the server does not answer is not an error", async () => {
-    const ok = new Uint8Array([0, 0, 0, 0, 0]);
-    let authed = false;
-    const fake = Bun.listen({
-      hostname: "127.0.0.1",
-      port: 0,
-      socket: {
-        data(s) {
-          if (!authed) {
-            authed = true;
-            s.write(ok); // accept AUTH
-            return;
-          }
-          s.end(); // hang up on the first PING
-        },
-      },
+    // Hang up on the first PING; answer everything after the reconnect.
+    const fake = fakeServer((s, _n, f) => {
+      if (f.tag === Op.Ping) s.end();
+      else s.write(f.tag === Op.Auth ? ok : oneValue);
     });
     try {
-      const c = await Client.connect(
-        tcp({ port: fake.port, token: "any", keepaliveMs: 20 }),
-      );
+      const t = await tcp({ port: fake.port, token: "any", keepaliveMs: 20 });
+      const c = await Client.connect(t);
       await Bun.sleep(150);
-      // The failed ping is swallowed; the closure is reported by the next call.
+      // The failed ping is swallowed and does not reconnect by itself; the
+      // next call does.
       expect(c.isOpen).toBe(false);
-      await expect(c.get("a")).rejects.toBeInstanceOf(ClosedError);
+      expect(fake.accepts).toBe(1);
+      expect(await c.get<number>("a")).toBe(1);
+      expect(t.reconnects).toBe(1);
+      c.close();
     } finally {
-      fake.stop(true);
+      fake.stop();
     }
   });
 });
