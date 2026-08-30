@@ -1,5 +1,5 @@
-//! The `oxicache-server` binary: argument parsing, startup, serving and
-//! clean shutdown on SIGINT or SIGTERM.
+//! The `oxicache-server` binary: environment configuration, startup, serving
+//! and clean shutdown on SIGINT or SIGTERM.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -10,7 +10,7 @@ use oxicache_wire::{self as wire, Op, Status};
 
 struct Running {
     child: Child,
-    /// The tracing log (stdout); warnings go to stderr.
+    /// The tracing log (stdout); errors go to stderr.
     stdout: BufReader<std::process::ChildStdout>,
     stderr: std::process::ChildStderr,
     addr: SocketAddr,
@@ -52,17 +52,17 @@ fn plain(s: &str) -> String {
     out
 }
 
-/// Start the server on a random port and wait until it logs the address.
-/// (`Running` kills and waits for the child when dropped, so a failure
-/// here leaves no zombie.)
+/// Start the server on a random port with `env` and wait until it logs the
+/// address; the token is `t` unless `env` sets one. (`Running` kills and
+/// waits for the child when dropped, so a failure here leaves no zombie.)
 #[allow(clippy::zombie_processes)]
-fn start(args: &[&str], env: &[(&str, &str)]) -> Running {
-    let mut full = vec!["--addr", "127.0.0.1:0"];
-    if !args.contains(&"--token") {
-        full.extend_from_slice(&["--token", "t"]);
+fn start(env: &[(&str, &str)]) -> Running {
+    let mut full = vec![("OXICACHE_ADDR", "127.0.0.1:0")];
+    if !env.iter().any(|(k, _)| *k == "OXICACHE_TOKEN") {
+        full.push(("OXICACHE_TOKEN", "t"));
     }
-    full.extend_from_slice(args);
-    let mut child = cmd(&full, env).spawn().unwrap();
+    full.extend_from_slice(env);
+    let mut child = cmd(&[], &full).spawn().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let stderr = child.stderr.take().unwrap();
     let mut log = String::new();
@@ -110,7 +110,7 @@ impl Running {
     }
 
     /// SIGINT, then wait; returns whether it exited cleanly and the whole
-    /// output, log and warnings together.
+    /// output, stdout and stderr together.
     fn interrupt(self) -> (bool, String) {
         self.signal("INT")
     }
@@ -166,7 +166,7 @@ fn get(addr: SocketAddr, key: &[u8]) -> (TcpStream, Status, Vec<u8>) {
 
 #[test]
 fn serves_and_shuts_down_cleanly() {
-    let r = start(&["--capacity", "1M", "--shards", "1"], &[]);
+    let r = start(&[("OXICACHE_CAPACITY", "1M"), ("OXICACHE_SHARDS", "1")]);
     let (conn, status, body) = get(r.addr, b"missing");
     assert_eq!(status, Status::Ok);
     assert_eq!(wire::decode_values(body.into()).unwrap(), vec![None]);
@@ -181,7 +181,7 @@ fn serves_and_shuts_down_cleanly() {
 
 #[test]
 fn sigterm_drains_and_exits_cleanly() {
-    let r = start(&["--capacity", "1M", "--shards", "1"], &[]);
+    let r = start(&[("OXICACHE_CAPACITY", "1M"), ("OXICACHE_SHARDS", "1")]);
     let (conn, status, _) = get(r.addr, b"missing");
     assert_eq!(status, Status::Ok);
     let (ok, log) = r.signal("TERM");
@@ -193,8 +193,8 @@ fn sigterm_drains_and_exits_cleanly() {
 
 #[test]
 fn idle_connections_are_closed() {
-    // Whole seconds on the flag; the shortest timeout is 1 s.
-    let r = start(&["--capacity", "1M", "--idle-timeout", "1"], &[]);
+    // Whole seconds; the shortest timeout is 1 s.
+    let r = start(&[("OXICACHE_CAPACITY", "1M"), ("OXICACHE_IDLE_TIMEOUT", "1")]);
     let (mut conn, status, _) = get(r.addr, b"k");
     assert_eq!(status, Status::Ok);
     let mut rest = Vec::new();
@@ -207,10 +207,7 @@ fn idle_connections_are_closed() {
 
 #[test]
 fn connection_limit_holds_the_next_peer_in_the_backlog() {
-    let r = start(
-        &["--capacity", "1M", "--max-conns", "1"],
-        &[("OXICACHE_MAX_CONNS", "5")],
-    );
+    let r = start(&[("OXICACHE_CAPACITY", "1M"), ("OXICACHE_MAX_CONNS", "1")]);
     let (first, status, _) = get(r.addr, b"k");
     assert_eq!(status, Status::Ok);
     let mut second = TcpStream::connect(r.addr).unwrap();
@@ -234,65 +231,55 @@ fn connection_limit_holds_the_next_peer_in_the_backlog() {
     assert_eq!(wire::decode_header(&hdr).0, Status::Ok as u8);
     let (ok, log) = r.interrupt();
     assert!(ok, "{log}");
-    assert!(log.contains("--max-conns=1"), "{log}");
+    assert!(log.contains("max_conns=1"), "{log}");
     assert!(log.contains("connection limit reached"), "{log}");
 }
 
 #[test]
 fn capacity_suffixes_and_defaults() {
     for cap in ["2048", "2k", "2M", "1g"] {
-        let r = start(&["--capacity", cap], &[]);
+        let r = start(&[("OXICACHE_CAPACITY", cap)]);
         let (ok, log) = r.interrupt();
         assert!(ok, "{log}");
     }
 }
 
+/// Run to exit with `env` (plus `args`) and return the plain stderr; the
+/// exit must be a failure.
+fn fails(args: &[&str], env: &[(&str, &str)]) -> String {
+    let out = cmd(args, env).output().unwrap();
+    assert!(!out.status.success(), "{args:?} {env:?}");
+    plain(&String::from_utf8_lossy(&out.stderr))
+}
+
 #[test]
 fn token_is_required_and_non_empty() {
-    for args in [
-        &["--capacity", "1M"][..],
-        &["--capacity", "1M", "--token", ""],
+    let err = fails(&[], &[("OXICACHE_CAPACITY", "1M")]);
+    assert!(err.contains("OXICACHE_TOKEN is required"), "{err}");
+    let err = fails(&[], &[("OXICACHE_CAPACITY", "1M"), ("OXICACHE_TOKEN", "")]);
+    assert!(err.contains("OXICACHE_TOKEN"), "{err}");
+    assert!(err.contains("empty"), "{err}");
+}
+
+#[test]
+fn rejects_bad_values_naming_the_variable() {
+    let token = ("OXICACHE_TOKEN", "t");
+    for cap in ["1X", "abc", "0", "99999999999999999999", "999999999999G"] {
+        let err = fails(&[], &[token, ("OXICACHE_CAPACITY", cap)]);
+        assert!(err.contains("OXICACHE_CAPACITY"), "{cap}: {err}");
+    }
+    for (var, bad) in [
+        ("OXICACHE_ADDR", "nowhere"),
+        ("OXICACHE_HTTP_ADDR", "nowhere"),
+        ("OXICACHE_SHARDS", "0"),
+        ("OXICACHE_SHARDS", "many"),
+        ("OXICACHE_IDLE_TIMEOUT", "0"),
+        ("OXICACHE_IDLE_TIMEOUT", "1.5"),
+        ("OXICACHE_MAX_CONNS", "0"),
+        ("OXICACHE_MAX_CONNS", "-1"),
     ] {
-        let out = cmd(args, &[]).output().unwrap();
-        assert!(!out.status.success());
-        let err = plain(&String::from_utf8_lossy(&out.stderr));
-        assert!(err.contains("token"), "{err}");
-    }
-}
-
-#[test]
-fn rejects_bad_capacity() {
-    for cap in ["1X", "abc", "99999999999999999999", "999999999999G"] {
-        let out = cmd(&["--capacity", cap], &[]).output().unwrap();
-        assert!(!out.status.success(), "{cap}");
-        let err = plain(&String::from_utf8_lossy(&out.stderr));
-        assert!(err.contains("capacity"), "{err}");
-    }
-}
-
-#[test]
-fn token_and_env_overrides() {
-    let r = start(
-        &["--capacity", "1M", "--shards", "1", "--token", "s3cret"],
-        &[
-            ("OXICACHE_ADDR", "127.0.0.1:1"),
-            ("OXICACHE_CAPACITY", "2M"),
-            ("OXICACHE_SHARDS", "2"),
-            ("OXICACHE_TOKEN", "other"),
-        ],
-    );
-    let (_conn, status, _) = get_as(r.addr, b"other", b"k");
-    assert_eq!(
-        status,
-        Status::Unauthorized,
-        "the flag wins over the variable"
-    );
-    let (_conn, status, _) = get_as(r.addr, b"s3cret", b"k");
-    assert_eq!(status, Status::Ok);
-    let (ok, log) = r.interrupt();
-    assert!(ok, "{log}");
-    for flag in ["--addr=", "--capacity=", "--shards=", "--token overrides"] {
-        assert!(log.contains(flag), "{flag}: {log}");
+        let err = fails(&[], &[token, (var, bad)]);
+        assert!(err.contains(var), "{var}={bad}: {err}");
     }
 }
 
@@ -323,19 +310,12 @@ fn http(
 
 #[test]
 fn http_front_end_serves_alongside_tcp() {
-    let mut r = start(
-        &[
-            "--capacity",
-            "1M",
-            "--shards",
-            "1",
-            "--http-addr",
-            "127.0.0.1:0",
-            "--token",
-            "t0k",
-        ],
-        &[("OXICACHE_HTTP_ADDR", "127.0.0.1:1")],
-    );
+    let mut r = start(&[
+        ("OXICACHE_CAPACITY", "1M"),
+        ("OXICACHE_SHARDS", "1"),
+        ("OXICACHE_HTTP_ADDR", "127.0.0.1:0"),
+        ("OXICACHE_TOKEN", "t0k"),
+    ]);
     let h = r.http_addr();
     assert_ne!(h, r.addr);
     assert_eq!(http(h, "GET", "/health", None, b""), (200, vec![]));
@@ -369,29 +349,21 @@ fn http_front_end_serves_alongside_tcp() {
     );
     let (ok, log) = r.interrupt();
     assert!(ok, "{log}");
-    assert!(log.contains("--http-addr="), "{log}");
+    assert!(log.contains("http="), "{log}");
     assert!(log.contains("listening (http)"), "{log}");
 }
 
 #[test]
 fn http_bind_failure_is_fatal() {
-    let r = start(&["--capacity", "1M"], &[]);
-    let out = cmd(
-        &[
-            "--addr",
-            "127.0.0.1:0",
-            "--token",
-            "t",
-            "--capacity",
-            "1M",
-            "--http-addr",
-            &r.addr.to_string(),
-        ],
+    let r = start(&[("OXICACHE_CAPACITY", "1M")]);
+    let err = fails(
         &[],
-    )
-    .output()
-    .unwrap();
-    assert!(!out.status.success());
-    let err = plain(&String::from_utf8_lossy(&out.stderr));
+        &[
+            ("OXICACHE_ADDR", "127.0.0.1:0"),
+            ("OXICACHE_TOKEN", "t"),
+            ("OXICACHE_CAPACITY", "1M"),
+            ("OXICACHE_HTTP_ADDR", &r.addr.to_string()),
+        ],
+    );
     assert!(err.contains("Bind") && err.contains("AddrInUse"), "{err}");
 }

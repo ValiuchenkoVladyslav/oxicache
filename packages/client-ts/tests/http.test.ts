@@ -147,7 +147,7 @@ describe("http transport e2e", () => {
 describe("http token auth", () => {
   let server: TestServer;
   beforeAll(async () => {
-    server = await startServer(["--token", "s3cret"]);
+    server = await startServer({ OXICACHE_TOKEN: "s3cret" });
   });
   afterAll(() => server.stop());
 

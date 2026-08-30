@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use oxicache_client::Client;
-use oxicache_wire::cli::warn_if_overridden;
+
+mod cli;
+use cli::warn_if_overridden;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

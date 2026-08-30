@@ -35,7 +35,6 @@ use std::time::Duration;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-pub mod cli;
 pub mod io;
 
 /// Size of a request or response frame header.

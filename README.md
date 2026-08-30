@@ -32,7 +32,7 @@ op 5 PING body: empty    -> empty
 status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized (body = message)
 ```
 
-The server requires a non-empty token (`--token` or `OXICACHE_TOKEN`); AUTH must be the
+The server requires a non-empty token (`OXICACHE_TOKEN`); AUTH must be the
 first request on every connection, and anything else gets status 4 and the connection is
 closed. There is no unauthenticated mode on either side: the Rust
 `Client::connect(addr, format, token)` and the TS transports (`tcp({ …, token })`,
@@ -40,14 +40,14 @@ closed. There is no unauthenticated mode on either side: the Rust
 `OXICACHE_TOKEN` (it also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
 tunnel.
 
-A connection that sends nothing for `--idle-timeout` (default 300 s) is closed, so both TCP
+A connection that sends nothing for `OXICACHE_IDLE_TIMEOUT` (default 300 s) is closed, so both TCP
 clients PING on their own after 100 s without a write — a third of that default, so two lost
 heartbeats still leave the connection open. PING is authenticated like everything else and
 its body is ignored.
 
 ### HTTP
 
-With `--http-addr` (or `OXICACHE_HTTP_ADDR`) the server also listens for HTTP/1.1, carrying the
+With `OXICACHE_HTTP_ADDR` set the server also listens for HTTP/1.1, carrying the
 same binary bodies — nothing is JSON. The op is the path, the request body is the frame body,
 the response body is the frame body, and the frame status becomes the HTTP status:
 
@@ -67,19 +67,26 @@ no CORS handling — put a reverse proxy in front for either.
 
 ## Run
 
-```sh
-cargo run --release -p oxicache-server -- --addr 0.0.0.0:4433 --http-addr 0.0.0.0:4434 --capacity 1G --token s3cret
-# --shards N      independent S3-FIFO shards (default: CPUs)
-# --token T       the shared secret (or OXICACHE_TOKEN in the environment); required
-# --http-addr A   also serve the HTTP API on A (off unless given)
-# --idle-timeout S close a connection that sends nothing for S seconds (default 300)
-# --max-conns N   at most N open connections, TCP and HTTP together (default 10000);
-#                 beyond it the listeners stop accepting until one closes
-# every server flag has an environment variable: OXICACHE_ADDR, OXICACHE_HTTP_ADDR,
-# OXICACHE_CAPACITY, OXICACHE_SHARDS, OXICACHE_TOKEN, OXICACHE_IDLE_TIMEOUT,
-# OXICACHE_MAX_CONNS; a flag wins over a differing variable, with a warning
-# SIGINT or SIGTERM stops accepting and drains open connections before exit
+The server is configured by environment variables only; it never reads its command line.
 
+```sh
+OXICACHE_TOKEN=s3cret OXICACHE_HTTP_ADDR=0.0.0.0:4434 OXICACHE_CAPACITY=1G cargo run --release -p oxicache-server
+```
+
+| variable | default | meaning |
+|---|---|---|
+| `OXICACHE_ADDR` | `0.0.0.0:4433` | address to listen on |
+| `OXICACHE_HTTP_ADDR` | unset (HTTP off) | also serve the HTTP API on this address |
+| `OXICACHE_CAPACITY` | `1G` | memory budget for cached entries; `K`/`M`/`G` suffixes |
+| `OXICACHE_SHARDS` | available CPUs | independent S3-FIFO shards |
+| `OXICACHE_TOKEN` | required | the shared secret; must not be empty |
+| `OXICACHE_IDLE_TIMEOUT` | `300` | close a connection that sends nothing for this many seconds |
+| `OXICACHE_MAX_CONNS` | `10000` | at most this many open connections, TCP and HTTP together; beyond it the listeners stop accepting until one closes |
+
+A missing token or an unparseable value is a startup error naming the variable. SIGINT or
+SIGTERM stops accepting and drains open connections before exit.
+
+```sh
 cargo run --release -p oxicache-client -- set a 1 b 2
 cargo run --release -p oxicache-client -- get a b c
 cargo run --release -p oxicache-client -- del a
@@ -210,9 +217,9 @@ The pre-commit hook (`.husky/pre-commit`) runs `cargo fmt --check`, `clippy -D w
   One listener; accepted connections are spread over the runtime's worker threads. The
   HTTP front end (hyper, HTTP/1.1) is a second listener over the same dispatch, one request
   per exchange; bodies are bounded to the frame limit before and while reading.
-  Frames are capped at 64 MiB each way. `--max-conns` is one semaphore shared by both
+  Frames are capped at 64 MiB each way. `OXICACHE_MAX_CONNS` is one semaphore shared by both
   listeners, taken before `accept` so an over-limit peer waits in the kernel backlog
-  instead of being accepted and dropped; `--idle-timeout` closes a TCP connection that
+  instead of being accepted and dropped; `OXICACHE_IDLE_TIMEOUT` closes a TCP connection that
   sends nothing for that long (hyper's per-request header timeout does the same for
   HTTP keep-alive). Defaults: 10 000 connections, 300 s idle; the library `Options` can
   lift either with `None`, the binary cannot. TCP clients send a PING after 100 s without

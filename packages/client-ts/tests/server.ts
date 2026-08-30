@@ -79,29 +79,29 @@ export interface TestServer {
 
 /**
  * Start a server on random loopback ports (TCP and HTTP) and wait until it is
- * listening. The token is `any` unless `args` set one.
+ * listening. The server is configured by `OXICACHE_*` variables only; `env`
+ * adds to or overrides the defaults, and the token is `any` unless it sets one.
  */
-export async function startServer(args: string[] = []): Promise<TestServer> {
+export async function startServer(
+  env: Record<string, string> = {},
+): Promise<TestServer> {
   await build();
-  const token = args.includes("--token") ? [] : ["--token", "any"];
   const port = freePort();
   const httpPort = freePort();
-  const proc = Bun.spawn(
-    [
-      bin,
-      "--addr",
-      `127.0.0.1:${port}`,
-      "--http-addr",
-      `127.0.0.1:${httpPort}`,
-      "--capacity",
-      "64M",
-      "--shards",
-      "2",
-      ...token,
-      ...args,
-    ],
-    { cwd: root, stdout: "ignore", stderr: "ignore" },
-  );
+  const proc = Bun.spawn([bin], {
+    cwd: root,
+    stdout: "ignore",
+    stderr: "ignore",
+    env: {
+      ...process.env,
+      OXICACHE_ADDR: `127.0.0.1:${port}`,
+      OXICACHE_HTTP_ADDR: `127.0.0.1:${httpPort}`,
+      OXICACHE_CAPACITY: "64M",
+      OXICACHE_SHARDS: "2",
+      OXICACHE_TOKEN: "any",
+      ...env,
+    },
+  });
   const stop = () => proc.kill();
   try {
     await waitForListen(port, () => proc.exitCode === null);

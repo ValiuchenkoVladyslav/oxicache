@@ -1,4 +1,4 @@
-//! Helpers shared by the server and client command lines.
+//! Warn when a client flag overrides its environment variable.
 
 /// Warn when a flag overrides a differing value of its environment variable.
 /// clap prefers the flag silently; a parsed value that differs from a set

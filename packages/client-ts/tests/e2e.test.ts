@@ -212,7 +212,9 @@ describe("tcp transport e2e", () => {
 });
 
 test("a server that exits before listening is reported", async () => {
-  await expect(startServer(["--no-such-flag"])).rejects.toThrow(
+  // An invalid variable makes the server exit before it binds; the harness
+  // polls the port instead of reading stderr, so that is what it sees.
+  await expect(startServer({ OXICACHE_CAPACITY: "1X" })).rejects.toThrow(
     "server exited before listening",
   );
 });
@@ -220,7 +222,7 @@ test("a server that exits before listening is reported", async () => {
 describe("token auth", () => {
   let server: TestServer;
   beforeAll(async () => {
-    server = await startServer(["--token", "s3cret"]);
+    server = await startServer({ OXICACHE_TOKEN: "s3cret" });
   });
   afterAll(() => server.stop());
 
@@ -285,7 +287,7 @@ describe("keepalive", () => {
   });
 
   test("a quiet connection outlives the server idle timeout", async () => {
-    const server = await startServer(["--idle-timeout", "1"]);
+    const server = await startServer({ OXICACHE_IDLE_TIMEOUT: "1" });
     try {
       // Pinging every 300 ms keeps the connection open across 1.5 s of
       // silence; the default interval (100 s) never comes due, so that

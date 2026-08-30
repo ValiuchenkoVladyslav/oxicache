@@ -377,7 +377,6 @@ name = "oxicache-server"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "clap",
  "crossbeam-epoch",
  "http-body-util",
  "hyper",
