@@ -1,12 +1,20 @@
 export {
+  type AnyGetOp,
+  type BatchOp,
+  type BatchResult,
+  type BatchResults,
   Client,
-  type Entries,
-  type Entry,
-  type Fill,
-  type Results,
-  type Types,
+  type DelOp,
+  type GetOp,
+  op,
+  type SetOp,
 } from "./client.js";
-export { ClosedError, StatusError, type Transport } from "./transport.js";
+export {
+  ClosedError,
+  isAnswer,
+  StatusError,
+  type Transport,
+} from "./transport.js";
 export {
   BIGINT_EXT,
   decodeValue,
@@ -23,5 +31,6 @@ export {
   MAX_FRAME,
   MAX_ITEMS,
   Op,
+  type Reply,
   Status,
 } from "./wire.js";

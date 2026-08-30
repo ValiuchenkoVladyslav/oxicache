@@ -15,22 +15,32 @@ runtimes without sockets), tokio multi-threaded runtime. No persistence.
 
 ## Protocol
 
-Three commands, all batch-only (a single op is a batch of one), plus AUTH and PING, as length-prefixed frames
-on a TCP connection. Requests on one connection are answered in order, so clients pipeline
-freely. Values are opaque bytes. Integers are little-endian.
+Three single-key commands, a BATCH that carries any mix of them, plus AUTH and PING, as
+length-prefixed frames on a TCP connection. Requests on one connection are answered in order,
+so clients pipeline freely. Values are opaque bytes. Integers are little-endian.
 
 ```
 request   := u8 op, u32 len, body          response := u8 status, u32 len, body
-keys      := u32 count, count × (u32 len, bytes)
-entries   := u32 count, count × (u32 klen, key, u32 vlen, value)
 
-op 1 GET  body: keys     -> u32 count, count × (u8 0 | u8 1, u32 len, value)
-op 2 SET  body: entries  -> empty
-op 3 DEL  body: keys     -> u32 count, count × u8 found
-op 4 AUTH body: token    -> empty
-op 5 PING body: empty    -> empty
-status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized (body = message)
+op 1 GET   body: key                       -> 0 ok, value            | 5 not found, empty
+op 2 SET   body: u32 klen, key, value      -> 0 ok, empty            | 3 too large
+op 3 DEL   body: key                       -> 0 ok, empty (deleted)  | 5 not found, empty
+op 4 AUTH  body: token                     -> 0 ok, empty            | 4 unauthorized
+op 5 PING  body: ignored                   -> 0 ok, empty
+op 6 BATCH body: u32 count, count × (u8 op, u32 len, body)
+                                           -> 0 ok, u32 count, count × (u8 status, u32 len, body)
+status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized | 5 not found
+             (1–4 carry a UTF-8 message; 5 is an answer, not an error)
 ```
+
+A batch holds up to 65 536 GET/SET/DEL items and answers each one, in order, exactly as the
+op would be answered on its own — so one refused item (a value that does not fit, a
+malformed body, an op that is not GET/SET/DEL) is its own status and its neighbours still
+go through, and a GET after a SET of the same key sees the write. Runs of the same op are
+served together (one lookup pass with prefetching for GETs, one epoch pin for writes), which
+is what makes a batch of GETs cheaper than the same GETs pipelined. A batch whose envelope
+does not parse (truncated item, trailing bytes, too many items) is `bad request` as a whole,
+and one whose replies would exceed 64 MiB is `too large`.
 
 The server requires a non-empty token (`OXICACHE_TOKEN`); AUTH must be the
 first request on every connection, and anything else (PING included) gets status 4 and the
@@ -54,12 +64,13 @@ same binary bodies — nothing is JSON. The op is the path, the request body is 
 the response body is the frame body, and the frame status becomes the HTTP status:
 
 ```
-POST /get   body: keys      -> 200, body: values
-POST /set   body: entries   -> 200, empty
-POST /del   body: keys      -> 200, body: flags
-POST /ping                  -> 200, empty
-GET  /health                -> 200, no body; never needs a token
-400 bad request | 401 unauthorized | 404 unknown path | 405 wrong method | 413 too large
+POST /get    body: key                  -> 200, body: value | 404, empty
+POST /set    body: u32 klen, key, value -> 200, empty
+POST /del    body: key                  -> 200, empty (deleted) | 404, empty
+POST /batch  body: items                -> 200, body: replies
+POST /ping                              -> 200, empty
+GET  /health                            -> 200, no body; never needs a token
+400 bad request | 401 unauthorized | 404 unknown path (with a message) | 405 wrong method | 413 too large
 ```
 
 Every request except `/health` carries `Authorization: Bearer <token>`. Every response sent
@@ -124,15 +135,13 @@ suites use; they are for tests only.
 
 ### Rust client API
 
-`get`/`set`/`del` act on one key; `get_multi`/`set_multi`/`del_multi` on several. Keys are
-any bytes (`&str`, `String`, `&[u8]`, `Vec<u8>`, `[u8; N]`); a batch of keys is a tuple (up to
-16), an array, a `Vec` or a slice, and comes back the same shape — an array for a tuple or
-array, a `Vec` for a `Vec` or slice. `Client::connect(addr, token)` authenticates as it
-connects (a refused token means no client). Values are any `Serialize` type in and any
-`DeserializeOwned` type out, stored as MessagePack through `rmp-serde` with structs as maps —
-the same encoding the TypeScript client writes, so both clients read each other's values
-(`Vec<u8>` is a MessagePack array; wrap it in `serde_bytes` for a `bin`). `get` and
-`get_multi` decode as part of the call: the type argument names the value types only.
+`get`/`set`/`del` act on one key; `batch` sends any mix of them in one round trip. Keys are
+any bytes (`&str`, `String`, `&[u8]`, `Vec<u8>`, `[u8; N]`). `Client::connect(addr, token)`
+authenticates as it connects (a refused token means no client). Values are any `Serialize`
+type in and any `DeserializeOwned` type out, stored as MessagePack through `rmp-serde` with
+structs as maps — the same encoding the TypeScript client writes, so both clients read each
+other's values (`Vec<u8>` is a MessagePack array; wrap it in `serde_bytes` for a `bin`).
+`get` decodes as part of the call: the type argument names the value type.
 `Client::connect_tls(addr, tls, token)` is the same over TLS: `Tls::trusting(ca, server_name)`
 trusts a PEM file of CA certificates, or fill `Tls { server_name, config }` with your own
 `rustls::ClientConfig`; a refused certificate is an `Error::Io`.
@@ -143,22 +152,26 @@ let secure = Client::connect_tls(addr, Tls::trusting(Path::new("ca.pem"), "cache
 
 #[derive(Serialize, Deserialize)] struct User { id: u64, name: String }
 client.set("user:7", User { id: 7, name: "alice".into() }).await?;
-let user = client.get::<User>("user:7").await?;                                   // Option<User>
+let user = client.get::<User>("user:7").await?;      // Option<User>
+let gone = client.del("user:7").await?;              // bool
 
-// several keys: one value type per key for a tuple, one for all otherwise;
-// every slot is an Option, None for a missing key
-let (user, hits) = client.get_multi::<(User, u64), _>(("user:7", "hits:7")).await?;
-let users = client.get_multi::<User, _>(["user:7", "user:8"]).await?;             // [Option<User>; 2]
-let users = client.get_multi::<User, _>(ids).await?;                              // Vec<Option<User>>
-let (user, hits): (Option<User>, Option<u64>) =                                   // or from the binding
-    client.get_multi(("user:7", "hits:7")).await?;
-client.set_multi([("a", 1), ("b", 2)]).await?;
-let [a, b] = client.del_multi(("a", "b")).await?;
+// any mix of ops in one round trip, answered in order; each op hands back a
+// typed Slot that reads its own result out of the Outcome
+let mut b = Batch::new();
+let user = b.get::<User>("user:7");                  // Slot<Option<User>>
+b.set("seen:7", now)?;                               // Slot<()>; encodes here
+let hits = b.get::<u64>("hits:7");
+let dropped = b.del("tmp:7");                        // Slot<bool>
+let out = client.batch(b).await?;
+let (user, hits, dropped) = (out.get(user)?, out.get(hits)?, out.get(dropped)?);
 ```
 
-A tuple of keys must be paired with a tuple of exactly as many value types; a mismatch does
-not compile. An encoding failure surfaces as `Error::Serialize`, a stored value that is not
-the named type as `Error::Deserialize`; the connection stays usable after either.
+A batch holds up to 65 536 ops (`Error::TooManyItems` past that, before anything is sent).
+`Outcome::get(slot)` returns the op's own answer: a missing key is `None`/`false`, never an
+error, and a refused op (a value that does not fit, say) is that slot's `Error::Status` while
+the other slots stay readable; `Outcome::status(i)` gives the raw status. An encoding failure
+surfaces as `Error::Serialize` (from `set` or `Batch::set`), a stored value that is not the
+named type as `Error::Deserialize`; the connection stays usable after either.
 `client.ping()` round-trips an empty request; the client also pings by itself after 100 s
 (`oxicache_wire::KEEPALIVE`) without a write, so a quiet connection survives the server's
 300 s idle timeout.
@@ -195,7 +208,7 @@ type level — a value containing a function, `symbol`, `undefined`, `Map` or `S
 error.
 
 ```ts
-import { Client } from "@oxicache/client";
+import { Client, op } from "@oxicache/client";
 import { tcp } from "@oxicache/client/transport/tcp";
 import { http } from "@oxicache/client/transport/http";
 
@@ -206,30 +219,36 @@ const c = await Client.connect(http({ url: "http://cache.internal:4434", token: 
 const c = await Client.connect(tcp({ hostname: "cache.internal", port: 4433, token: "s3cret", tls: { ca } }));
 const c = await Client.connect(http({ url: "https://cache.internal:4434", token: "s3cret", tls: { ca } }));
 
-await c.set("user:7", { id: 7, name: "alice", joined: new Date() });  // one
-await c.set(["a", 1], ["b", ["x", null]]);                             // several
-await c.set(entries);                                                  // Entry[] of any length
+await c.set("user:7", { id: 7, name: "alice", joined: new Date() });
+const u = await c.get<User>("user:7");   // User | null
+const gone = await c.del("user:7");      // boolean
 
-const u = await c.get<User>("user:7");          // User | null
-const [u7, n] = await c.get<[User, number]>("user:7", "n"); // one type per key, length checked
-const vs = await c.get<number>(someKeys);       // (number | null)[] for a runtime-length array
-const d = await c.del("a");                     // boolean
-const ds = await c.del("a", "b");               // [boolean, boolean]
+// any mix of ops in one round trip, answered in order and typed by position
+const [user, , hits, dropped] = await c.batch([
+  op.get<User>("user:7"),                // User | null
+  op.set("seen:7", Date.now()),          // undefined
+  op.get<number>("hits:7"),              // number | null
+  op.del("tmp:7"),                       // boolean
+]);
+const users = await c.batch(ids.map((id) => op.get<User>(`user:${id}`)));  // (User | null)[]
 c.close();
 ```
 
-One key in, one result out; several keys in, a tuple of that length out (up to 16 literal
-keys); an array in, an array out for lengths only known at runtime — all enforced by
-overloads, so `...spread` of a plain array is a compile error (pass the array). The return
-type parameter says what stored values decode to and is not checked at runtime; with several
-keys it is a tuple with exactly one type per key. A non-OK status rejects with `StatusError`
-(`.status` is the `Status` enum), a closed transport with `ClosedError`. On TCP, calls issued in
-the same tick are coalesced into one write; on HTTP each call is its own request and a refused
-one does not end the transport. `http({ fetch })` takes a custom `fetch` for agents or tests.
-`c.ping()` round-trips an empty request (`POST /ping` on HTTP). The TCP transport also pings
-by itself after `keepaliveMs` (default 100 000, a third of the server's 300 s idle timeout)
-without a write, on an unref'd timer, so a quiet connection stays open without keeping the
-process alive; HTTP needs no heartbeat, since each call is its own request.
+`get`, `set` and `del` act on one key; `batch` takes an array of ops built with `op.get`,
+`op.set` and `op.del` (up to 65 536) and resolves with one result per op — `T | null` for a
+get, `undefined` for a set, `boolean` for a del — typed by position when the array is a
+literal. The type parameter of `get`/`op.get` says what the stored value decodes to and is
+not checked at runtime. A missing key is `null`/`false`, never an error. A refused op (a
+value that does not fit, say) rejects the whole `batch` call with `StatusError` naming the
+item; on its own, a non-OK status rejects with `StatusError` (`.status` is the `Status` enum),
+a closed transport with `ClosedError`. `op.set` encodes its value when it is built, so an
+unencodable value throws there. On TCP, calls issued in the same tick are coalesced into
+one write; on HTTP each call is its own request and a refused one does not end the
+transport. `http({ fetch })` takes a custom `fetch` for agents or tests. `c.ping()`
+round-trips an empty request (`POST /ping` on HTTP). The TCP transport also pings by itself
+after `keepaliveMs` (default 100 000, a third of the server's 300 s idle timeout) without a
+write, on an unref'd timer, so a quiet connection stays open without keeping the process
+alive; HTTP needs no heartbeat, since each call is its own request.
 
 The TCP transport reconnects lazily when the connection is lost (closed by the server or the
 network: idle timeout, restart, reset): the next call re-connects and re-authenticates, and

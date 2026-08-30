@@ -5,6 +5,7 @@ import {
   ClosedError,
   DecodeError,
   Op,
+  op,
   Status,
   StatusError,
 } from "../src/index";
@@ -23,8 +24,8 @@ function frame(status: number, body: number[] = []): Uint8Array {
 }
 
 const ok = frame(Status.Ok);
-/** The reply to a one-key GET whose value is the MessagePack `1`. */
-const oneValue = frame(Status.Ok, [1, 0, 0, 0, 1, 1, 0, 0, 0, 1]);
+/** The reply to a GET whose value is the MessagePack `1`. */
+const oneValue = frame(Status.Ok, [1]);
 
 type Conn = Socket<{ n: number; reader: FrameReader }>;
 
@@ -124,38 +125,86 @@ describe("tcp transport e2e", () => {
     expect(c.isOpen).toBe(false);
   });
 
-  test("several keys in, tuple out", async () => {
+  test("a batch answers every op in order", async () => {
     const c = await Client.connect(tcp({ port: server.port, token: "any" }));
-    await c.set(["a", "1"], ["b", [0, 1, 2]]);
-    const [a, b, missing] = await c.get("a", "b", "c");
+    const [, , a, b, missing] = await c.batch([
+      op.set("a", "1"),
+      op.set("b", [0, 1, 2]),
+      op.get("a"),
+      op.get("b"),
+      op.get("c"),
+    ]);
     expect(a).toBe("1");
     expect(b).toEqual([0, 1, 2]);
     expect(missing).toBeNull();
-    expect(await c.del("a", "zz")).toEqual([true, false]);
-    expect(await c.get("a", "b")).toEqual([null, [0, 1, 2]]);
-    await c.set(["n", 5], ["s", "five"]);
-    const [n, str, none] = await c.get<[number, string, User]>(
-      "n",
-      "s",
-      "nope",
-    );
-    expect(must(n) + 1).toBe(6);
-    expect(must(str).toUpperCase()).toBe("FIVE");
+    expect(await c.batch([op.del("a"), op.del("zz")])).toEqual([true, false]);
+    expect(await c.batch([op.get("a"), op.get("b")])).toEqual([
+      null,
+      [0, 1, 2],
+    ]);
+    const [n, str, none] = await c.batch([
+      op.get<number>("n"),
+      op.get<string>("s"),
+      op.get<User>("nope"),
+    ]);
+    expect(n).toBeNull();
+    await c.batch([op.set("n", 5), op.set("s", "five")]);
+    const [n2, str2] = await c.batch([
+      op.get<number>("n"),
+      op.get<string>("s"),
+    ]);
+    expect(must(n2) + 1).toBe(6);
+    expect(must(str2).toUpperCase()).toBe("FIVE");
+    expect(str).toBeNull();
     expect(none).toBeNull();
+    // A later op sees an earlier one: set, get, del, get of one key.
+    expect(
+      await c.batch([
+        op.set("seq", 1),
+        op.get<number>("seq"),
+        op.del("seq"),
+        op.get<number>("seq"),
+      ]),
+    ).toEqual([undefined, 1, true, null]);
     c.close();
   });
 
-  test("array in, array out", async () => {
+  test("a batch built at runtime, of any length", async () => {
     const c = await Client.connect(tcp({ port: server.port, token: "any" }));
     const keys = Array.from({ length: 20 }, (_, i) => `arr-${i}`);
-    await c.set(keys.map((k, i) => [k, i] as const));
-    expect(await c.get<number>(keys)).toEqual(keys.map((_, i) => i));
-    expect(await c.get(["arr-0"])).toEqual([0]); // one-element array stays an array
-    expect(await c.del([...keys, "zz"])).toEqual([
+    await c.batch(keys.map((k, i) => op.set(k, i)));
+    expect(await c.batch(keys.map((k) => op.get<number>(k)))).toEqual(
+      keys.map((_, i) => i),
+    );
+    expect(await c.batch([op.get("arr-0")])).toEqual([0]);
+    expect(await c.batch([...keys, "zz"].map((k) => op.del(k)))).toEqual([
       ...keys.map(() => true),
       false,
     ]);
-    expect(await c.get(keys)).toEqual(keys.map(() => null));
+    expect(await c.batch(keys.map((k) => op.get(k)))).toEqual(
+      keys.map(() => null),
+    );
+    expect(await c.batch([])).toEqual([]);
+    c.close();
+  });
+
+  test("a refused op rejects the batch, naming the op", async () => {
+    const c = await Client.connect(tcp({ port: server.port, token: "any" }));
+    // 256 MiB across 16 shards: a value this big fits no shard.
+    const huge = new Uint8Array(32 << 20);
+    const err = await c
+      .batch([op.set("ok", 1), op.set("huge", huge), op.get("ok")])
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(StatusError);
+    expect((err as StatusError).status).toBe(Status.TooLarge);
+    expect((err as Error).message).toContain("item 1:");
+    // The ops the server accepted were still applied.
+    expect(await c.get<number>("ok")).toBe(1);
+    await expect(c.set("huge", huge)).rejects.toBeInstanceOf(StatusError);
+    // Too many ops never reach the wire.
+    expect(() => c.batch(new Array(65537).fill(op.get("x")))).toThrow(
+      RangeError,
+    );
     c.close();
   });
 
@@ -181,30 +230,30 @@ describe("tcp transport e2e", () => {
 
   test("every primitive kind", async () => {
     const c = await Client.connect(tcp({ port: server.port, token: "any" }));
-    await c.set(
-      ["null", null],
-      ["bool", false],
-      ["int", -42],
-      ["float", 3.25],
-      ["bigint", 2n ** 62n],
-      ["str", "ключ ✓"],
-      ["bin", new Uint8Array([255, 0])],
-      ["date", new Date(1234567890123)],
-      ["arr", [1, "a", null]],
-      ["obj", { nested: { deep: true } }],
-    );
-    const [n, b, i, f, bi, s, bin, d, arr, obj] = await c.get(
-      "null",
-      "bool",
-      "int",
-      "float",
-      "bigint",
-      "str",
-      "bin",
-      "date",
-      "arr",
-      "obj",
-    );
+    await c.batch([
+      op.set("null", null),
+      op.set("bool", false),
+      op.set("int", -42),
+      op.set("float", 3.25),
+      op.set("bigint", 2n ** 62n),
+      op.set("str", "ключ ✓"),
+      op.set("bin", new Uint8Array([255, 0])),
+      op.set("date", new Date(1234567890123)),
+      op.set("arr", [1, "a", null]),
+      op.set("obj", { nested: { deep: true } }),
+    ]);
+    const [n, b, i, f, bi, s, bin, d, arr, obj] = await c.batch([
+      op.get("null"),
+      op.get("bool"),
+      op.get("int"),
+      op.get("float"),
+      op.get("bigint"),
+      op.get("str"),
+      op.get("bin"),
+      op.get("date"),
+      op.get("arr"),
+      op.get("obj"),
+    ]);
     expect(n).toBeNull();
     expect(b).toBe(false);
     expect(i).toBe(-42);
@@ -221,17 +270,14 @@ describe("tcp transport e2e", () => {
   test("binary keys and unicode string keys", async () => {
     const c = await Client.connect(tcp({ port: server.port, token: "any" }));
     const key = new Uint8Array([0, 255, 1, 2]);
-    await c.set([
-      [key, "bin"],
-      ["ключ", "значение"],
-      ["", "empty key"],
+    await c.batch([
+      op.set(key, "bin"),
+      op.set("ключ", "значение"),
+      op.set("", "empty key"),
     ]);
-    expect(await c.get(key, "ключ", "", "ключ2")).toEqual([
-      "bin",
-      "значение",
-      "empty key",
-      null,
-    ]);
+    expect(
+      await c.batch([op.get(key), op.get("ключ"), op.get(""), op.get("ключ2")]),
+    ).toEqual(["bin", "значение", "empty key", null]);
     c.close();
   });
 
@@ -271,14 +317,6 @@ describe("tcp transport e2e", () => {
     for (const [i, r] of results.entries()) {
       expect(r?.k).toBe(`t${i % 16}-${i % 50}`);
     }
-    c.close();
-  });
-
-  test("empty batches", async () => {
-    const c = await Client.connect(tcp({ port: server.port, token: "any" }));
-    expect(await c.get([])).toEqual([]);
-    expect(await c.del([])).toEqual([]);
-    await c.set([]);
     c.close();
   });
 

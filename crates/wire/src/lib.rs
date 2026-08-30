@@ -1,46 +1,33 @@
-//! Binary wire format shared by the oxicache server and client.
+//! The wire protocol shared by the server and the clients.
 //!
-//! Transport is a plain TCP stream carrying length-prefixed frames. Requests
-//! on one connection are answered in order, so clients may pipeline freely.
-//! The server also serves the same bodies over HTTP/1.1 (`POST /get`, `/set`,
-//! `/del`; see `oxicache_server::http`), where the op is the path and the
-//! status is the HTTP status.
-//! All integers are little-endian. Values are opaque byte strings; the format
-//! never inspects them.
+//! Every message is a frame: `u8 tag, u32 len, body[len]`, little-endian.
+//! A request's tag is its [`Op`], a response's is its [`Status`]. Bodies:
 //!
 //! ```text
-//! request     := u8 op, u32 len, len bytes of body
-//! response    := u8 status, u32 len, len bytes of body
-//!
-//! keys        := u32 count, count × (u32 len, len bytes)
-//! entries     := u32 count, count × (u32 klen, key, u32 vlen, value)
-//!
-//! op GET(1)   body: keys      -> u32 count, count × (u8 0 | u8 1, u32 len, value)
-//! op SET(2)   body: entries   -> empty
-//! op DEL(3)   body: keys      -> u32 count, count × u8 found
-//! op AUTH(4)  body: token     -> empty
-//! op PING(5)  body: ignored   -> empty
+//! op 1 GET   key                          -> Ok, value | NotFound
+//! op 2 SET   u32 klen, key, value         -> Ok | TooLarge
+//! op 3 DEL   key                          -> Ok (deleted) | NotFound
+//! op 4 AUTH  token                        -> Ok | Unauthorized
+//! op 5 PING  (ignored)                    -> Ok
+//! op 6 BATCH u32 count, count × (u8 op, u32 len, body)
+//!            -> Ok, u32 count, count × (u8 status, u32 len, body)
 //! ```
 //!
-//! A non-OK status carries a UTF-8 message as its body. When the server is
-//! started with a token, AUTH must be the first request on a connection;
-//! any other request before a successful AUTH is answered with
-//! `Unauthorized` and the connection is closed.
-//!
-//! PING exists because the server closes a connection that sends nothing
-//! for its idle timeout: a client that may sit quiet sends one every
-//! [`KEEPALIVE`] to stay connected.
+//! A batch carries GET, SET and DEL items (at most [`MAX_ITEMS`]) and
+//! answers each exactly as the standalone op would, in order; a malformed
+//! envelope is `BadRequest` for the whole frame, a bad item is its own
+//! status. Error bodies are UTF-8 messages.
 
 use std::time::Duration;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 pub mod io;
 
-/// Size of a request or response frame header.
+/// Bytes in a frame header: tag plus length.
 pub const HEADER_LEN: usize = 5;
 
-/// Request operations.
+/// Request tags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Op {
@@ -48,8 +35,8 @@ pub enum Op {
     Set = 2,
     Del = 3,
     Auth = 4,
-    /// Keeps a quiet connection open; the body is ignored.
     Ping = 5,
+    Batch = 6,
 }
 
 impl Op {
@@ -60,12 +47,14 @@ impl Op {
             3 => Some(Op::Del),
             4 => Some(Op::Auth),
             5 => Some(Op::Ping),
+            6 => Some(Op::Batch),
             _ => None,
         }
     }
 }
 
-/// Response status.
+/// Response tags. `Ok` and `NotFound` are answers, the rest are refusals
+/// whose body is a message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Status {
@@ -74,6 +63,7 @@ pub enum Status {
     UnknownOp = 2,
     TooLarge = 3,
     Unauthorized = 4,
+    NotFound = 5,
 }
 
 impl Status {
@@ -84,12 +74,12 @@ impl Status {
             2 => Some(Status::UnknownOp),
             3 => Some(Status::TooLarge),
             4 => Some(Status::Unauthorized),
+            5 => Some(Status::NotFound),
             _ => None,
         }
     }
 }
 
-/// Encode a frame header (request `op` or response `status` as the tag byte).
 #[inline]
 pub fn encode_header(tag: u8, len: usize) -> [u8; HEADER_LEN] {
     debug_assert!(
@@ -102,22 +92,18 @@ pub fn encode_header(tag: u8, len: usize) -> [u8; HEADER_LEN] {
     h
 }
 
-/// Decode a frame header into its tag byte and body length.
 #[inline]
 pub fn decode_header(h: &[u8; HEADER_LEN]) -> (u8, usize) {
     (h[0], u32::from_le_bytes([h[1], h[2], h[3], h[4]]) as usize)
 }
 
-/// Error returned while decoding a malformed frame.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("unexpected end of frame: needed {needed} more bytes")]
     Truncated { needed: usize },
-    #[error("invalid tag byte {0}")]
-    InvalidTag(u8),
     #[error("trailing {0} bytes after frame")]
     Trailing(usize),
-    #[error("{0} items in one request exceeds the limit of {MAX_ITEMS}")]
+    #[error("{0} items in one batch exceeds the limit of {MAX_ITEMS}")]
     TooMany(usize),
 }
 
@@ -127,211 +113,10 @@ const U32: usize = 4;
 
 /// Largest frame body either side accepts.
 pub const MAX_FRAME: usize = 64 << 20;
-/// Most keys or entries one request may name. Without a bound a 64 MiB body
-/// of empty keys encodes ~16.7 M of them, and the server's per-request
-/// scratch space grows with that count.
+/// Most items in one batch.
 pub const MAX_ITEMS: usize = 1 << 16;
-/// How long a client lets a connection go without sending anything before
-/// it sends a PING. A third of the server's default idle timeout
-/// (`oxicache_server::DEFAULT_IDLE_TIMEOUT` is defined as three of these),
-/// so the connection survives two lost or late heartbeats.
+/// How long a client waits without a write before it pings the server.
 pub const KEEPALIVE: Duration = Duration::from_secs(100);
-
-#[inline]
-fn need(buf: &Bytes, n: usize) -> Result<()> {
-    if buf.remaining() < n {
-        Err(DecodeError::Truncated {
-            needed: n - buf.remaining(),
-        })
-    } else {
-        Ok(())
-    }
-}
-
-#[inline]
-fn get_u32(buf: &mut Bytes) -> Result<u32> {
-    need(buf, U32)?;
-    Ok(buf.get_u32_le())
-}
-
-#[inline]
-fn get_blob(buf: &mut Bytes) -> Result<Bytes> {
-    let len = get_u32(buf)? as usize;
-    need(buf, len)?;
-    Ok(buf.split_to(len))
-}
-
-#[inline]
-fn put_blob(out: &mut BytesMut, b: &[u8]) {
-    out.put_u32_le(b.len() as u32);
-    out.put_slice(b);
-}
-
-fn finish(buf: Bytes) -> Result<()> {
-    if buf.is_empty() {
-        Ok(())
-    } else {
-        Err(DecodeError::Trailing(buf.len()))
-    }
-}
-
-/// Exact encoded size of a list of keys.
-pub fn keys_size<'a>(keys: impl IntoIterator<Item = &'a [u8]>) -> usize {
-    U32 + keys.into_iter().map(|k| U32 + k.len()).sum::<usize>()
-}
-
-/// Encode a key list (body of `/get` and `/del`).
-pub fn encode_keys<'a, I>(keys: I) -> Bytes
-where
-    I: IntoIterator<Item = &'a [u8]>,
-    I::IntoIter: ExactSizeIterator + Clone,
-{
-    let it = keys.into_iter();
-    let mut out = BytesMut::with_capacity(keys_size(it.clone()));
-    out.put_u32_le(it.len() as u32);
-    for k in it {
-        put_blob(&mut out, k);
-    }
-    out.freeze()
-}
-
-/// Decode a key list. Slices are zero-copy views into `body`.
-pub fn decode_keys(mut body: Bytes) -> Result<Vec<Bytes>> {
-    let n = get_u32(&mut body)? as usize;
-    let mut keys = Vec::with_capacity(n.min(body.len() / U32));
-    for _ in 0..n {
-        keys.push(get_blob(&mut body)?);
-    }
-    finish(body)?;
-    Ok(keys)
-}
-
-/// Encode key/value entries (body of `/set`).
-pub fn encode_entries<'a, I>(entries: I) -> Bytes
-where
-    I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
-    I::IntoIter: ExactSizeIterator + Clone,
-{
-    let it = entries.into_iter();
-    let size = U32
-        + it.clone()
-            .map(|(k, v)| 2 * U32 + k.len() + v.len())
-            .sum::<usize>();
-    let mut out = BytesMut::with_capacity(size);
-    out.put_u32_le(it.len() as u32);
-    for (k, v) in it {
-        put_blob(&mut out, k);
-        put_blob(&mut out, v);
-    }
-    out.freeze()
-}
-
-/// Decode key/value entries. Slices are zero-copy views into `body`.
-pub fn decode_entries(mut body: Bytes) -> Result<Vec<(Bytes, Bytes)>> {
-    let n = get_u32(&mut body)? as usize;
-    let mut entries = Vec::with_capacity(n.min(body.len() / (2 * U32)));
-    for _ in 0..n {
-        let k = get_blob(&mut body)?;
-        let v = get_blob(&mut body)?;
-        entries.push((k, v));
-    }
-    finish(body)?;
-    Ok(entries)
-}
-
-/// Borrowed view of an encoded key list. Construction validates the whole
-/// body, so iteration cannot fail and yields plain slices of it: no
-/// allocation and no refcount traffic per key.
-#[derive(Clone)]
-pub struct Keys<'a> {
-    rest: &'a [u8],
-    left: usize,
-}
-
-/// Validate and borrow a key list (body of `GET` and `DEL`).
-pub fn keys(body: &[u8]) -> Result<Keys<'_>> {
-    let (n, mut rest) = split_count(body)?;
-    if n > MAX_ITEMS {
-        return Err(DecodeError::TooMany(n));
-    }
-    for _ in 0..n {
-        rest = skip_blob(rest)?.1;
-    }
-    if !rest.is_empty() {
-        return Err(DecodeError::Trailing(rest.len()));
-    }
-    Ok(Keys {
-        rest: &body[U32..],
-        left: n,
-    })
-}
-
-impl<'a> Iterator for Keys<'a> {
-    type Item = &'a [u8];
-    #[inline]
-    fn next(&mut self) -> Option<&'a [u8]> {
-        if self.left == 0 {
-            return None;
-        }
-        self.left -= 1;
-        // SAFETY: `keys` validated `left` blobs ahead of `rest`.
-        let (k, rest) = unsafe { take_blob(self.rest) };
-        self.rest = rest;
-        Some(k)
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.left, Some(self.left))
-    }
-}
-impl ExactSizeIterator for Keys<'_> {}
-
-/// Borrowed view of encoded key/value entries; see [`Keys`].
-#[derive(Clone)]
-pub struct Entries<'a> {
-    rest: &'a [u8],
-    left: usize,
-}
-
-/// Validate and borrow an entry list (body of `SET`).
-pub fn entries(body: &[u8]) -> Result<Entries<'_>> {
-    let (n, mut rest) = split_count(body)?;
-    if n > MAX_ITEMS {
-        return Err(DecodeError::TooMany(n));
-    }
-    for _ in 0..n {
-        rest = skip_blob(skip_blob(rest)?.1)?.1;
-    }
-    if !rest.is_empty() {
-        return Err(DecodeError::Trailing(rest.len()));
-    }
-    Ok(Entries {
-        rest: &body[U32..],
-        left: n,
-    })
-}
-
-impl<'a> Iterator for Entries<'a> {
-    type Item = (&'a [u8], &'a [u8]);
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.left == 0 {
-            return None;
-        }
-        self.left -= 1;
-        // SAFETY: `entries` validated `2 * left` blobs ahead of `rest`.
-        let (k, v, rest) = unsafe {
-            let (k, rest) = take_blob(self.rest);
-            let (v, rest) = take_blob(rest);
-            (k, v, rest)
-        };
-        self.rest = rest;
-        Some((k, v))
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.left, Some(self.left))
-    }
-}
-impl ExactSizeIterator for Entries<'_> {}
 
 #[inline]
 fn split_count(body: &[u8]) -> Result<(usize, &[u8])> {
@@ -343,125 +128,178 @@ fn split_count(body: &[u8]) -> Result<(usize, &[u8])> {
     Ok((u32::from_le_bytes(*n) as usize, rest))
 }
 
-/// Validate one length-prefixed blob, returning it and the remainder.
 #[inline]
-fn skip_blob(b: &[u8]) -> Result<(&[u8], &[u8])> {
-    let (len, rest) = split_count(b)?;
-    if rest.len() < len {
+fn split_len(b: &[u8], len: usize) -> Result<(&[u8], &[u8])> {
+    if b.len() < len {
         return Err(DecodeError::Truncated {
-            needed: len - rest.len(),
+            needed: len - b.len(),
         });
     }
-    Ok(rest.split_at(len))
+    Ok(b.split_at(len))
 }
 
-/// Split one blob off an already validated buffer.
-///
-/// # Safety
-/// `b` must start with a blob that [`skip_blob`] has accepted: a length
-/// prefix followed by at least that many bytes. [`Keys`] and [`Entries`] are
-/// only built by [`keys`] and [`entries`], which validate every blob they
-/// will later yield, and their fields are private, so this holds for every
-/// call from their iterators.
+/// Size of a SET body for `key` and `value`.
 #[inline]
-unsafe fn take_blob(b: &[u8]) -> (&[u8], &[u8]) {
-    debug_assert!(b.len() >= U32);
-    unsafe {
-        let len = u32::from_le_bytes(*(b.as_ptr() as *const [u8; U32])) as usize;
-        let rest = b.get_unchecked(U32..);
-        debug_assert!(rest.len() >= len);
-        rest.split_at_unchecked(len)
-    }
+pub fn set_size(key: &[u8], value: &[u8]) -> usize {
+    U32 + key.len() + value.len()
 }
 
-/// Encode a `/get` response: one optional value per requested key.
-pub fn encode_values<'a, I>(values: I) -> Bytes
-where
-    I: IntoIterator<Item = Option<&'a [u8]>>,
-    I::IntoIter: ExactSizeIterator + Clone,
-{
-    let it = values.into_iter();
-    let size = U32
-        + it.clone()
-            .map(|v| 1 + v.map_or(0, |v| U32 + v.len()))
-            .sum::<usize>();
-    let mut out = BytesMut::with_capacity(size);
-    out.put_u32_le(it.len() as u32);
-    for v in it {
-        match v {
-            Some(v) => {
-                out.put_u8(1);
-                put_blob(&mut out, v);
-            }
-            None => out.put_u8(0),
-        }
-    }
+/// Append a SET body to `out`.
+#[inline]
+pub fn put_set(out: &mut BytesMut, key: &[u8], value: &[u8]) {
+    out.put_u32_le(key.len() as u32);
+    out.put_slice(key);
+    out.put_slice(value);
+}
+
+/// A SET body.
+pub fn encode_set(key: &[u8], value: &[u8]) -> Bytes {
+    let mut out = BytesMut::with_capacity(set_size(key, value));
+    put_set(&mut out, key, value);
     out.freeze()
 }
 
-/// Incremental encoder for a `/get` response, for callers that produce values
-/// one at a time and want a single output buffer.
-pub struct ValuesEncoder {
-    out: BytesMut,
-    count: u32,
+/// The key and value of a SET body.
+#[inline]
+pub fn set_body(body: &[u8]) -> Result<(&[u8], &[u8])> {
+    let (klen, rest) = split_count(body)?;
+    split_len(rest, klen)
 }
 
-impl ValuesEncoder {
-    pub fn with_capacity(count: usize, bytes_hint: usize) -> Self {
-        let mut out = BytesMut::with_capacity(U32 + count * (1 + U32) + bytes_hint);
+/// Builds a BATCH body: items in the order they are added.
+pub struct BatchEncoder {
+    out: BytesMut,
+    count: usize,
+}
+
+impl Default for BatchEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BatchEncoder {
+    pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// With room for `bytes` of items before the buffer grows.
+    pub fn with_capacity(bytes: usize) -> Self {
+        let mut out = BytesMut::with_capacity(U32 + bytes);
         out.put_u32_le(0);
         Self { out, count: 0 }
     }
 
+    /// Items added so far.
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     #[inline]
-    pub fn push(&mut self, value: Option<&[u8]>) {
-        match value {
-            Some(v) => {
-                self.out.put_u8(1);
-                put_blob(&mut self.out, v);
-            }
-            None => self.out.put_u8(0),
-        }
+    fn item(&mut self, op: Op, len: usize) {
+        self.out.put_slice(&encode_header(op as u8, len));
         self.count += 1;
     }
 
+    pub fn get(&mut self, key: &[u8]) {
+        self.item(Op::Get, key.len());
+        self.out.put_slice(key);
+    }
+
+    pub fn set(&mut self, key: &[u8], value: &[u8]) {
+        self.item(Op::Set, set_size(key, value));
+        put_set(&mut self.out, key, value);
+    }
+
+    pub fn del(&mut self, key: &[u8]) {
+        self.item(Op::Del, key.len());
+        self.out.put_slice(key);
+    }
+
+    /// The body. Panics past [`MAX_ITEMS`]; check [`len`](Self::len) first.
     pub fn finish(mut self) -> Bytes {
-        self.out[..U32].copy_from_slice(&self.count.to_le_bytes());
+        assert!(
+            self.count <= MAX_ITEMS,
+            "{} items exceed MAX_ITEMS",
+            self.count
+        );
+        self.out[..U32].copy_from_slice(&(self.count as u32).to_le_bytes());
         self.out.freeze()
     }
 }
 
-/// Decode a `/get` response.
-pub fn decode_values(mut body: Bytes) -> Result<Vec<Option<Bytes>>> {
-    let n = get_u32(&mut body)? as usize;
-    let mut values = Vec::with_capacity(n.min(body.len()));
+/// The items of a BATCH body, or the replies of a BATCH response: nested
+/// frames, validated once up front so iteration cannot fail.
+#[derive(Clone, Debug)]
+pub struct Frames<'a> {
+    rest: &'a [u8],
+    left: usize,
+}
+
+/// Validate a `u32 count, count × frame` body and iterate its frames as
+/// `(tag, body)`.
+pub fn frames(body: &[u8]) -> Result<Frames<'_>> {
+    let (n, mut rest) = split_count(body)?;
+    if n > MAX_ITEMS {
+        return Err(DecodeError::TooMany(n));
+    }
     for _ in 0..n {
-        need(&body, 1)?;
-        match body.get_u8() {
-            0 => values.push(None),
-            1 => values.push(Some(get_blob(&mut body)?)),
-            t => return Err(DecodeError::InvalidTag(t)),
+        let (h, r) = split_len(rest, HEADER_LEN)?;
+        let (_, len) = decode_header(h.try_into().expect("HEADER_LEN bytes"));
+        rest = split_len(r, len)?.1;
+    }
+    if !rest.is_empty() {
+        return Err(DecodeError::Trailing(rest.len()));
+    }
+    Ok(Frames {
+        rest: &body[U32..],
+        left: n,
+    })
+}
+
+impl<'a> Iterator for Frames<'a> {
+    type Item = (u8, &'a [u8]);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        // SAFETY: `frames` walked every header and length once already.
+        unsafe {
+            let h = &*(self.rest.as_ptr() as *const [u8; HEADER_LEN]);
+            let (tag, len) = decode_header(h);
+            let rest = self.rest.get_unchecked(HEADER_LEN..);
+            debug_assert!(rest.len() >= len);
+            let (body, rest) = rest.split_at_unchecked(len);
+            self.rest = rest;
+            Some((tag, body))
         }
     }
-    finish(body)?;
-    Ok(values)
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.left, Some(self.left))
+    }
 }
 
-/// Encode a `/del` response: one `found` flag per requested key.
-pub fn encode_flags(flags: &[bool]) -> Bytes {
-    let mut out = BytesMut::with_capacity(U32 + flags.len());
-    out.put_u32_le(flags.len() as u32);
-    out.extend(flags.iter().map(|&f| f as u8));
-    out.freeze()
-}
+impl ExactSizeIterator for Frames<'_> {}
 
-/// Decode a `/del` response.
-pub fn decode_flags(mut body: Bytes) -> Result<Vec<bool>> {
-    let n = get_u32(&mut body)? as usize;
-    need(&body, n)?;
-    let flags = body.split_to(n).iter().map(|&b| b != 0).collect();
-    finish(body)?;
-    Ok(flags)
+/// The replies of a BATCH response as owned `(status, body)` pairs sharing
+/// the response's allocation.
+pub fn decode_replies(body: Bytes) -> Result<Vec<(u8, Bytes)>> {
+    let it = frames(&body)?;
+    let mut replies = Vec::with_capacity(it.len());
+    let base = body.as_ptr() as usize;
+    for (tag, b) in it {
+        let start = b.as_ptr() as usize - base;
+        replies.push((tag, body.slice(start..start + b.len())));
+    }
+    Ok(replies)
 }
 
 #[cfg(test)]
@@ -469,129 +307,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn borrowed_iterators_match_owned() {
-        let ks: [&[u8]; 3] = [b"a", b"", b"hello world"];
-        let enc = encode_keys(ks);
-        let it = keys(&enc).unwrap();
-        assert_eq!(it.len(), 3);
-        assert_eq!(it.collect::<Vec<_>>(), ks);
-        let es: [(&[u8], &[u8]); 2] = [(b"k1", b"v1"), (b"k2", &[0u8, 255, 1])];
-        let enc = encode_entries(es);
-        assert_eq!(entries(&enc).unwrap().collect::<Vec<_>>(), es);
-        assert!(matches!(keys(&[1, 0]), Err(DecodeError::Truncated { .. })));
-        assert!(matches!(
-            keys(&[1, 0, 0, 0, 100, 0, 0, 0]),
-            Err(DecodeError::Truncated { needed: 100 })
-        ));
-        assert!(matches!(
-            entries(&[0, 0, 0, 0, 9]),
-            Err(DecodeError::Trailing(1))
-        ));
-    }
-
-    #[test]
-    fn keys_roundtrip() {
-        let keys: [&[u8]; 3] = [b"a", b"", b"hello world"];
-        let enc = encode_keys(keys);
-        assert_eq!(enc.len(), keys_size(keys));
-        let dec = decode_keys(enc).unwrap();
-        assert_eq!(dec, keys.map(Bytes::from_static));
-    }
-
-    #[test]
-    fn entries_roundtrip() {
-        let entries: [(&[u8], &[u8]); 2] = [(b"k1", b"v1"), (b"k2", &[0u8, 255, 1])];
-        let dec = decode_entries(encode_entries(entries)).unwrap();
-        assert_eq!(dec.len(), 2);
-        assert_eq!(&dec[1].1[..], &[0u8, 255, 1]);
-    }
-
-    #[test]
-    fn values_roundtrip() {
-        let vals: [Option<&[u8]>; 3] = [Some(b"x"), None, Some(b"")];
-        let dec = decode_values(encode_values(vals)).unwrap();
-        assert_eq!(
-            dec,
-            vec![Some(Bytes::from_static(b"x")), None, Some(Bytes::new())]
-        );
-    }
-
-    #[test]
-    fn values_encoder_matches_encode_values() {
-        let vals: [Option<&[u8]>; 3] = [Some(b"x"), None, Some(b"")];
-        let mut enc = ValuesEncoder::with_capacity(3, 0);
-        for v in vals {
-            enc.push(v);
-        }
-        assert_eq!(enc.finish(), encode_values(vals));
-    }
-
-    #[test]
-    fn flags_roundtrip() {
-        let flags = [true, false, true];
-        assert_eq!(decode_flags(encode_flags(&flags)).unwrap(), flags);
-    }
-
-    #[test]
-    fn empty_frames() {
-        assert!(
-            decode_keys(encode_keys([] as [&[u8]; 0]))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            decode_values(encode_values([] as [Option<&[u8]>; 0]))
-                .unwrap()
-                .is_empty()
-        );
-        assert!(decode_flags(encode_flags(&[])).unwrap().is_empty());
-    }
-
-    #[test]
     fn header_roundtrip() {
-        let h = encode_header(Op::Set as u8, 0xdead_beef);
-        assert_eq!(decode_header(&h), (2, 0xdead_beef));
-        assert_eq!(Op::from_u8(3), Some(Op::Del));
-        assert_eq!(Op::from_u8(9), None);
-        assert_eq!(Status::from_u8(1), Some(Status::BadRequest));
+        let h = encode_header(Op::Batch as u8, 0x01020304);
+        assert_eq!(decode_header(&h), (6, 0x01020304));
+    }
+
+    #[test]
+    fn set_body_roundtrip() {
+        let b = encode_set(b"key", b"value bytes");
+        assert_eq!(b.len(), set_size(b"key", b"value bytes"));
+        assert_eq!(set_body(&b).unwrap(), (&b"key"[..], &b"value bytes"[..]));
+        assert_eq!(
+            set_body(&encode_set(b"", b"")).unwrap(),
+            (&b""[..], &b""[..])
+        );
+        assert!(matches!(
+            set_body(&[1, 0]),
+            Err(DecodeError::Truncated { needed: 2 })
+        ));
+        assert!(matches!(
+            set_body(&[9, 0, 0, 0, 1]),
+            Err(DecodeError::Truncated { needed: 8 })
+        ));
+    }
+
+    #[test]
+    fn batch_roundtrip() {
+        let mut b = BatchEncoder::new();
+        assert!(b.is_empty());
+        b.get(b"a");
+        b.set(b"k", b"v");
+        b.del(b"");
+        assert_eq!(b.len(), 3);
+        let body = b.finish();
+        let items: Vec<_> = frames(&body).unwrap().collect();
+        assert_eq!(
+            items,
+            vec![
+                (Op::Get as u8, &b"a"[..]),
+                (Op::Set as u8, &encode_set(b"k", b"v")[..]),
+                (Op::Del as u8, &b""[..]),
+            ]
+        );
+        assert_eq!(frames(&BatchEncoder::new().finish()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn replies_share_the_buffer() {
+        let mut out = BytesMut::new();
+        out.put_u32_le(2);
+        out.put_slice(&encode_header(Status::Ok as u8, 3));
+        out.put_slice(b"abc");
+        out.put_slice(&encode_header(Status::NotFound as u8, 0));
+        let body = out.freeze();
+        let r = decode_replies(body.clone()).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0, 0);
+        assert_eq!(&r[0].1[..], b"abc");
+        assert_eq!(r[0].1.as_ptr(), body[9..].as_ptr(), "no copy");
+        assert_eq!(r[1], (5, Bytes::new()));
     }
 
     #[test]
     fn rejects_malformed() {
         assert!(matches!(
-            decode_keys(Bytes::from_static(&[1, 0])),
+            frames(&[1, 0]),
             Err(DecodeError::Truncated { .. })
         ));
+        // One item announced, only part of its header present.
         assert!(matches!(
-            decode_keys(Bytes::from_static(&[1, 0, 0, 0, 100, 0, 0, 0])),
+            frames(&[1, 0, 0, 0, 1, 0]),
+            Err(DecodeError::Truncated { needed: 3 })
+        ));
+        // Item claims 100 bytes, has none.
+        assert!(matches!(
+            frames(&[1, 0, 0, 0, 1, 100, 0, 0, 0]),
             Err(DecodeError::Truncated { needed: 100 })
         ));
+        assert!(matches!(
+            frames(&[0, 0, 0, 0, 9]),
+            Err(DecodeError::Trailing(1))
+        ));
+        let mut too_many = ((MAX_ITEMS + 1) as u32).to_le_bytes().to_vec();
+        too_many.resize(U32 + HEADER_LEN * (MAX_ITEMS + 1), 0);
         assert_eq!(
-            decode_values(Bytes::from_static(&[1, 0, 0, 0, 7])),
-            Err(DecodeError::InvalidTag(7))
+            frames(&too_many).unwrap_err(),
+            DecodeError::TooMany(MAX_ITEMS + 1)
         );
         assert_eq!(
-            decode_flags(Bytes::from_static(&[0, 0, 0, 0, 9])),
-            Err(DecodeError::Trailing(1))
+            DecodeError::TooMany(70000).to_string(),
+            "70000 items in one batch exceeds the limit of 65536"
         );
     }
 
     #[test]
     fn unknown_status_byte() {
-        assert_eq!(Status::from_u8(9), None);
-    }
-
-    #[test]
-    fn rejects_trailing_and_too_many() {
-        let mut k = encode_keys([&b"a"[..]]).to_vec();
-        k.push(0);
-        assert!(matches!(keys(&k), Err(DecodeError::Trailing(1))));
-        let mut e = encode_entries([(&b"a"[..], &b"b"[..])]).to_vec();
-        e.push(0);
-        assert!(matches!(entries(&e), Err(DecodeError::Trailing(1))));
-        let n = (MAX_ITEMS + 1) as u32;
-        let huge = n.to_le_bytes();
-        assert!(matches!(keys(&huge), Err(DecodeError::TooMany(_))));
-        assert!(matches!(entries(&huge), Err(DecodeError::TooMany(_))));
+        assert_eq!(Status::from_u8(5), Some(Status::NotFound));
+        assert_eq!(Status::from_u8(6), None);
+        assert_eq!(Op::from_u8(6), Some(Op::Batch));
+        assert_eq!(Op::from_u8(7), None);
     }
 }

@@ -521,67 +521,152 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Route a request to the cache and append the response frame to `out`.
 pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
-    let res = match Op::from_u8(op) {
-        Some(Op::Get) => wire::keys(body).map(|keys| {
-            cache.get_many(keys, |entries| {
-                let total = 4 + entries
-                    .iter()
-                    .map(|e| 1 + e.as_ref().map_or(0, |e| 4 + e.value().len()))
-                    .sum::<usize>();
-                if total > MAX_RESPONSE {
-                    return out.frame(
-                        Status::TooLarge as u8,
-                        Bytes::from(format!("response of {total} bytes exceeds the limit")),
-                    );
-                }
-                out.header(Status::Ok as u8, total);
-                out.put_slice(&(entries.len() as u32).to_le_bytes());
-                for e in entries {
-                    match e {
-                        Some(e) => {
-                            out.put_slice(&[1]);
-                            out.put_slice(&(e.value().len() as u32).to_le_bytes());
-                            if e.value().len() < wire::io::INLINE_BODY {
-                                out.put_slice(e.value());
-                            } else {
-                                out.put_bytes(Bytes::from_owner(Entry::clone(e)));
-                            }
-                        }
-                        None => out.put_slice(&[0]),
-                    }
-                }
-            })
-        }),
-        Some(Op::Set) => wire::entries(body).map(|entries| {
+    match Op::from_u8(op) {
+        Some(Op::Get) => match cache.get(body) {
+            Some(e) if e.value().len() > MAX_RESPONSE => out.frame(
+                Status::TooLarge as u8,
+                Bytes::from(format!(
+                    "response of {} bytes exceeds the limit",
+                    e.value().len()
+                )),
+            ),
+            Some(e) => value(&e, out),
+            None => out.header(Status::NotFound as u8, 0),
+        },
+        Some(Op::Set) => match wire::set_body(body) {
             // The cache copies key and value into its own allocation, so the
             // request body is released as soon as this returns.
-            match cache.set_many(entries) {
+            Ok((k, v)) => match cache.set(k, v) {
                 Ok(()) => out.header(Status::Ok as u8, 0),
                 Err(e) => out.frame(Status::TooLarge as u8, Bytes::from(e.to_string())),
-            }
-        }),
-        Some(Op::Del) => wire::keys(body).map(|keys| {
-            out.header(Status::Ok as u8, 4 + keys.len());
-            out.put_slice(&(keys.len() as u32).to_le_bytes());
-            cache.del_many(keys, |found| out.put_slice(&[found as u8]));
-        }),
+            },
+            Err(e) => out.frame(Status::BadRequest as u8, Bytes::from(e.to_string())),
+        },
+        Some(Op::Del) => out.header(
+            if cache.del(body) {
+                Status::Ok
+            } else {
+                Status::NotFound
+            } as u8,
+            0,
+        ),
+        Some(Op::Batch) => batch(body, cache, out),
         // AUTH here means already authenticated: a no-op. PING is the
         // client's heartbeat; its body is ignored rather than validated, so
         // a future client can attach something without being refused.
-        Some(Op::Auth | Op::Ping) => {
-            out.header(Status::Ok as u8, 0);
-            Ok(())
-        }
-        None => {
-            return out.frame(
-                Status::UnknownOp as u8,
-                Bytes::from(format!("unknown op {op}")),
-            );
-        }
-    };
-    if let Err(e) = res {
-        out.frame(Status::BadRequest as u8, Bytes::from(e.to_string()));
+        Some(Op::Auth | Op::Ping) => out.header(Status::Ok as u8, 0),
+        None => out.frame(
+            Status::UnknownOp as u8,
+            Bytes::from(format!("unknown op {op}")),
+        ),
     }
+}
+
+/// An `Ok` frame carrying `e`'s value: copied while small, referenced from
+/// the cache entry (and read in place by `writev`) once it is not.
+#[inline]
+fn value(e: &Entry, out: &mut FrameWriter) {
+    let v = e.value();
+    out.header(Status::Ok as u8, v.len());
+    if v.len() < wire::io::INLINE_BODY {
+        out.put_slice(v);
+    } else {
+        out.put_bytes(Bytes::from_owner(Entry::clone(e)));
+    }
+}
+
+/// Serve a BATCH body: every item answered as its op would be on its own,
+/// in order, written as it is produced under a header patched at the end.
+/// Runs of the same op go to the cache together (one epoch pin, prefetched
+/// lookups), which is what makes a batch of GETs cheaper than the same GETs
+/// pipelined.
+fn batch(body: &[u8], cache: &Cache, out: &mut FrameWriter) {
+    let items = match wire::frames(body) {
+        Ok(items) => items,
+        Err(e) => return out.frame(Status::BadRequest as u8, Bytes::from(e.to_string())),
+    };
+    let mark = out.begin(Status::Ok as u8);
+    out.put_slice(&(items.len() as u32).to_le_bytes());
+    let mut items = items.peekable();
+    while let Some((op, b)) = items.next() {
+        match Op::from_u8(op) {
+            Some(Op::Get) => {
+                let run = std::iter::once(b).chain(std::iter::from_fn(|| {
+                    items.next_if(|(o, _)| *o == op).map(|(_, k)| k)
+                }));
+                cache.get_many(run, |found| {
+                    for e in found {
+                        match e {
+                            Some(e) => value(e, out),
+                            None => out.header(Status::NotFound as u8, 0),
+                        }
+                    }
+                });
+            }
+            Some(Op::Set) => {
+                // A run ends at the first item that does not parse; that
+                // one is refused on its own and the next run starts after it.
+                let mut entries = Vec::new();
+                let mut bad = None;
+                match wire::set_body(b) {
+                    Ok(kv) => entries.push(kv),
+                    Err(e) => bad = Some(e),
+                }
+                while bad.is_none() {
+                    let Some((_, b)) = items.next_if(|(o, _)| *o == op) else {
+                        break;
+                    };
+                    match wire::set_body(b) {
+                        Ok(kv) => entries.push(kv),
+                        Err(e) => bad = Some(e),
+                    }
+                }
+                match cache.set_many(entries.iter().copied()) {
+                    Ok(()) => {
+                        for _ in &entries {
+                            out.header(Status::Ok as u8, 0);
+                        }
+                    }
+                    // Something does not fit: store what does, one by one,
+                    // so each item answers for itself.
+                    Err(_) => {
+                        for (k, v) in &entries {
+                            match cache.set(k, v) {
+                                Ok(()) => out.header(Status::Ok as u8, 0),
+                                Err(e) => {
+                                    out.frame(Status::TooLarge as u8, Bytes::from(e.to_string()))
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(e) = bad {
+                    out.frame(Status::BadRequest as u8, Bytes::from(e.to_string()));
+                }
+            }
+            Some(Op::Del) => {
+                let run = std::iter::once(b).chain(std::iter::from_fn(|| {
+                    items.next_if(|(o, _)| *o == op).map(|(_, k)| k)
+                }));
+                cache.del_many(run, |found| {
+                    out.header(if found { Status::Ok } else { Status::NotFound } as u8, 0)
+                });
+            }
+            _ => out.frame(
+                Status::UnknownOp as u8,
+                Bytes::from(format!("op {op} is not allowed in a batch")),
+            ),
+        }
+    }
+    let total = out.since(mark);
+    if total > MAX_RESPONSE {
+        out.abort(mark);
+        return out.frame(
+            Status::TooLarge as u8,
+            Bytes::from(format!("response of {total} bytes exceeds the limit")),
+        );
+    }
+    out.end(mark);
 }
 
 #[cfg(test)]
@@ -607,33 +692,115 @@ mod tests {
             NonZeroUsize::new(2).unwrap(),
         );
         let big = vec![9u8; wire::io::INLINE_BODY * 2];
-        let (st, _) = call(
-            &cache,
-            Op::Set as u8,
-            wire::encode_entries([(&b"k"[..], &b"v"[..]), (&b"big"[..], &big[..])]),
+        let set = |k: &[u8], v: &[u8]| call(&cache, Op::Set as u8, wire::encode_set(k, v));
+        let get = |k: &'static [u8]| call(&cache, Op::Get as u8, Bytes::from_static(k));
+        let del = |k: &'static [u8]| call(&cache, Op::Del as u8, Bytes::from_static(k));
+        assert_eq!(set(b"k", b"v"), (Status::Ok, Bytes::new()));
+        assert_eq!(set(b"big", &big), (Status::Ok, Bytes::new()));
+        assert_eq!(get(b"k"), (Status::Ok, Bytes::from_static(b"v")));
+        assert_eq!(get(b"x"), (Status::NotFound, Bytes::new()));
+        assert_eq!(get(b"big"), (Status::Ok, Bytes::from(big.clone())));
+        assert_eq!(del(b"k"), (Status::Ok, Bytes::new()));
+        assert_eq!(del(b"k"), (Status::NotFound, Bytes::new()));
+        assert_eq!(get(b"k").0, Status::NotFound);
+        // An empty key is a key.
+        assert_eq!(set(b"", b""), (Status::Ok, Bytes::new()));
+        assert_eq!(get(b""), (Status::Ok, Bytes::new()));
+    }
+
+    /// One nested frame per item, in order, each answered as the op would
+    /// be on its own; a later item sees an earlier one's write.
+    #[test]
+    fn batch_answers_every_item_in_order() {
+        let cache = Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
         );
+        let big = vec![9u8; wire::io::INLINE_BODY * 2];
+        let mut b = wire::BatchEncoder::new();
+        b.get(b"k");
+        b.set(b"k", b"v");
+        b.set(b"big", &big);
+        b.get(b"k");
+        b.get(b"big");
+        b.del(b"k");
+        b.del(b"k");
+        b.get(b"k");
+        let (st, body) = call(&cache, Op::Batch as u8, b.finish());
         assert_eq!(st, Status::Ok);
-        let (st, body) = call(
-            &cache,
-            Op::Get as u8,
-            wire::encode_keys([&b"k"[..], &b"x"[..], &b"big"[..]]),
+        let replies = wire::decode_replies(body).unwrap();
+        let expect: [(Status, &[u8]); 8] = [
+            (Status::NotFound, b""),
+            (Status::Ok, b""),
+            (Status::Ok, b""),
+            (Status::Ok, b"v"),
+            (Status::Ok, &big),
+            (Status::Ok, b""),
+            (Status::NotFound, b""),
+            (Status::NotFound, b""),
+        ];
+        assert_eq!(replies.len(), expect.len());
+        for (i, ((st, body), (est, eb))) in replies.iter().zip(expect).enumerate() {
+            assert_eq!(
+                (Status::from_u8(*st).unwrap(), &body[..]),
+                (est, eb),
+                "item {i}"
+            );
+        }
+        let (st, body) = call(&cache, Op::Batch as u8, wire::BatchEncoder::new().finish());
+        assert_eq!(st, Status::Ok);
+        assert!(wire::decode_replies(body).unwrap().is_empty());
+    }
+
+    /// A refused item does not take its neighbours down with it: the SET
+    /// that fits is stored, the one that does not answers TooLarge, a
+    /// malformed item is BadRequest, an op that is not GET/SET/DEL is
+    /// UnknownOp.
+    #[test]
+    fn batch_items_fail_individually() {
+        use bytes::BufMut;
+        let cache = Cache::new(
+            NonZeroUsize::new(1 << 20).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
         );
+        let big = vec![0u8; 1 << 20];
+        let mut raw = bytes::BytesMut::new();
+        raw.put_u32_le(5);
+        for (op, body) in [
+            (Op::Set as u8, wire::encode_set(b"small", b"v")),
+            (Op::Set as u8, wire::encode_set(b"big", &big)),
+            (Op::Set as u8, wire::encode_set(b"after", b"w")),
+            (Op::Set as u8, Bytes::from_static(&[9, 0, 0, 0, 1])),
+            (Op::Ping as u8, Bytes::new()),
+        ] {
+            raw.put_slice(&wire::encode_header(op, body.len()));
+            raw.put_slice(&body);
+        }
+        let (st, body) = call(&cache, Op::Batch as u8, raw.freeze());
         assert_eq!(st, Status::Ok);
+        let replies = wire::decode_replies(body).unwrap();
+        let statuses: Vec<_> = replies
+            .iter()
+            .map(|(s, _)| Status::from_u8(*s).unwrap())
+            .collect();
         assert_eq!(
-            wire::decode_values(body).unwrap(),
-            vec![
-                Some(Bytes::from_static(b"v")),
-                None,
-                Some(Bytes::from(big.clone()))
+            statuses,
+            [
+                Status::Ok,
+                Status::TooLarge,
+                Status::Ok,
+                Status::BadRequest,
+                Status::UnknownOp
             ]
         );
-        let (st, body) = call(
-            &cache,
-            Op::Del as u8,
-            wire::encode_keys([&b"k"[..], &b"x"[..]]),
+        assert!(
+            std::str::from_utf8(&replies[4].1)
+                .unwrap()
+                .contains("not allowed in a batch")
         );
-        assert_eq!(st, Status::Ok);
-        assert_eq!(wire::decode_flags(body).unwrap(), vec![true, false]);
+        assert!(cache.get(b"small").is_some());
+        assert!(cache.get(b"big").is_none());
+        assert!(cache.get(b"after").is_some());
     }
 
     #[test]
@@ -659,15 +826,26 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
         );
         assert_eq!(call(&cache, 42, Bytes::new()).0, Status::UnknownOp);
+        // A SET whose key length runs past the body.
         assert_eq!(
-            call(&cache, Op::Get as u8, Bytes::from_static(&[9, 0])).0,
+            call(&cache, Op::Set as u8, Bytes::from_static(&[9, 0, 0, 0, 1])).0,
+            Status::BadRequest
+        );
+        // A batch envelope that ends mid-item is refused whole.
+        assert_eq!(
+            call(
+                &cache,
+                Op::Batch as u8,
+                Bytes::from_static(&[1, 0, 0, 0, 1, 0])
+            )
+            .0,
             Status::BadRequest
         );
         // A count beyond the item limit is rejected before any work is done.
         let mut huge = Vec::new();
         huge.extend_from_slice(&((wire::MAX_ITEMS + 1) as u32).to_le_bytes());
-        huge.resize(4 + 4 * (wire::MAX_ITEMS + 1), 0);
-        let (st, msg) = call(&cache, Op::Get as u8, Bytes::from(huge));
+        huge.resize(4 + wire::HEADER_LEN * (wire::MAX_ITEMS + 1), 0);
+        let (st, msg) = call(&cache, Op::Batch as u8, Bytes::from(huge));
         assert_eq!(st, Status::BadRequest);
         assert!(
             std::str::from_utf8(&msg)
@@ -677,22 +855,14 @@ mod tests {
     }
 
     #[test]
-    fn oversized_set_is_rejected_whole() {
+    fn oversized_set_is_refused() {
         let cache = Cache::new(
             NonZeroUsize::new(1 << 20).unwrap(),
             NonZeroUsize::new(1).unwrap(),
         );
         let big = vec![0u8; 1 << 20];
-        let (st, _) = call(
-            &cache,
-            Op::Set as u8,
-            wire::encode_entries([(&b"small"[..], &b"v"[..]), (&b"big"[..], &big[..])]),
-        );
+        let (st, _) = call(&cache, Op::Set as u8, wire::encode_set(b"big", &big));
         assert_eq!(st, Status::TooLarge);
-        assert!(
-            cache.get(b"small").is_none(),
-            "nothing from the batch is stored"
-        );
         assert!(cache.get(b"big").is_none());
     }
 
@@ -766,12 +936,7 @@ mod tests {
         auth(&mut c).await;
         // Store a value too big for the socket buffers to absorb unread.
         let big = vec![7u8; 4 << 20];
-        let mut set = Vec::new();
-        set.extend_from_slice(&1u32.to_le_bytes());
-        set.extend_from_slice(&1u32.to_le_bytes());
-        set.push(b'k');
-        set.extend_from_slice(&(big.len() as u32).to_le_bytes());
-        set.extend_from_slice(&big);
+        let set = wire::encode_set(b"k", &big);
         c.write_all(&wire::encode_header(Op::Set as u8, set.len()))
             .await
             .unwrap();
@@ -781,13 +946,12 @@ mod tests {
         assert_eq!(wire::decode_header(&hdr), (Status::Ok as u8, 0));
         // 15 × 4 MiB stays under the response cap but far above what the
         // socket buffers can absorb unread.
-        let mut get = Vec::new();
-        get.extend_from_slice(&15u32.to_le_bytes());
+        let mut get = wire::BatchEncoder::new();
         for _ in 0..15 {
-            get.extend_from_slice(&1u32.to_le_bytes());
-            get.push(b'k');
+            get.get(b"k");
         }
-        c.write_all(&wire::encode_header(Op::Get as u8, get.len()))
+        let get = get.finish();
+        c.write_all(&wire::encode_header(Op::Batch as u8, get.len()))
             .await
             .unwrap();
         c.write_all(&get).await.unwrap();
@@ -871,11 +1035,11 @@ mod tests {
         drop(c); // RST rather than FIN
         tokio::time::sleep(Duration::from_millis(50)).await;
         // The server is still accepting.
-        let (st, _) = call(&s.cache, Op::Get as u8, wire::encode_keys([&b"k"[..]]));
-        assert_eq!(st, Status::Ok);
+        let (st, _) = call(&s.cache, Op::Get as u8, Bytes::from_static(b"k"));
+        assert_eq!(st, Status::NotFound);
         let mut c = TcpStream::connect(addr).await.unwrap();
         auth(&mut c).await;
-        tokio::io::AsyncWriteExt::write_all(&mut c, &wire::encode_header(Op::Get as u8, 0))
+        tokio::io::AsyncWriteExt::write_all(&mut c, &wire::encode_header(Op::Set as u8, 0))
             .await
             .unwrap();
         let mut hdr = [0u8; wire::HEADER_LEN];
@@ -974,17 +1138,12 @@ mod tests {
         let mut hdr = [0u8; wire::HEADER_LEN];
         c.read_exact(&mut hdr).await.unwrap();
         assert_eq!(wire::decode_header(&hdr).0, Status::Ok as u8);
-        let keys = wire::encode_keys([&b"k"[..]]);
-        c.write_all(&wire::encode_header(Op::Del as u8, keys.len()))
+        c.write_all(&wire::encode_header(Op::Del as u8, 1))
             .await
             .unwrap();
-        c.write_all(&keys).await.unwrap();
+        c.write_all(b"k").await.unwrap();
         c.read_exact(&mut hdr).await.unwrap();
-        let (st, len) = wire::decode_header(&hdr);
-        assert_eq!((st, len), (Status::Ok as u8, 5));
-        let mut body = vec![0u8; len];
-        c.read_exact(&mut body).await.unwrap();
-        assert_eq!(wire::decode_flags(body.into()).unwrap(), vec![false]);
+        assert_eq!(wire::decode_header(&hdr), (Status::NotFound as u8, 0));
         // A plain-text peer is not a TLS client: closed without a reply.
         let mut plain = TcpStream::connect(addr).await.unwrap();
         plain
@@ -1033,11 +1192,10 @@ mod tests {
         let v = vec![0u8; MAX_RESPONSE / 2];
         cache.set(b"a", &v).unwrap();
         cache.set(b"b", &v).unwrap();
-        let (st, _) = call(
-            &cache,
-            Op::Get as u8,
-            wire::encode_keys([&b"a"[..], &b"b"[..]]),
-        );
+        let mut b = wire::BatchEncoder::new();
+        b.get(b"a");
+        b.get(b"b");
+        let (st, _) = call(&cache, Op::Batch as u8, b.finish());
         assert_eq!(st, Status::TooLarge);
     }
 }

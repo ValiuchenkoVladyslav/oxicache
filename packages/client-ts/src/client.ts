@@ -1,4 +1,10 @@
-import type { Transport } from "./transport.js";
+/**
+ * The typed API over a {@link Transport}: one key per call, or a
+ * {@link Client.batch} of any number of GET/SET/DEL requests answered in
+ * one exchange. Values are MessagePack ({@link encodeValue}); keys are
+ * strings (UTF-8) or bytes.
+ */
+import { isAnswer, StatusError, type Transport } from "./transport.js";
 import {
   decodeValue,
   type Encodable,
@@ -6,52 +12,87 @@ import {
   type Value,
 } from "./value.js";
 import {
+  type BatchItem,
   type Bin,
-  decodeFlags,
-  decodeValues,
-  encodeEntriesFrame,
-  encodeKeysFrame,
+  DecodeError,
+  decodeReplies,
+  encodeBatchFrame,
+  encodeDelFrame,
+  encodeGetFrame,
+  encodePingFrame,
+  encodeSetFrame,
   Op,
+  type Reply,
+  Status,
 } from "./wire.js";
 
-/** One key/value pair for `set`. */
-export type Entry<V = Value> = readonly [key: Bin, value: V];
+/** A GET in a batch, as the transport sees it. */
+export interface AnyGetOp {
+  readonly op: Op.Get;
+  readonly key: Bin;
+}
 
-/** `E` if every entry's value is `Encodable`; each entry is checked on its own. */
-export type Entries<E extends readonly Entry<unknown>[]> = E & {
-  readonly [I in keyof E]: readonly [
-    Bin,
-    Encodable<E[I] extends Entry<infer V> ? V : never>,
-  ];
-};
+/** A GET in a batch; `T` is what the value decodes to (not checked at runtime). */
+export interface GetOp<T = Value> extends AnyGetOp {
+  /** Type-level only: carries `T` so the result tuple can name it. */
+  readonly __type?: T;
+}
 
-/** A tuple of `N` copies of `R`. */
-export type Fill<
-  N extends number,
-  R,
-  A extends R[] = [],
-> = A["length"] extends N ? A : Fill<N, R, [...A, R]>;
+/** A SET in a batch; the value is encoded when the op is built. */
+export interface SetOp {
+  readonly op: Op.Set;
+  readonly key: Bin;
+  readonly value: Uint8Array;
+}
 
-/** The type argument of an `N`-key `get`: a tuple of exactly `N` value types, one per key. */
-export type Types<N extends number> = Fill<N, unknown>;
-
-/** Result tuple of an `N`-key `get`: each key's type, or `null` when absent. */
-export type Results<T extends readonly unknown[]> = {
-  -readonly [I in keyof T]: T[I] | null;
-};
-
-/** Normalise `(key)`, `(k1, k2, …)` and `(keys[])` into a key list plus whether the result is a list. */
-function keyArgs(args: Bin[] | [readonly Bin[]]): [readonly Bin[], boolean] {
-  const first = args[0];
-  if (args.length === 1 && Array.isArray(first)) return [first, true];
-  return [args as Bin[], args.length !== 1];
+/** A DEL in a batch. */
+export interface DelOp {
+  readonly op: Op.Del;
+  readonly key: Bin;
 }
 
 /**
- * A cache client over a {@link Transport}. Calls are independent of each
- * other, so any number of tasks may share one client; what that means on
- * the wire (pipelining, one request per exchange, …) is up to the transport.
+ * Any op a batch takes. `AnyGetOp` rather than `GetOp<unknown>` so that
+ * the batch's element type does not steer `op.get`'s inference away from
+ * its default.
  */
+export type BatchOp = AnyGetOp | SetOp | DelOp;
+
+/** What one batch op resolves to: get → value or null, set → undefined, del → whether the key existed. */
+export type BatchResult<O> =
+  O extends GetOp<infer T>
+    ? T | null
+    : O extends SetOp
+      ? undefined
+      : O extends DelOp
+        ? boolean
+        : never;
+
+/** The results of a batch, positionally typed after its ops. */
+export type BatchResults<O extends readonly BatchOp[]> = {
+  -readonly [I in keyof O]: BatchResult<O[I]>;
+};
+
+/**
+ * Builders for {@link Client.batch}:
+ * `c.batch([op.get<User>("u:1"), op.set("seen", 1), op.del("tmp")])`.
+ * `op.set` encodes its value at once, so a value that cannot be encoded
+ * throws here rather than inside the batch.
+ */
+export const op = {
+  get<T = Value>(key: Bin): GetOp<T> {
+    return { op: Op.Get, key };
+  },
+  set<V>(key: Bin, value: V & Encodable<V>): SetOp {
+    return { op: Op.Set, key, value: encodeValue(value) };
+  },
+  del(key: Bin): DelOp {
+    return { op: Op.Del, key };
+  },
+} as const;
+
+const utf8 = new TextDecoder();
+
 export class Client {
   private constructor(private readonly transport: Transport) {}
 
@@ -66,390 +107,77 @@ export class Client {
   }
 
   /**
-   * Fetch one key or many. One key in, one value out; several keys in, a
-   * tuple of values out, one per key in argument order (up to 16 literal
-   * keys); an array in, an array out, for lists whose length is only known
-   * at runtime. `null` marks an absent key.
-   *
-   * `T` is what the stored values decode to and is not checked at runtime.
-   * With several keys it is a tuple with exactly one type per key:
-   * `get<[User, number]>(a, b)`.
+   * The value stored under `key`, or `null` if there is none. `T` is what
+   * the value decodes to and is not checked at runtime.
    */
-  get<T = Value>(key: Bin): Promise<T | null>;
-  get<T extends Types<2> = Fill<2, Value>>(
-    k1: Bin,
-    k2: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<3> = Fill<3, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<4> = Fill<4, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<5> = Fill<5, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<6> = Fill<6, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<7> = Fill<7, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<8> = Fill<8, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<9> = Fill<9, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<10> = Fill<10, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<11> = Fill<11, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<12> = Fill<12, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<13> = Fill<13, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-    k13: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<14> = Fill<14, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-    k13: Bin,
-    k14: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<15> = Fill<15, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-    k13: Bin,
-    k14: Bin,
-    k15: Bin,
-  ): Promise<Results<T>>;
-  get<T extends Types<16> = Fill<16, Value>>(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-    k13: Bin,
-    k14: Bin,
-    k15: Bin,
-    k16: Bin,
-  ): Promise<Results<T>>;
-  get<T = Value>(keys: readonly Bin[]): Promise<(T | null)[]>;
-  async get<T = Value>(
-    ...args: Bin[] | [readonly Bin[]]
-  ): Promise<(T | null) | (T | null)[]> {
-    const [keys, many] = keyArgs(args);
-    const body = await this.transport.request(encodeKeysFrame(Op.Get, keys));
-    const values = decodeValues(body).map((v) =>
-      v === null ? null : decodeValue<T>(v),
-    );
-    return many ? values : (values[0] ?? null);
+  async get<T = Value>(key: Bin): Promise<T | null> {
+    const r = await this.transport.request(encodeGetFrame(key));
+    return r.status === Status.NotFound ? null : decodeValue<T>(r.body);
+  }
+
+  /** Store `value` under `key`, replacing whatever was there. */
+  async set<V>(key: Bin, value: V & Encodable<V>): Promise<void> {
+    await this.transport.request(encodeSetFrame(key, encodeValue(value)));
+  }
+
+  /** Remove `key`; whether it existed. */
+  async del(key: Bin): Promise<boolean> {
+    const r = await this.transport.request(encodeDelFrame(key));
+    return r.status === Status.Ok;
   }
 
   /**
-   * Store one key/value pair, several, or an array of them. Values are
-   * msgpack-encoded; anything that fails `Encodable` (functions, symbols,
-   * `undefined`, `Map`, …) is rejected at compile time, entry by entry.
+   * Send `ops` in one request and get one result per op, in order and
+   * typed after it (see {@link op}). Every op is answered on its own: a
+   * missing key is `null`/`false`, not an error; but an op the server
+   * refuses (a value too large, say) rejects the whole call with a
+   * `StatusError` naming its index. More than `MAX_ITEMS` ops throws a
+   * `RangeError` before anything is sent.
    */
-  set<V>(key: Bin, value: V & Encodable<V>): Promise<void>;
-  set<E extends readonly Entry<unknown>[]>(
-    ...entries: Entries<E>
-  ): Promise<void>;
-  set<E extends readonly Entry<unknown>[]>(entries: Entries<E>): Promise<void>;
-  async set(
-    ...args: [Bin, unknown] | Entry<unknown>[] | [readonly Entry<unknown>[]]
-  ): Promise<void> {
-    let entries: readonly Entry<unknown>[];
-    const first = args[0];
-    if (!Array.isArray(first)) {
-      entries = [[first as Bin, args[1]]]; // set(key, value)
-    } else if (first.length === 0 || Array.isArray(first[0])) {
-      entries = first as readonly Entry<unknown>[]; // set(entries)
-    } else {
-      entries = args as Entry<unknown>[]; // set([k, v], [k2, v2], ...)
+  async batch<const O extends readonly BatchOp[]>(
+    ops: O,
+  ): Promise<BatchResults<O>> {
+    const frame = encodeBatchFrame(ops as readonly BatchItem[]);
+    const replies = decodeReplies((await this.transport.request(frame)).body);
+    if (replies.length !== ops.length) {
+      throw new DecodeError(
+        `server answered ${replies.length} replies for ${ops.length} ops`,
+      );
     }
-    await this.transport.request(
-      encodeEntriesFrame(entries.map(([k, v]) => [k, encodeValue(v)] as const)),
-    );
+    return ops.map((o, i) =>
+      // biome-ignore lint/style/noNonNullAssertion: same length as ops, just checked
+      result(o, replies[i]!, i),
+    ) as BatchResults<O>;
   }
 
-  /** Delete one key or many; returns whether each one existed. Same shapes as `get`. */
-  del(key: Bin): Promise<boolean>;
-  del(k1: Bin, k2: Bin): Promise<Fill<2, boolean>>;
-  del(k1: Bin, k2: Bin, k3: Bin): Promise<Fill<3, boolean>>;
-  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin): Promise<Fill<4, boolean>>;
-  del(k1: Bin, k2: Bin, k3: Bin, k4: Bin, k5: Bin): Promise<Fill<5, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-  ): Promise<Fill<6, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-  ): Promise<Fill<7, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-  ): Promise<Fill<8, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-  ): Promise<Fill<9, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-  ): Promise<Fill<10, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-  ): Promise<Fill<11, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-  ): Promise<Fill<12, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-    k13: Bin,
-  ): Promise<Fill<13, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-    k13: Bin,
-    k14: Bin,
-  ): Promise<Fill<14, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-    k13: Bin,
-    k14: Bin,
-    k15: Bin,
-  ): Promise<Fill<15, boolean>>;
-  del(
-    k1: Bin,
-    k2: Bin,
-    k3: Bin,
-    k4: Bin,
-    k5: Bin,
-    k6: Bin,
-    k7: Bin,
-    k8: Bin,
-    k9: Bin,
-    k10: Bin,
-    k11: Bin,
-    k12: Bin,
-    k13: Bin,
-    k14: Bin,
-    k15: Bin,
-    k16: Bin,
-  ): Promise<Fill<16, boolean>>;
-  del(keys: readonly Bin[]): Promise<boolean[]>;
-  async del(...args: Bin[] | [readonly Bin[]]): Promise<boolean | boolean[]> {
-    const [keys, many] = keyArgs(args);
-    const flags = decodeFlags(
-      await this.transport.request(encodeKeysFrame(Op.Del, keys)),
-    );
-    return many ? flags : (flags[0] ?? false);
+  /** Round-trip an empty request; resolves once the server has answered. */
+  async ping(): Promise<void> {
+    await this.transport.request(encodePingFrame());
   }
 
-  /** Round-trip an empty request: resolves once the server has answered. */
-  ping(): Promise<void> {
-    return this.transport.ping();
-  }
-
-  /** Whether the transport is still usable. */
+  /** Whether the transport can still be used. */
   get isOpen(): boolean {
     return this.transport.isOpen;
   }
 
-  /** Close the transport; every in-flight call rejects with ClosedError. */
+  /** Release the transport; every in-flight and later call rejects with `ClosedError`. */
   close(): void {
     this.transport.close();
+  }
+}
+
+/** One batch reply as its op's result. */
+function result(o: BatchOp, r: Reply, i: number): unknown {
+  const { status, body } = r;
+  if (!isAnswer(status) || (o.op === Op.Set && status !== Status.Ok)) {
+    throw new StatusError(status as Status, `item ${i}: ${utf8.decode(body)}`);
+  }
+  switch (o.op) {
+    case Op.Get:
+      return status === Status.NotFound ? null : decodeValue(body);
+    case Op.Set:
+      return undefined;
+    case Op.Del:
+      return status === Status.Ok;
   }
 }

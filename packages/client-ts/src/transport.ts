@@ -1,3 +1,4 @@
+import type { Reply } from "./wire.js";
 import { Status } from "./wire.js";
 
 /**
@@ -23,6 +24,13 @@ export class StatusError extends Error {
 }
 
 /** The transport is closed (or was closed before a reply arrived). */
+/** Whether a status is an answer rather than a refusal. */
+export function isAnswer(
+  status: number,
+): status is Status.Ok | Status.NotFound {
+  return status === Status.Ok || status === Status.NotFound;
+}
+
 export class ClosedError extends Error {
   override name = "ClosedError";
   constructor(cause?: unknown) {
@@ -39,10 +47,11 @@ export class ClosedError extends Error {
 export interface Transport {
   /**
    * Send one complete request frame (`u8 op, u32 len, body`) and resolve
-   * with the response body. A non-OK status rejects with `StatusError`, a
-   * dead transport with `ClosedError`.
+   * with the response: its status (`Ok` or `NotFound`, the two answers)
+   * and body. A refusal rejects with `StatusError`, a dead transport with
+   * `ClosedError`.
    */
-  request(frame: Uint8Array): Promise<Uint8Array>;
+  request(frame: Uint8Array): Promise<Reply>;
   /** Round-trip an empty request; resolves once the server has answered. */
   ping(): Promise<void>;
   /** Whether requests can still be made. */

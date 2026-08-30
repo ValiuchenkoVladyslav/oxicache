@@ -4,14 +4,18 @@
 //! and the frame status maps onto the HTTP status. Nothing is JSON.
 //!
 //! ```text
-//! POST /get   body: keys      -> 200, body: values
-//! POST /set   body: entries   -> 200, empty
-//! POST /del   body: keys      -> 200, body: flags
-//! POST /ping                  -> 200, empty
-//! GET  /health                -> 200, empty (no authentication)
+//! POST /get    body: key                 -> 200, body: value | 404, empty
+//! POST /set    body: u32 klen, key, value -> 200, empty
+//! POST /del    body: key                 -> 200 (deleted) | 404, empty
+//! POST /batch  body: items               -> 200, body: replies
+//! POST /ping                             -> 200, empty
+//! GET  /health                           -> 200, empty (no authentication)
 //!
 //! 400 bad request | 401 unauthorized | 404 unknown path | 405 wrong method
 //! 413 too large   (the body is a UTF-8 message, as on TCP)
+//!
+//! A missing key and an unknown path are both 404; only the latter has a
+//! body.
 //! ```
 //!
 //! Every request except `/health` must carry
@@ -238,6 +242,7 @@ async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response
         "/get" => Op::Get,
         "/set" => Op::Set,
         "/del" => Op::Del,
+        "/batch" => Op::Batch,
         "/ping" => Op::Ping,
         p => return closing(text(StatusCode::NOT_FOUND, format!("unknown path {p}"))),
     };
@@ -275,6 +280,7 @@ async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response
     let body = raw.slice(wire::HEADER_LEN..);
     match Status::from_u8(status) {
         Some(Status::Ok) => reply(StatusCode::OK, body, true),
+        Some(Status::NotFound) => reply(StatusCode::NOT_FOUND, body, true),
         Some(Status::BadRequest) => reply(StatusCode::BAD_REQUEST, body, false),
         Some(Status::TooLarge) => reply(StatusCode::PAYLOAD_TOO_LARGE, body, false),
         Some(Status::Unauthorized) => reply(StatusCode::UNAUTHORIZED, body, false),
@@ -370,19 +376,30 @@ mod tests {
         assert_eq!((st, body.len()), (200, 0));
         // `/health` closed that one; the token keeps the next one open.
         let mut c = connect(&s).await;
-        let entries = wire::encode_entries([(&b"k"[..], &b"v"[..])]);
-        let (st, body) = call(&mut c, "POST", "/set", &AUTH, &entries).await;
+        let set = wire::encode_set(b"k", b"v");
+        let (st, body) = call(&mut c, "POST", "/set", &AUTH, &set).await;
         assert_eq!((st, body.len()), (200, 0));
-        let keys = wire::encode_keys([&b"k"[..], &b"x"[..]]);
-        let (st, body) = call(&mut c, "POST", "/get", &AUTH, &keys).await;
+        let (st, body) = call(&mut c, "POST", "/get", &AUTH, b"k").await;
+        assert_eq!((st, &body[..]), (200, &b"v"[..]));
+        // A missing key is 404 with no body, on the same connection.
+        let (st, body) = call(&mut c, "POST", "/get", &AUTH, b"x").await;
+        assert_eq!((st, body.len()), (404, 0));
+        let mut b = wire::BatchEncoder::new();
+        b.get(b"k");
+        b.del(b"k");
+        b.del(b"k");
+        let (st, body) = call(&mut c, "POST", "/batch", &AUTH, &b.finish()).await;
         assert_eq!(st, 200);
+        let replies = wire::decode_replies(body.into()).unwrap();
+        assert_eq!(replies.len(), 3);
         assert_eq!(
-            wire::decode_values(body.into()).unwrap(),
-            vec![Some(Bytes::from_static(b"v")), None]
+            (replies[0].0, &replies[0].1[..]),
+            (Status::Ok as u8, &b"v"[..])
         );
-        let (st, body) = call(&mut c, "POST", "/del", &AUTH, &keys).await;
-        assert_eq!(st, 200);
-        assert_eq!(wire::decode_flags(body.into()).unwrap(), vec![true, false]);
+        assert_eq!(replies[1], (Status::Ok as u8, Bytes::new()));
+        assert_eq!(replies[2], (Status::NotFound as u8, Bytes::new()));
+        let (st, body) = call(&mut c, "POST", "/del", &AUTH, b"k").await;
+        assert_eq!((st, body.len()), (404, 0));
     }
 
     #[tokio::test]
@@ -395,7 +412,7 @@ mod tests {
         let mut c = connect(&s).await;
         assert_eq!(call(&mut c, "GET", "/get", &[], b"").await.0, 405);
         let mut c = connect(&s).await;
-        let (st, body) = call(&mut c, "POST", "/get", &AUTH, &[9, 0]).await;
+        let (st, body) = call(&mut c, "POST", "/set", &AUTH, &[9, 0, 0, 0, 1]).await;
         assert_eq!(st, 400);
         assert!(
             std::str::from_utf8(&body)
@@ -416,8 +433,8 @@ mod tests {
         // A SET whose entry does not fit the cache: too large from dispatch.
         let mut c = TcpStream::connect(s.local_addr()).await.unwrap();
         let big = vec![0u8; 2 << 20];
-        let entries = wire::encode_entries([(&b"big"[..], &big[..])]);
-        assert_eq!(call(&mut c, "POST", "/set", &AUTH, &entries).await.0, 413);
+        let set = wire::encode_set(b"big", &big);
+        assert_eq!(call(&mut c, "POST", "/set", &AUTH, &set).await.0, 413);
     }
 
     #[tokio::test]
@@ -476,25 +493,25 @@ mod tests {
         let s = server();
         let mut c = connect(&s).await;
         assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 200);
-        let keys = wire::encode_keys([&b"k"[..]]);
+        let keys = b"k";
         // Every response before the token is verified closes the
         // connection, so each attempt gets a fresh one.
         let mut c = connect(&s).await;
-        let (st, body) = call(&mut c, "POST", "/get", &[], &keys).await;
+        let (st, body) = call(&mut c, "POST", "/get", &[], keys).await;
         assert_eq!((st, &body[..]), (401, &b"auth required"[..]));
         for auth in ["Bearer s3cre", "Basic s3cret", "bearer s3cret"] {
             let mut c = TcpStream::connect(s.local_addr()).await.unwrap();
             let h = [("Authorization", auth)];
             assert_eq!(
-                call(&mut c, "POST", "/get", &h, &keys).await.0,
+                call(&mut c, "POST", "/get", &h, keys).await.0,
                 401,
                 "{auth}"
             );
         }
         let mut c = TcpStream::connect(s.local_addr()).await.unwrap();
         let right = [("Authorization", "Bearer s3cret")];
-        assert_eq!(call(&mut c, "POST", "/get", &right, &keys).await.0, 200);
-        assert_eq!(call(&mut c, "POST", "/get", &right, &keys).await.0, 200);
+        assert_eq!(call(&mut c, "POST", "/get", &right, keys).await.0, 404);
+        assert_eq!(call(&mut c, "POST", "/get", &right, keys).await.0, 404);
     }
 
     #[test]
@@ -543,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn responses_before_auth_close_the_connection() {
         let s = server_with(opts().idle_timeout(None));
-        let keys = wire::encode_keys([&b"k"[..]]);
+        let keys = Bytes::from_static(b"k");
         for (method, path, headers, body, code) in [
             ("GET", "/health", &[][..], &b""[..], 200),
             ("POST", "/nope", &[], &b""[..], 404),
@@ -641,15 +658,10 @@ mod tests {
         let (connector, name) = crate::tls::testing::client();
         let tcp = TcpStream::connect(addr).await.unwrap();
         let mut c = connector.connect(name, tcp).await.unwrap();
-        let entries = wire::encode_entries([(&b"k"[..], &b"v"[..])]);
-        assert_eq!(call(&mut c, "POST", "/set", &AUTH, &entries).await.0, 200);
-        let keys = wire::encode_keys([&b"k"[..]]);
-        let (st, body) = call(&mut c, "POST", "/get", &AUTH, &keys).await;
-        assert_eq!(st, 200);
-        assert_eq!(
-            wire::decode_values(body.into()).unwrap(),
-            vec![Some(Bytes::from_static(b"v"))]
-        );
+        let set = wire::encode_set(b"k", b"v");
+        assert_eq!(call(&mut c, "POST", "/set", &AUTH, &set).await.0, 200);
+        let (st, body) = call(&mut c, "POST", "/get", &AUTH, b"k").await;
+        assert_eq!((st, &body[..]), (200, &b"v"[..]));
         // Plain HTTP to a TLS listener gets no HTTP answer at all.
         let mut plain = TcpStream::connect(addr).await.unwrap();
         plain

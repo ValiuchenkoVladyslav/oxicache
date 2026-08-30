@@ -1,19 +1,20 @@
 import { describe, expect, test } from "bun:test";
 import {
   DecodeError,
-  decodeFlags,
-  decodeValues,
-  encodeEntriesFrame,
-  encodeKeysFrame,
+  decodeReplies,
+  encodeBatchFrame,
+  encodeDelFrame,
+  encodeGetFrame,
   encodeRawFrame,
+  encodeSetFrame,
   FrameReader,
   HEADER_LEN,
   MAX_ITEMS,
   Op,
+  Status,
 } from "../src/wire";
 import { must } from "./must";
 
-const INVALID_TAG = /invalid tag byte 7/;
 const NEEDED_100 = /needed 100/;
 const TRAILING_1 = /trailing 1 bytes/;
 const EXCEEDS_16 = /exceeds the client limit of 16/;
@@ -26,91 +27,86 @@ const le32 = (n: number) => [
 ];
 
 describe("encode", () => {
-  test("keys frame", () => {
-    const f = encodeKeysFrame(Op.Get, ["a", new Uint8Array([0, 255]), ""]);
-    expect([...f]).toEqual([
-      1,
-      ...le32(4 + (4 + 1) + (4 + 2) + 4),
-      ...le32(3),
-      ...le32(1),
-      0x61,
+  test("get and del frames carry the key", () => {
+    expect([...encodeGetFrame("a")]).toEqual([1, ...le32(1), 0x61]);
+    expect([...encodeDelFrame(new Uint8Array([0, 255]))]).toEqual([
+      3,
       ...le32(2),
       0,
       255,
-      ...le32(0),
     ]);
+    expect([...encodeGetFrame("")]).toEqual([1, ...le32(0)]);
   });
 
-  test("entries frame", () => {
-    const f = encodeEntriesFrame([
-      ["k", "v"],
-      [new Uint8Array([1]), new Uint8Array([2, 3])],
+  test("set frame", () => {
+    const f = encodeSetFrame("k", new Uint8Array([2, 3]));
+    expect([...f]).toEqual([2, ...le32(4 + 1 + 2), ...le32(1), 0x6b, 2, 3]);
+  });
+
+  test("batch frame nests one frame per item", () => {
+    const f = encodeBatchFrame([
+      { op: Op.Get, key: "a" },
+      { op: Op.Set, key: "k", value: new Uint8Array([9]) },
+      { op: Op.Del, key: "" },
     ]);
+    const get = [1, ...le32(1), 0x61];
+    const set = [2, ...le32(4 + 1 + 1), ...le32(1), 0x6b, 9];
+    const del = [3, ...le32(0)];
     expect([...f]).toEqual([
-      2,
-      ...le32(4 + (4 + 1 + 4 + 1) + (4 + 1 + 4 + 2)),
-      ...le32(2),
-      ...le32(1),
-      0x6b,
-      ...le32(1),
-      0x76,
-      ...le32(1),
-      1,
-      ...le32(2),
-      2,
-      3,
+      6,
+      ...le32(4 + get.length + set.length + del.length),
+      ...le32(3),
+      ...get,
+      ...set,
+      ...del,
     ]);
+    expect([...encodeBatchFrame([])]).toEqual([6, ...le32(4), ...le32(0)]);
   });
 
   test("raw frame and utf-8 strings", () => {
     const f = encodeRawFrame(Op.Auth, new TextEncoder().encode("é"));
     expect([...f]).toEqual([4, ...le32(2), 0xc3, 0xa9]);
-    expect(encodeKeysFrame(Op.Del, ["é"]).length).toBe(HEADER_LEN + 4 + 4 + 2);
+    expect(encodeGetFrame("é").length).toBe(HEADER_LEN + 2);
   });
 
   test("rejects too many items", () => {
-    expect(() =>
-      encodeKeysFrame(Op.Get, new Array(MAX_ITEMS + 1).fill("")),
-    ).toThrow(RangeError);
+    const items = new Array(MAX_ITEMS + 1).fill({ op: Op.Get, key: "" });
+    expect(() => encodeBatchFrame(items)).toThrow(RangeError);
   });
 });
 
 describe("decode", () => {
-  test("values", () => {
+  test("replies", () => {
     const body = new Uint8Array([
       ...le32(3),
-      1,
+      Status.Ok,
       ...le32(1),
       0x78,
-      0,
-      1,
+      Status.NotFound,
       ...le32(0),
+      Status.TooLarge,
+      ...le32(2),
+      0x6e,
+      0x6f,
     ]);
-    const v = decodeValues(body);
-    expect(v.length).toBe(3);
-    expect([...must(v[0])]).toEqual([0x78]);
-    expect(v[1]).toBeNull();
-    expect(must(v[2]).length).toBe(0);
-  });
-
-  test("flags", () => {
-    expect(decodeFlags(new Uint8Array([...le32(3), 1, 0, 1]))).toEqual([
-      true,
-      false,
-      true,
-    ]);
-    expect(decodeFlags(new Uint8Array(le32(0)))).toEqual([]);
+    const r = decodeReplies(body);
+    expect(r.length).toBe(3);
+    expect(must(r[0]).status).toBe(Status.Ok);
+    expect([...must(r[0]).body]).toEqual([0x78]);
+    expect(must(r[1])).toEqual({
+      status: Status.NotFound,
+      body: new Uint8Array(0),
+    });
+    expect([...must(r[2]).body]).toEqual([0x6e, 0x6f]);
+    expect(decodeReplies(new Uint8Array(le32(0)))).toEqual([]);
   });
 
   test("rejects malformed", () => {
-    expect(() => decodeValues(new Uint8Array([1, 0]))).toThrow(DecodeError);
-    expect(() => decodeValues(new Uint8Array([...le32(1), 7]))).toThrow(
-      INVALID_TAG,
-    );
+    expect(() => decodeReplies(new Uint8Array([1, 0]))).toThrow(DecodeError);
     expect(() =>
-      decodeValues(new Uint8Array([...le32(1), 1, ...le32(100)])),
+      decodeReplies(new Uint8Array([...le32(1), 0, ...le32(100)])),
     ).toThrow(NEEDED_100);
-    expect(() => decodeFlags(new Uint8Array([...le32(0), 9]))).toThrow(
+    expect(() => decodeReplies(new Uint8Array([...le32(0), 9]))).toThrow(
       TRAILING_1,
     );
   });

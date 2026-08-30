@@ -9,7 +9,13 @@ import {
   type TlsOptions,
   type Transport,
 } from "../transport.js";
-import { encodePingFrame, HEADER_LEN, Op, Status } from "../wire.js";
+import {
+  encodePingFrame,
+  HEADER_LEN,
+  Op,
+  type Reply,
+  Status,
+} from "../wire.js";
 
 export interface HttpOptions {
   /** Base URL of the server's HTTP listener, e.g. `http://127.0.0.1:4434`. */
@@ -40,6 +46,7 @@ const PATH: Readonly<Record<Op, string>> = {
   [Op.Del]: "/del",
   [Op.Auth]: "",
   [Op.Ping]: "/ping",
+  [Op.Batch]: "/batch",
 };
 
 /** HTTP status codes the server uses for each frame status. */
@@ -71,12 +78,12 @@ class HttpTransport implements Transport {
     this.tls = opts.tls;
   }
 
-  async request(frame: Uint8Array): Promise<Uint8Array> {
+  async request(frame: Uint8Array): Promise<Reply> {
     if (this.closed) throw this.closed;
     // The op byte picks the path; the token travels as a header instead of
     // an AUTH frame, so AUTH has nothing to send.
     const op = frame[0] as Op;
-    if (op === Op.Auth) return new Uint8Array(0);
+    if (op === Op.Auth) return { status: Status.Ok, body: new Uint8Array(0) };
     const res = await this.fetch(this.base + PATH[op], {
       method: "POST",
       headers: this.headers,
@@ -85,7 +92,11 @@ class HttpTransport implements Transport {
       ...(this.tls && { tls: this.tls }),
     });
     const body = new Uint8Array(await res.arrayBuffer());
-    if (res.ok) return body;
+    if (res.ok) return { status: Status.Ok, body };
+    // The path is known, so an empty 404 is the key's absence; an unknown
+    // path's 404 carries a message.
+    if (res.status === 404 && body.length === 0)
+      return { status: Status.NotFound, body };
     const status = STATUS[res.status];
     const message = utf8.decode(body);
     if (status === undefined)

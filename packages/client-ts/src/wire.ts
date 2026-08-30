@@ -25,6 +25,7 @@ export enum Op {
   Auth = 4,
   /** Keeps a quiet connection open; the server ignores the body. */
   Ping = 5,
+  Batch = 6,
 }
 
 export enum Status {
@@ -33,6 +34,7 @@ export enum Status {
   UnknownOp = 2,
   TooLarge = 3,
   Unauthorized = 4,
+  NotFound = 5,
 }
 
 /**
@@ -126,45 +128,100 @@ class Reader {
 function checkCount(n: number): void {
   if (n > MAX_ITEMS) {
     throw new RangeError(
-      `${n} items in one request exceeds the limit of ${MAX_ITEMS}`,
+      `${n} items in one batch exceeds the limit of ${MAX_ITEMS}`,
     );
   }
 }
 
-/** Encode a whole request frame: header followed by a key list (GET, DEL). */
-export function encodeKeysFrame(op: Op, keys: readonly Bin[]): Uint8Array {
-  checkCount(keys.length);
-  const ks = keys.map(toBytes);
-  let size = HEADER_LEN + U32;
-  for (const k of ks) size += U32 + k.length;
-  const w = new Writer(size);
+/** A GET or DEL frame: the body is the key. */
+function keyFrame(op: Op, key: Bin): Uint8Array {
+  const k = toBytes(key);
+  const w = new Writer(HEADER_LEN + k.length);
   w.u8(op);
-  w.u32(size - HEADER_LEN);
-  w.u32(ks.length);
-  for (const k of ks) w.blob(k);
+  w.u32(k.length);
+  w.buf.set(k, w.pos);
   return w.buf;
 }
 
-/** Encode a whole SET frame: header followed by key/value entries. */
-export function encodeEntriesFrame(
-  entries: readonly (readonly [Bin, Bin])[],
-): Uint8Array {
-  checkCount(entries.length);
-  const es = entries.map(([k, v]) => [toBytes(k), toBytes(v)] as const);
-  let size = HEADER_LEN + U32;
-  for (const [k, v] of es) size += 2 * U32 + k.length + v.length;
-  const w = new Writer(size);
+/** `GET key`. */
+export function encodeGetFrame(key: Bin): Uint8Array {
+  return keyFrame(Op.Get, key);
+}
+
+/** `DEL key`. */
+export function encodeDelFrame(key: Bin): Uint8Array {
+  return keyFrame(Op.Del, key);
+}
+
+/** `SET u32 klen, key, value`. */
+export function encodeSetFrame(key: Bin, value: Uint8Array): Uint8Array {
+  const k = toBytes(key);
+  const w = new Writer(HEADER_LEN + U32 + k.length + value.length);
   w.u8(Op.Set);
+  w.u32(U32 + k.length + value.length);
+  w.blob(k);
+  w.buf.set(value, w.pos);
+  return w.buf;
+}
+
+/** One request of a batch, ready to encode. */
+export type BatchItem =
+  | { readonly op: Op.Get | Op.Del; readonly key: Bin }
+  | { readonly op: Op.Set; readonly key: Bin; readonly value: Uint8Array };
+
+/**
+ * A BATCH frame: `u32 count, count × (u8 op, u32 len, body)`, each body
+ * exactly what the standalone op would carry. Throws RangeError past
+ * `MAX_ITEMS`.
+ */
+export function encodeBatchFrame(items: readonly BatchItem[]): Uint8Array {
+  checkCount(items.length);
+  const keys = items.map((i) => toBytes(i.key));
+  let size = HEADER_LEN + U32;
+  for (const [i, item] of items.entries()) {
+    // biome-ignore lint/style/noNonNullAssertion: same index as items
+    size += HEADER_LEN + keys[i]!.length;
+    if (item.op === Op.Set) size += U32 + item.value.length;
+  }
+  const w = new Writer(size);
+  w.u8(Op.Batch);
   w.u32(size - HEADER_LEN);
-  w.u32(es.length);
-  for (const [k, v] of es) {
-    w.blob(k);
-    w.blob(v);
+  w.u32(items.length);
+  for (const [i, item] of items.entries()) {
+    // biome-ignore lint/style/noNonNullAssertion: same index as items
+    const k = keys[i]!;
+    w.u8(item.op);
+    if (item.op === Op.Set) {
+      w.u32(U32 + k.length + item.value.length);
+      w.blob(k);
+      w.buf.set(item.value, w.pos);
+      w.pos += item.value.length;
+    } else {
+      w.blob(k);
+    }
   }
   return w.buf;
 }
 
-/** Encode a whole frame whose body is one raw blob without a length prefix (AUTH). */
+/** One answer inside a BATCH response. */
+export interface Reply {
+  status: number;
+  body: Uint8Array;
+}
+
+/** The replies of a BATCH response: `u32 count, count × (u8 status, u32 len, body)`. */
+export function decodeReplies(body: Uint8Array): Reply[] {
+  const r = new Reader(body);
+  const n = r.u32();
+  const out: Reply[] = [];
+  for (let i = 0; i < n; i++) {
+    const status = r.u8();
+    out.push({ status, body: r.blob() });
+  }
+  r.finish();
+  return out;
+}
+
 export function encodeRawFrame(op: Op, body: Uint8Array): Uint8Array {
   const w = new Writer(HEADER_LEN + body.length);
   w.u8(op);

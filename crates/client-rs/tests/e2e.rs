@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use oxicache_client::{Client, Error, ServerName, Tls};
+use oxicache_client::{Batch, Client, Error, ServerName, Tls};
 use oxicache_server::{Cache, Options, Server};
 use oxicache_wire::Status;
 
@@ -100,39 +100,34 @@ async fn keepalive_outlives_the_server_idle_timeout() {
 #[tokio::test]
 async fn get_set_del_over_tcp() {
     let (_server, client) = start().await;
+    assert_eq!(client.get::<u32>(b"a").await.unwrap(), None);
+    client.set(b"a", 1u32).await.unwrap();
+    let mut b = Batch::new();
+    b.set(b"b", 2u32).unwrap();
+    let a = b.get::<u32>(b"a");
+    let bb = b.get::<u32>(b"b");
+    let c = b.get::<u32>(b"c");
+    let out = client.batch(b).await.unwrap();
     assert_eq!(
-        client.get_multi::<u32, _>([&b"a"[..]]).await.unwrap(),
-        [None]
+        (
+            out.get(a).unwrap(),
+            out.get(bb).unwrap(),
+            out.get(c).unwrap()
+        ),
+        (Some(1), Some(2), None)
     );
-    client
-        .set_multi([(&b"a"[..], 1u32), (&b"b"[..], 2)])
-        .await
-        .unwrap();
-    let got = client
-        .get_multi::<u32, _>([&b"a"[..], &b"b"[..], &b"c"[..]])
-        .await
-        .unwrap();
-    assert_eq!(got, [Some(1), Some(2), None]);
-    assert_eq!(
-        client.del_multi([&b"a"[..], &b"zz"[..]]).await.unwrap(),
-        [true, false]
-    );
-    assert_eq!(
-        client.get_multi::<u32, _>([&b"a"[..]]).await.unwrap(),
-        [None]
-    );
+    assert!(client.del(b"a").await.unwrap());
+    assert!(!client.del(b"zz").await.unwrap());
+    assert_eq!(client.get::<u32>(b"a").await.unwrap(), None);
 }
 
 #[tokio::test]
 async fn large_values() {
     let (_server, client) = start().await;
     let big = "7".repeat(4 << 20);
-    client
-        .set_multi([(&b"big"[..], big.as_str())])
-        .await
-        .unwrap();
-    let got = client.get_multi::<String, _>([&b"big"[..]]).await.unwrap();
-    assert_eq!(got[0].as_deref(), Some(big.as_str()));
+    client.set(b"big", big.as_str()).await.unwrap();
+    let got = client.get::<String>(b"big").await.unwrap();
+    assert_eq!(got.as_deref(), Some(big.as_str()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -144,12 +139,9 @@ async fn pipelined_concurrent_calls() {
             tokio::spawn(async move {
                 for i in 0..50 {
                     let k = format!("t{t}-{i}");
-                    client
-                        .set_multi([(k.as_bytes(), k.as_str())])
-                        .await
-                        .unwrap();
-                    let got = client.get_multi::<String, _>([k.as_bytes()]).await.unwrap();
-                    assert_eq!(got[0].as_deref(), Some(k.as_str()));
+                    client.set(k.as_bytes(), k.as_str()).await.unwrap();
+                    let got = client.get::<String>(k.as_bytes()).await.unwrap();
+                    assert_eq!(got.as_deref(), Some(k.as_str()));
                 }
             })
         })
@@ -216,9 +208,9 @@ async fn token_auth() {
 
     // Right token: everything works.
     let c = Client::connect(addr, "s3cret").await.unwrap();
-    c.set_multi([(&b"a"[..], 1u8)]).await.unwrap();
-    assert_eq!(c.get_multi::<u8, _>([&b"a"[..]]).await.unwrap(), [Some(1)]);
-    assert_eq!(c.del_multi([&b"a"[..]]).await.unwrap(), [true]);
+    c.set(b"a", 1u8).await.unwrap();
+    assert_eq!(c.get::<u8>(b"a").await.unwrap(), Some(1));
+    assert!(c.del(b"a").await.unwrap());
 }
 
 #[tokio::test]
@@ -227,7 +219,7 @@ async fn closed_connection_errors() {
     let addr = server.stop().await;
     // Nothing listens: the call fails with the connect error, and so does a
     // fresh connect.
-    let err = client.set_multi([(&b"x"[..], "y")]).await.unwrap_err();
+    let err = client.set(b"x", "y").await.unwrap_err();
     assert!(matches!(err, Error::Io(_) | Error::Closed), "{err}");
     let dead = Client::connect(addr, "t").await;
     assert!(matches!(dead, Err(Error::Io(_))));
@@ -316,7 +308,7 @@ fn frame(status: u8, body: &[u8]) -> Vec<u8> {
 /// The reply to a one-key GET whose value is the MessagePack `1u8`.
 fn one_value() -> Vec<u8> {
     let value = rmp_serde::to_vec(&1u8).unwrap();
-    frame(0, &oxicache_wire::encode_values([Some(value.as_slice())]))
+    frame(0, &value)
 }
 
 /// A fake that accepts AUTH, answers every later request with `reply`
@@ -355,13 +347,13 @@ async fn unsolicited_frame_closes_connection() {
     })
     .await;
     let c = Client::connect(fake.addr, "t").await.unwrap();
-    c.set_multi([(&b"a"[..], "1")]).await.unwrap();
+    c.set(b"a", "1").await.unwrap();
     // Without detection this call would receive the stray frame as its own
-    // reply and decode an empty body as a values list.
-    let err = c.get_multi::<u8, _>([&b"a"[..]]).await.unwrap_err();
+    // reply and decode an empty body as its value.
+    let err = c.get::<u8>(b"a").await.unwrap_err();
     assert!(matches!(err, Error::Closed), "{err}");
     // A server that does not speak the protocol is not reconnected to.
-    let err = c.get_multi::<u8, _>([&b"a"[..]]).await.unwrap_err();
+    let err = c.get::<u8>(b"a").await.unwrap_err();
     assert!(matches!(err, Error::Closed), "{err}");
     assert_eq!(fake.accepts(), 1);
 }
@@ -370,10 +362,10 @@ async fn unsolicited_frame_closes_connection() {
 async fn invalid_status_byte_is_permanent() {
     let fake = scripted(frame(9, b"")).await;
     let c = Client::connect(fake.addr, "t").await.unwrap();
-    let err = c.get_multi::<u8, _>([&b"a"[..]]).await.unwrap_err();
+    let err = c.get::<u8>(b"a").await.unwrap_err();
     assert!(matches!(err, Error::InvalidStatus(9)), "{err}");
     // The client is dead with that error: no reconnect, no new accept.
-    let err = c.get_multi::<u8, _>([&b"a"[..]]).await.unwrap_err();
+    let err = c.get::<u8>(b"a").await.unwrap_err();
     assert!(matches!(err, Error::InvalidStatus(9)), "{err}");
     assert_eq!(fake.accepts(), 1);
     assert_eq!(c.reconnects(), 0);
@@ -384,14 +376,14 @@ async fn oversized_response_is_reported() {
     let too_big = oxicache_wire::MAX_FRAME + 1;
     let fake = scripted(oxicache_wire::encode_header(0, too_big).to_vec()).await;
     let c = Client::connect(fake.addr, "t").await.unwrap();
-    let err = c.get_multi::<u8, _>([&b"a"[..]]).await.unwrap_err();
+    let err = c.get::<u8>(b"a").await.unwrap_err();
     assert!(
         matches!(err, Error::ResponseTooLarge(n) if n == too_big),
         "{err}"
     );
     // The client closed that connection itself, so the next call may open
     // another; the call that hit the limit is not retried.
-    let err = c.get_multi::<u8, _>([&b"a"[..]]).await.unwrap_err();
+    let err = c.get::<u8>(b"a").await.unwrap_err();
     assert!(
         matches!(err, Error::ResponseTooLarge(n) if n == too_big),
         "{err}"
@@ -402,13 +394,18 @@ async fn oversized_response_is_reported() {
 
 #[tokio::test]
 async fn malformed_bodies_are_decode_errors() {
-    let bad = frame(0, &[9, 0]);
+    // As a batch reply: 193 items announced, none present. As a value:
+    // 0xc1 is the one byte MessagePack never uses.
+    let bad = frame(0, &[0xc1, 0, 0, 0, 0]);
     let fake = scripted(bad).await;
     let c = Client::connect(fake.addr, "t").await.unwrap();
-    let err = c.get_multi::<u8, _>([&b"a"[..]]).await.unwrap_err();
+    let mut b = Batch::new();
+    b.get::<u8>(b"a");
+    let err = c.batch(b).await.unwrap_err();
     assert!(matches!(err, Error::Decode(_)), "{err}");
-    let err = c.del_multi([&b"a"[..]]).await.unwrap_err();
-    assert!(matches!(err, Error::Decode(_)), "{err}");
+    // A value that is not MessagePack.
+    let err = c.get::<u8>(b"a").await.unwrap_err();
+    assert!(matches!(err, Error::Deserialize(_)), "{err}");
     // The connection is fine, only the bodies were not.
     assert_eq!(fake.accepts(), 1);
 }
@@ -428,9 +425,9 @@ async fn write_failure_is_reported() {
     fake.stop();
     let big = "0".repeat(32 << 20);
     // The retry is refused, so that is the error; nobody accepts again.
-    let err = c.set_multi([(&b"a"[..], big.as_str())]).await.unwrap_err();
+    let err = c.set(b"a", big.as_str()).await.unwrap_err();
     assert!(matches!(err, Error::Io(_)), "{err}");
-    let err = c.get_multi::<u8, _>([&b"a"[..]]).await.unwrap_err();
+    let err = c.get::<u8>(b"a").await.unwrap_err();
     assert!(matches!(err, Error::Io(_)), "{err}");
     assert_eq!(fake.accepts(), 1);
 }

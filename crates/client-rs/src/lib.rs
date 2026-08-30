@@ -3,26 +3,28 @@
 //! to responses in order. Every client authenticates with a token as it
 //! connects. Keys are bytes; values are any serde type, stored as MessagePack
 //! (`rmp-serde`, structs as maps — the same encoding the TypeScript client
-//! writes, so both clients can read each other's values). `get` and
-//! `get_multi` decode into the type the caller names; there is no byte-level
-//! value API.
+//! writes, so both clients can read each other's values). `get` decodes into
+//! the type the caller names; there is no byte-level value API.
 //!
 //! ```ignore
 //! let c = Client::connect(addr, "s3cret").await?;
 //! c.set("user:7", &user).await?;
-//! let user = c.get::<User>("user:7").await?;                                   // Option<User>
-//! let (user, hits) = c.get_multi::<(User, u64), _>(("user:7", "hits:7")).await?;
-//! let users = c.get_multi::<User, _>(["user:7", "user:8"]).await?;             // [Option<User>; 2]
-//! let users = c.get_multi::<User, _>(ids).await?;                              // Vec<Option<User>>
-//! let (user, hits): (Option<User>, Option<u64>) =                              // or from the binding
-//!     c.get_multi(("user:7", "hits:7")).await?;
-//! c.set_multi([("a", 1), ("b", 2)]).await?;
+//! let user = c.get::<User>("user:7").await?;          // Option<User>
+//! let gone = c.del("user:7").await?;                  // bool
+//!
+//! // Any number of gets, sets and dels in one round trip, answered in order.
+//! let mut b = Batch::new();
+//! let user = b.get::<User>("user:7");
+//! let hits = b.get::<u64>("hits:7");
+//! b.set("seen:7", true)?;
+//! let out = c.batch(b).await?;
+//! let (user, hits) = (out.get(user)?, out.get(hits)?);  // Option<User>, Option<u64>
 //! ```
 //!
-//! `get_multi`'s type argument names the value types only — one per key for
-//! a tuple of keys (a mismatched count does not compile), a single type for
-//! an array, `Vec` or slice of keys — and every slot comes back as an
-//! `Option`, `None` for a missing key.
+//! A [`Batch`] hands out a typed [`Slot`] per item; the [`Outcome`] answers
+//! each slot as the standalone call would (`Option<V>` for a get, `()` for
+//! a set, `bool` for a del) or with that item's own error, so one refused
+//! item does not hide the others.
 //!
 //! The server closes a connection that stays silent for its idle timeout
 //! (300 s by default), so a client that has sent nothing for
@@ -79,8 +81,10 @@ pub enum Error {
     Serialize(#[from] rmp_serde::encode::Error),
     #[error("deserialize: {0}")]
     Deserialize(#[from] rmp_serde::decode::Error),
-    #[error("server answered {got} values for {expected} keys")]
+    #[error("server answered {got} items for a batch of {expected}")]
     Count { expected: usize, got: usize },
+    #[error("{0} items in one batch exceeds the limit of {limit}", limit = wire::MAX_ITEMS)]
+    TooManyItems(usize),
     #[error("reading {}: {source}", path.display())]
     Pem {
         path: std::path::PathBuf,
@@ -100,8 +104,10 @@ const BACKOFF_MIN: Duration = Duration::from_millis(100);
 /// Every failed attempt doubles the wait, up to this.
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-type Reply = oneshot::Sender<Result<Bytes>>;
-type Request = (Op, Bytes, Reply);
+/// A response as the reader hands it over: `Ok` and `NotFound` with their
+/// body, any other status already turned into the error it means.
+type Answer = oneshot::Sender<Result<(Status, Bytes)>>;
+type Request = (Op, Bytes, Answer);
 
 /// How to speak TLS to the server: what its certificate must chain to
 /// and the name (DNS or IP) it must be issued for. Build one with
@@ -160,97 +166,6 @@ pub struct Client {
 /// 16 keys, an array `[K; N]`, a `Vec<K>` or a `&[K]`, each key any
 /// `AsRef<[u8]>`. Tuples and arrays give arrays back, vectors and slices
 /// give vectors.
-pub trait Keys {
-    /// `[T; N]` for tuples and arrays, `Vec<T>` otherwise.
-    type Batch<T>;
-    fn keys(&self) -> Vec<&[u8]>;
-    fn batch<T>(items: Vec<T>) -> Result<Self::Batch<T>>;
-}
-
-fn expect_count<T>(items: &[T], expected: usize) -> Result<()> {
-    if items.len() == expected {
-        Ok(())
-    } else {
-        Err(Error::Count {
-            expected,
-            got: items.len(),
-        })
-    }
-}
-
-fn array<T, const N: usize>(items: Vec<T>) -> Result<[T; N]> {
-    items.try_into().map_err(|v: Vec<T>| Error::Count {
-        expected: N,
-        got: v.len(),
-    })
-}
-
-macro_rules! impl_key_tuples {
-    ($($n:literal => ($($i:tt $K:ident),+);)+) => {$(
-        impl<$($K: AsRef<[u8]>),+> Keys for ($($K,)+) {
-            type Batch<T> = [T; $n];
-            fn keys(&self) -> Vec<&[u8]> {
-                vec![$(self.$i.as_ref()),+]
-            }
-            fn batch<T>(items: Vec<T>) -> Result<[T; $n]> {
-                array(items)
-            }
-        }
-    )+};
-}
-
-impl_key_tuples! {
-    1 => (0 K0);
-    2 => (0 K0, 1 K1);
-    3 => (0 K0, 1 K1, 2 K2);
-    4 => (0 K0, 1 K1, 2 K2, 3 K3);
-    5 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4);
-    6 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5);
-    7 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6);
-    8 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6, 7 K7);
-    9 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6, 7 K7, 8 K8);
-    10 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6, 7 K7, 8 K8, 9 K9);
-    11 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6, 7 K7, 8 K8, 9 K9, 10 K10);
-    12 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6, 7 K7, 8 K8, 9 K9, 10 K10, 11 K11);
-    13 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6, 7 K7, 8 K8, 9 K9, 10 K10, 11 K11, 12 K12);
-    14 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6, 7 K7, 8 K8, 9 K9, 10 K10, 11 K11, 12 K12, 13 K13);
-    15 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6, 7 K7, 8 K8, 9 K9, 10 K10, 11 K11, 12 K12, 13 K13, 14 K14);
-    16 => (0 K0, 1 K1, 2 K2, 3 K3, 4 K4, 5 K5, 6 K6, 7 K7, 8 K8, 9 K9, 10 K10, 11 K11, 12 K12, 13 K13, 14 K14, 15 K15);
-}
-
-impl<K: AsRef<[u8]>, const N: usize> Keys for [K; N] {
-    type Batch<T> = [T; N];
-    fn keys(&self) -> Vec<&[u8]> {
-        self.iter().map(AsRef::as_ref).collect()
-    }
-    fn batch<T>(items: Vec<T>) -> Result<[T; N]> {
-        array(items)
-    }
-}
-
-impl<K: AsRef<[u8]>> Keys for Vec<K> {
-    type Batch<T> = Vec<T>;
-    fn keys(&self) -> Vec<&[u8]> {
-        self.iter().map(AsRef::as_ref).collect()
-    }
-    fn batch<T>(items: Vec<T>) -> Result<Vec<T>> {
-        Ok(items)
-    }
-}
-
-impl<K: AsRef<[u8]>> Keys for &[K] {
-    type Batch<T> = Vec<T>;
-    fn keys(&self) -> Vec<&[u8]> {
-        self.iter().map(AsRef::as_ref).collect()
-    }
-    fn batch<T>(items: Vec<T>) -> Result<Vec<T>> {
-        Ok(items)
-    }
-}
-
-/// Why a client stopped for good. Kept as data rather than an [`Error`]
-/// because every later call has to report it again and `Error` is not
-/// `Clone`.
 #[derive(Clone)]
 enum Fatal {
     /// The token was refused on (re)connect: rotated or wrong, and no
@@ -418,7 +333,7 @@ impl Conn {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (tx, rx) = mpsc::channel::<Request>(1024);
-        let (pending_tx, pending_rx) = mpsc::unbounded_channel::<Reply>();
+        let (pending_tx, pending_rx) = mpsc::unbounded_channel::<Answer>();
         let (stop_tx, stop_rx) = oneshot::channel();
         let lost = Arc::new(OnceLock::new());
         let writer = tokio::spawn(write_loop(
@@ -440,7 +355,7 @@ impl Conn {
 
     /// Queue one request and wait for its reply. `Closed` means this
     /// connection is gone, nothing else does.
-    async fn send(&self, op: Op, body: Bytes) -> Result<Bytes> {
+    async fn send(&self, op: Op, body: Bytes) -> Result<(Status, Bytes)> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send((op, body, reply))
@@ -646,7 +561,7 @@ impl Client {
 
     /// One request, re-issued once if the connection it was on is lost;
     /// `body` is a refcounted `Bytes`, so keeping it for that is free.
-    async fn call(&self, op: Op, body: Bytes) -> Result<Bytes> {
+    async fn call(&self, op: Op, body: Bytes) -> Result<(Status, Bytes)> {
         let inner = &self.inner;
         let mut conn = match inner.current()? {
             Some(conn) => conn,
@@ -664,154 +579,227 @@ impl Client {
         }
     }
 
-    /// Round-trip an empty request: `Ok` proves the connection is alive and
-    /// the server is answering. The client also does this on its own after
-    /// [`KEEPALIVE`](wire::KEEPALIVE) of silence.
+    /// Round-trip an empty request; resolves once the server has answered.
     pub async fn ping(&self) -> Result<()> {
         self.call(Op::Ping, Bytes::new()).await?;
         Ok(())
     }
 
-    /// Fetch one key, decoding its value as `V`; `None` if it is missing.
+    /// The value under `key` decoded as `V`, `None` if there is none.
     pub async fn get<V: DeserializeOwned>(&self, key: impl AsRef<[u8]>) -> Result<Option<V>> {
-        Ok(self.get_multi::<(V,), _>((key,)).await?.0)
+        let (status, body) = self
+            .call(Op::Get, Bytes::copy_from_slice(key.as_ref()))
+            .await?;
+        Option::<V>::reply(status, body)
     }
 
-    /// Fetch many keys, decoding every value as `Vs` says: one slot per key
-    /// in request order, `None` for a missing one. `Vs` is a tuple of value
-    /// types for a tuple of keys (one per key) and a single type for an
-    /// array, `Vec` or slice of keys; the result is an array for a tuple or
-    /// array of keys, a `Vec` for a `Vec` or slice. `Vs` may also be left to
-    /// inference from the binding.
-    pub async fn get_multi<Vs, Ks: Values<Vs>>(&self, keys: Ks) -> Result<Ks::Output> {
-        let ks = keys.keys();
-        let values = wire::decode_values(
-            self.call(Op::Get, wire::encode_keys(ks.iter().copied()))
-                .await?,
-        )?;
-        expect_count(&values, ks.len())?;
-        Ks::decode(values)
-    }
-
-    /// Store one key/value pair.
+    /// Store `value` under `key`, replacing what was there.
     pub async fn set<V: Serialize>(&self, key: impl AsRef<[u8]>, value: V) -> Result<()> {
-        self.set_multi([(key, value)]).await
-    }
-
-    /// Store many key/value pairs from any iterator of `(key, value)`.
-    pub async fn set_multi<K, V, I>(&self, entries: I) -> Result<()>
-    where
-        K: AsRef<[u8]>,
-        V: Serialize,
-        I: IntoIterator<Item = (K, V)>,
-    {
-        let entries = entries
-            .into_iter()
-            .map(|(k, v)| Ok((k, encode(&v)?)))
-            .collect::<Result<Vec<(K, Vec<u8>)>>>()?;
-        self.call(
-            Op::Set,
-            wire::encode_entries(entries.iter().map(|(k, v)| (k.as_ref(), v.as_slice()))),
-        )
-        .await?;
+        let value = encode(&value)?;
+        self.call(Op::Set, wire::encode_set(key.as_ref(), &value))
+            .await?;
         Ok(())
     }
 
-    /// Delete one key; returns whether it existed.
+    /// Remove `key`; whether there was anything to remove.
     pub async fn del(&self, key: impl AsRef<[u8]>) -> Result<bool> {
-        Ok(self.del_multi((key,)).await?[0])
+        let (status, body) = self
+            .call(Op::Del, Bytes::copy_from_slice(key.as_ref()))
+            .await?;
+        bool::reply(status, body)
     }
 
-    /// Delete many keys; returns whether each one existed, in an array for
-    /// a tuple or array of keys and a `Vec` for a `Vec` or slice.
-    pub async fn del_multi<Ks: Keys>(&self, keys: Ks) -> Result<Ks::Batch<bool>> {
-        let ks = keys.keys();
-        let flags = wire::decode_flags(
-            self.call(Op::Del, wire::encode_keys(ks.iter().copied()))
-                .await?,
-        )?;
-        expect_count(&flags, ks.len())?;
-        Ks::batch(flags)
+    /// Send every item of `batch` in one request and answer each in order.
+    /// An empty batch is a round trip that answers nothing.
+    pub async fn batch(&self, batch: Batch) -> Result<Outcome> {
+        let n = batch.enc.len();
+        if n > wire::MAX_ITEMS {
+            return Err(Error::TooManyItems(n));
+        }
+        let (_, body) = self.call(Op::Batch, batch.enc.finish()).await?;
+        let frames = wire::frames(&body)?;
+        if frames.len() != n {
+            return Err(Error::Count {
+                expected: n,
+                got: frames.len(),
+            });
+        }
+        // Offsets into the one response buffer: no allocation or refcount
+        // per item, only for the slots that are read.
+        let base = body.as_ptr() as usize;
+        let index = frames
+            .map(|(status, b)| (status, (b.as_ptr() as usize - base) as u32, b.len() as u32))
+            .collect();
+        Ok(Outcome { body, index })
     }
 }
 
-/// MessagePack with structs as maps, so values round-trip with the
-/// TypeScript client.
+/// Items for one [`Client::batch`] call, in the order they are added.
+/// Each method hands back the [`Slot`] that reads its answer from the
+/// [`Outcome`].
+#[derive(Default)]
+pub struct Batch {
+    enc: wire::BatchEncoder,
+}
+
+impl Batch {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Items so far.
+    pub fn len(&self) -> usize {
+        self.enc.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.enc.is_empty()
+    }
+
+    fn slot<T>(&self) -> Slot<T> {
+        Slot {
+            index: self.enc.len() - 1,
+            _reply: std::marker::PhantomData,
+        }
+    }
+
+    /// Fetch `key`, decoding it as `V` when the outcome is read.
+    pub fn get<V: DeserializeOwned>(&mut self, key: impl AsRef<[u8]>) -> Slot<Option<V>> {
+        self.enc.get(key.as_ref());
+        self.slot()
+    }
+
+    /// Store `value` under `key`; encoding happens now, so a value that
+    /// cannot be serialised is refused here rather than at send time.
+    pub fn set<V: Serialize>(&mut self, key: impl AsRef<[u8]>, value: V) -> Result<Slot<()>> {
+        let value = encode(&value)?;
+        self.enc.set(key.as_ref(), &value);
+        Ok(self.slot())
+    }
+
+    /// Remove `key`.
+    pub fn del(&mut self, key: impl AsRef<[u8]>) -> Slot<bool> {
+        self.enc.del(key.as_ref());
+        self.slot()
+    }
+}
+
+/// One item's place in a [`Batch`], typed by what it answers with.
+pub struct Slot<T> {
+    index: usize,
+    _reply: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for Slot<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Slot<T> {}
+
+impl<T> std::fmt::Debug for Slot<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Slot").field(&self.index).finish()
+    }
+}
+
+/// The server's answers to a [`Batch`], one per item.
+#[derive(Debug)]
+pub struct Outcome {
+    body: Bytes,
+    /// Per item: status, and where its body lies in `body`.
+    index: Vec<(u8, u32, u32)>,
+}
+
+impl Outcome {
+    /// Answers, which is the batch's item count.
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// The raw status of item `index`; `None` past the end or for a status
+    /// byte this client does not know.
+    pub fn status(&self, index: usize) -> Option<Status> {
+        self.index
+            .get(index)
+            .and_then(|(s, _, _)| Status::from_u8(*s))
+    }
+
+    /// The answer in `slot`: the item's value, or the error the server
+    /// refused it with.
+    pub fn get<T: Reply>(&self, slot: Slot<T>) -> Result<T> {
+        // A slot only comes from the batch this outcome answers, and the
+        // count was checked when it arrived.
+        let (status, start, len) = self.index[slot.index];
+        let status = Status::from_u8(status).ok_or(Error::InvalidStatus(status))?;
+        let (start, len) = (start as usize, len as usize);
+        T::reply(status, self.body.slice(start..start + len))
+    }
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// What a [`Slot`] answers with: `Option<V>` for a get, `()` for a set,
+/// `bool` for a del. Implemented here for exactly those.
+pub trait Reply: sealed::Sealed + Sized {
+    #[doc(hidden)]
+    fn reply(status: Status, body: Bytes) -> Result<Self>;
+}
+
+/// The error a status other than the ones an op answers with means.
+fn refused(status: Status, body: Bytes) -> Error {
+    Error::Status {
+        status,
+        message: String::from_utf8_lossy(&body).into_owned(),
+    }
+}
+
+impl<V: DeserializeOwned> sealed::Sealed for Option<V> {}
+impl<V: DeserializeOwned> Reply for Option<V> {
+    fn reply(status: Status, body: Bytes) -> Result<Self> {
+        match status {
+            Status::Ok => Ok(Some(rmp_serde::from_slice(&body)?)),
+            Status::NotFound => Ok(None),
+            other => Err(refused(other, body)),
+        }
+    }
+}
+
+impl sealed::Sealed for () {}
+impl Reply for () {
+    fn reply(status: Status, body: Bytes) -> Result<Self> {
+        match status {
+            Status::Ok => Ok(()),
+            other => Err(refused(other, body)),
+        }
+    }
+}
+
+impl sealed::Sealed for bool {}
+impl Reply for bool {
+    fn reply(status: Status, body: Bytes) -> Result<Self> {
+        match status {
+            Status::Ok => Ok(true),
+            Status::NotFound => Ok(false),
+            other => Err(refused(other, body)),
+        }
+    }
+}
+
 fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
     Ok(rmp_serde::to_vec_named(value)?)
-}
-
-fn decode<V: DeserializeOwned>(value: Option<Bytes>) -> Result<Option<V>> {
-    Ok(value.map(|v| rmp_serde::from_slice(&v)).transpose()?)
 }
 
 /// What `get_multi::<Vs, _>` over this key batch returns: `(Option<V1>, …)`
 /// for a tuple of keys with `Vs = (V1, …)`, `[Option<V>; N]` or
 /// `Vec<Option<V>>` for an array, `Vec` or slice of keys with `Vs = V`.
-pub trait Values<Vs>: Keys {
-    type Output;
-    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output>;
-}
-
-macro_rules! impl_value_tuples {
-    ($($n:literal => ($($i:tt $K:ident $V:ident),+);)+) => {$(
-        impl<$($K: AsRef<[u8]>, $V: DeserializeOwned),+> Values<($($V,)+)> for ($($K,)+) {
-            type Output = ($(Option<$V>,)+);
-            fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
-                expect_count(&values, $n)?;
-                let mut it = values.into_iter();
-                Ok(($(decode::<$V>(it.next().unwrap())?,)+))
-            }
-        }
-    )+};
-}
-
-impl_value_tuples! {
-    1 => (0 K0 V0);
-    2 => (0 K0 V0, 1 K1 V1);
-    3 => (0 K0 V0, 1 K1 V1, 2 K2 V2);
-    4 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3);
-    5 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4);
-    6 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5);
-    7 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6);
-    8 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7);
-    9 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8);
-    10 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9);
-    11 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10);
-    12 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11);
-    13 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11, 12 K12 V12);
-    14 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11, 12 K12 V12, 13 K13 V13);
-    15 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11, 12 K12 V12, 13 K13 V13, 14 K14 V14);
-    16 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11, 12 K12 V12, 13 K13 V13, 14 K14 V14, 15 K15 V15);
-}
-
-impl<K: AsRef<[u8]>, V: DeserializeOwned, const N: usize> Values<V> for [K; N] {
-    type Output = [Option<V>; N];
-    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
-        Self::batch(values.into_iter().map(decode).collect::<Result<_>>()?)
-    }
-}
-
-impl<K: AsRef<[u8]>, V: DeserializeOwned> Values<V> for Vec<K> {
-    type Output = Vec<Option<V>>;
-    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
-        values.into_iter().map(decode).collect()
-    }
-}
-
-impl<K: AsRef<[u8]>, V: DeserializeOwned> Values<V> for &[K] {
-    type Output = Vec<Option<V>>;
-    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
-        values.into_iter().map(decode).collect()
-    }
-}
-
-/// Writes queued requests, coalescing everything already queued into one
-/// flush. After `keepalive` without a write it sends a PING whose reply is
-/// discarded, so the server's idle timeout never fires on a quiet client.
-/// Stops as soon as the reader does (`stop` resolves when the reader
-/// drops its end), so the socket is closed the moment the connection is
-/// known to be gone rather than at the next write.
 /// A flush this small waits one scheduler turn for more requests to
 /// coalesce (see `write_loop`); a larger one goes out at once.
 const YIELD_BELOW: usize = BUF / 4;
@@ -819,7 +807,7 @@ const YIELD_BELOW: usize = BUF / 4;
 async fn write_loop<W: AsyncWrite + Unpin>(
     mut w: W,
     mut rx: mpsc::Receiver<Request>,
-    pending: mpsc::UnboundedSender<Reply>,
+    pending: mpsc::UnboundedSender<Answer>,
     keepalive: Duration,
     mut stop: oneshot::Receiver<()>,
     lost: Arc<OnceLock<Lost>>,
@@ -894,7 +882,7 @@ async fn write_loop<W: AsyncWrite + Unpin>(
 /// and that is what wakes the callers who then ask.
 async fn read_loop<R: AsyncRead + Unpin>(
     mut r: R,
-    mut pending: mpsc::UnboundedReceiver<Reply>,
+    mut pending: mpsc::UnboundedReceiver<Answer>,
     stop: oneshot::Sender<()>,
     lost: Arc<OnceLock<Lost>>,
 ) {
@@ -912,7 +900,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
                         break Some(Lost::Fatal(Fatal::Desync));
                     };
                     let res = match Status::from_u8(status) {
-                        Some(Status::Ok) => Ok(body),
+                        Some(status @ (Status::Ok | Status::NotFound)) => Ok((status, body)),
                         Some(status) => Err(Error::Status {
                             status,
                             message: String::from_utf8_lossy(&body).into_owned(),

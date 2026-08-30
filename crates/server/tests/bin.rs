@@ -148,10 +148,9 @@ fn get_as(addr: SocketAddr, token: &[u8], key: &[u8]) -> (TcpStream, Status, Vec
         s.read_exact(&mut out).unwrap();
         return (s, Status::from_u8(status).unwrap(), out);
     }
-    let body = wire::encode_keys([key]);
-    s.write_all(&wire::encode_header(Op::Get as u8, body.len()))
+    s.write_all(&wire::encode_header(Op::Get as u8, key.len()))
         .unwrap();
-    s.write_all(&body).unwrap();
+    s.write_all(key).unwrap();
     let mut hdr = [0u8; wire::HEADER_LEN];
     s.read_exact(&mut hdr).unwrap();
     let (status, len) = wire::decode_header(&hdr);
@@ -168,8 +167,7 @@ fn get(addr: SocketAddr, key: &[u8]) -> (TcpStream, Status, Vec<u8>) {
 fn serves_and_shuts_down_cleanly() {
     let r = start(&[("OXICACHE_CAPACITY", "1M")]);
     let (conn, status, body) = get(r.addr, b"missing");
-    assert_eq!(status, Status::Ok);
-    assert_eq!(wire::decode_values(body.into()).unwrap(), vec![None]);
+    assert_eq!((status, body.len()), (Status::NotFound, 0));
     // Interrupt with the connection still open: it is drained, not cut.
     let (ok, log) = r.interrupt();
     drop(conn);
@@ -183,7 +181,7 @@ fn serves_and_shuts_down_cleanly() {
 fn sigterm_drains_and_exits_cleanly() {
     let r = start(&[("OXICACHE_CAPACITY", "1M")]);
     let (conn, status, _) = get(r.addr, b"missing");
-    assert_eq!(status, Status::Ok);
+    assert_eq!(status, Status::NotFound);
     let (ok, log) = r.signal("TERM");
     drop(conn);
     assert!(ok, "{log}");
@@ -196,7 +194,7 @@ fn idle_connections_are_closed() {
     // Whole seconds; the shortest timeout is 1 s.
     let r = start(&[("OXICACHE_CAPACITY", "1M"), ("OXICACHE_IDLE_TIMEOUT", "1")]);
     let (mut conn, status, _) = get(r.addr, b"k");
-    assert_eq!(status, Status::Ok);
+    assert_eq!(status, Status::NotFound);
     let mut rest = Vec::new();
     conn.read_to_end(&mut rest).unwrap();
     assert!(rest.is_empty(), "closed without a frame");
@@ -209,7 +207,7 @@ fn idle_connections_are_closed() {
 fn connection_limit_holds_the_next_peer_in_the_backlog() {
     let r = start(&[("OXICACHE_CAPACITY", "1M"), ("OXICACHE_MAX_CONNS", "1")]);
     let (first, status, _) = get(r.addr, b"k");
-    assert_eq!(status, Status::Ok);
+    assert_eq!(status, Status::NotFound);
     let mut second = TcpStream::connect(r.addr).unwrap();
     second
         .set_read_timeout(Some(Duration::from_millis(300)))
@@ -316,12 +314,9 @@ fn http_front_end_serves_alongside_tcp() {
     let h = r.http_addr();
     assert_ne!(h, r.addr);
     assert_eq!(http(h, "GET", "/health", None, b""), (200, vec![]));
-    let entries = wire::encode_entries([(&b"k"[..], &b"v"[..])]);
-    assert_eq!(http(h, "POST", "/set", None, &entries).0, 401);
-    assert_eq!(
-        http(h, "POST", "/set", Some("t0k"), &entries),
-        (200, vec![])
-    );
+    let set = wire::encode_set(b"k", b"v");
+    assert_eq!(http(h, "POST", "/set", None, &set).0, 401);
+    assert_eq!(http(h, "POST", "/set", Some("t0k"), &set), (200, vec![]));
     // The same cache is behind both front ends.
     let mut s = TcpStream::connect(r.addr).unwrap();
     let auth = b"t0k";
@@ -331,19 +326,13 @@ fn http_front_end_serves_alongside_tcp() {
     let mut hdr = [0u8; wire::HEADER_LEN];
     s.read_exact(&mut hdr).unwrap();
     assert_eq!(wire::decode_header(&hdr).0, Status::Ok as u8);
-    let keys = wire::encode_keys([&b"k"[..]]);
-    s.write_all(&wire::encode_header(Op::Get as u8, keys.len()))
-        .unwrap();
-    s.write_all(&keys).unwrap();
+    s.write_all(&wire::encode_header(Op::Get as u8, 1)).unwrap();
+    s.write_all(b"k").unwrap();
     s.read_exact(&mut hdr).unwrap();
     let (st, len) = wire::decode_header(&hdr);
     let mut body = vec![0u8; len];
     s.read_exact(&mut body).unwrap();
-    assert_eq!(st, Status::Ok as u8);
-    assert_eq!(
-        wire::decode_values(body.into()).unwrap(),
-        vec![Some(b"v".as_slice().into())]
-    );
+    assert_eq!((st, &body[..]), (Status::Ok as u8, &b"v"[..]));
     let (ok, log) = r.interrupt();
     assert!(ok, "{log}");
     assert!(log.contains("http="), "{log}");

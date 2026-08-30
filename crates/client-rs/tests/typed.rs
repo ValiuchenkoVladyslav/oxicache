@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use oxicache_client::{Client, Error};
+use oxicache_client::{Batch, Client, Error};
 use oxicache_server::{Cache, Options, Server};
 use serde::{Deserialize, Serialize};
 
@@ -66,118 +66,124 @@ async fn single_key_shapes() {
 }
 
 #[tokio::test]
-async fn tuple_with_a_type_per_key() {
+async fn mixed_batch_answers_each_item_in_order() {
     let (_server, c) = start().await;
     c.set("user", alice()).await.unwrap();
     c.set("hits", 42u64).await.unwrap();
-    c.set("tags", vec!["a", "b"]).await.unwrap();
 
-    // Value types only, no `Option`s to spell out.
-    let (user, hits, tags, missing) = c
-        .get_multi::<(User, u64, Vec<String>, String), _>(("user", "hits", "tags", "nope"))
-        .await
-        .unwrap();
-    assert_eq!(user, Some(alice()));
-    assert_eq!(hits, Some(42));
-    assert_eq!(tags, Some(vec!["a".to_string(), "b".to_string()]));
-    assert_eq!(missing, None);
+    let mut b = Batch::new();
+    let user = b.get::<User>("user");
+    let hits = b.get::<u64>("hits");
+    let missing = b.get::<String>("nope");
+    let tags = b.set("tags", vec!["a", "b"]).unwrap();
+    let tags_now = b.get::<Vec<String>>("tags");
+    let gone = b.del("hits");
+    let hits_now = b.get::<u64>("hits");
+    let never = b.del("nope");
+    assert_eq!(b.len(), 8);
+    let out = c.batch(b).await.unwrap();
+    assert_eq!(out.len(), 8);
 
-    // Inferred from the binding.
-    let (hits, user): (Option<u64>, Option<User>) = c.get_multi(("hits", "user")).await.unwrap();
-    assert_eq!(hits, Some(42));
-    assert_eq!(user.map(|u| u.id), Some(7));
+    assert_eq!(out.get(user).unwrap(), Some(alice()));
+    assert_eq!(out.get(hits).unwrap(), Some(42));
+    assert_eq!(out.get(missing).unwrap(), None);
+    out.get(tags).unwrap();
+    assert_eq!(
+        out.get(tags_now).unwrap(),
+        Some(vec!["a".to_string(), "b".to_string()])
+    );
+    assert!(out.get(gone).unwrap());
+    assert_eq!(out.get(hits_now).unwrap(), None, "the earlier DEL is seen");
+    assert!(!out.get(never).unwrap());
 
-    // Wrong type for one slot fails the whole call, and only that call.
-    let err = c
-        .get_multi::<(User, String), _>(("user", "hits"))
-        .await
-        .unwrap_err();
+    // Slots are Copy: an answer can be read twice.
+    assert_eq!(out.get(user).unwrap().map(|u| u.id), Some(7));
+    // Raw statuses are there too.
+    assert_eq!(out.status(0), Some(oxicache_wire::Status::Ok));
+    assert_eq!(out.status(2), Some(oxicache_wire::Status::NotFound));
+    assert_eq!(out.status(8), None);
+}
+
+#[tokio::test]
+async fn wrong_type_in_one_slot_fails_only_that_slot() {
+    let (_server, c) = start().await;
+    c.set("user", alice()).await.unwrap();
+    c.set("hits", 42u64).await.unwrap();
+    let mut b = Batch::new();
+    let user = b.get::<User>("user");
+    let hits_as_text = b.get::<String>("hits");
+    let out = c.batch(b).await.unwrap();
+    assert_eq!(out.get(user).unwrap(), Some(alice()));
+    let err = out.get(hits_as_text).unwrap_err();
     assert!(matches!(err, Error::Deserialize(_)), "{err}");
-
-    assert_eq!(
-        c.del_multi(("user", "hits", "nope")).await.unwrap(),
-        [true, true, false]
-    );
-    let single: (Option<User>,) = c.get_multi(("user",)).await.unwrap();
-    assert_eq!(single, (None,));
 }
 
 #[tokio::test]
-async fn arrays_and_vecs_share_one_type() {
+async fn refused_item_does_not_hide_the_others() {
     let (_server, c) = start().await;
-    c.set_multi([("1", "one"), ("2", "two")]).await.unwrap();
-
-    // Array: fixed length in the type.
-    let got = c.get_multi::<String, _>(["2", "1", "3"]).await.unwrap();
-    assert_eq!(got, [Some("two".into()), Some("one".into()), None]);
-
-    // Vec and slice: runtime length.
-    let ids: Vec<String> = (1..=3).map(|i| i.to_string()).collect();
-    let got = c.get_multi::<String, _>(ids.clone()).await.unwrap();
-    assert_eq!(got, vec![Some("one".into()), Some("two".into()), None]);
-    let got: Vec<Option<String>> = c.get_multi(ids.as_slice()).await.unwrap();
-    assert_eq!(got.len(), 3);
-
-    assert_eq!(c.del_multi(["1", "9"]).await.unwrap(), [true, false]);
-    assert_eq!(
-        c.del_multi(vec!["2", "9"]).await.unwrap(),
-        vec![true, false]
+    let big = "x".repeat(48 << 20);
+    let mut b = Batch::new();
+    let small = b.set("small", "v").unwrap();
+    let huge = b.set("huge", big.as_str()).unwrap();
+    let after = b.set("after", "w").unwrap();
+    let out = c.batch(b).await.unwrap();
+    out.get(small).unwrap();
+    out.get(after).unwrap();
+    let err = out.get(huge).unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            Error::Status {
+                status: oxicache_wire::Status::TooLarge,
+                ..
+            }
+        ),
+        "{err}"
     );
-    assert_eq!(c.del_multi(&["2"][..]).await.unwrap(), vec![false]);
+    assert_eq!(out.status(1), Some(oxicache_wire::Status::TooLarge));
+    assert_eq!(c.get::<String>("small").await.unwrap(), Some("v".into()));
+    assert_eq!(c.get::<String>("after").await.unwrap(), Some("w".into()));
+    assert_eq!(c.get::<String>("huge").await.unwrap(), None);
 }
 
 #[tokio::test]
-async fn sixteen_key_tuple() {
+async fn sixteen_key_batches() {
     let (_server, c) = start().await;
-    c.set_multi((0u8..16).map(|i| ([i], i as u32 * 10)))
-        .await
-        .unwrap();
-    type U = u32;
-    let got = c
-        .get_multi::<(U, U, U, U, U, U, U, U, U, U, U, U, U, U, U, U), _>((
-            [0u8],
-            [1u8],
-            [2u8],
-            [3u8],
-            [4u8],
-            [5u8],
-            [6u8],
-            [7u8],
-            [8u8],
-            [9u8],
-            [10u8],
-            [11u8],
-            [12u8],
-            [13u8],
-            [14u8],
-            [15u8],
-        ))
-        .await
-        .unwrap();
-    assert_eq!(got.0, Some(0));
-    assert_eq!(got.15, Some(150));
-    let flags = c
-        .del_multi((
-            [0u8],
-            [1u8],
-            [2u8],
-            [3u8],
-            [4u8],
-            [5u8],
-            [6u8],
-            [7u8],
-            [8u8],
-            [9u8],
-            [10u8],
-            [11u8],
-            [12u8],
-            [13u8],
-            [14u8],
-            [15u8],
-        ))
-        .await
-        .unwrap();
-    assert_eq!(flags, [true; 16]);
+    let mut b = Batch::new();
+    for i in 0u8..16 {
+        b.set([i], i as u32 * 10).unwrap();
+    }
+    c.batch(b).await.unwrap();
+    let mut b = Batch::new();
+    let slots: Vec<_> = (0u8..16).map(|i| b.get::<u32>([i])).collect();
+    let out = c.batch(b).await.unwrap();
+    let got: Vec<Option<u32>> = slots.iter().map(|&s| out.get(s).unwrap()).collect();
+    assert_eq!(got[0], Some(0));
+    assert_eq!(got[15], Some(150));
+    let mut b = Batch::new();
+    let slots: Vec<_> = (0u8..16).map(|i| b.del([i])).collect();
+    let out = c.batch(b).await.unwrap();
+    assert!(slots.iter().all(|&s| out.get(s).unwrap()));
+}
+
+#[tokio::test]
+async fn unserialisable_value_is_refused_when_added() {
+    let (_server, c) = start().await;
+    // A value whose `Serialize` refuses.
+    struct Bad;
+    impl Serialize for Bad {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("no"))
+        }
+    }
+    let bad = Bad;
+    let mut b = Batch::new();
+    let err = b.set("k", &bad).unwrap_err();
+    assert!(matches!(err, Error::Serialize(_)), "{err}");
+    assert!(b.is_empty());
+    let err = c.set("k", &bad).await.unwrap_err();
+    assert!(matches!(err, Error::Serialize(_)), "{err}");
+    assert_eq!(c.get::<u8>("k").await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -244,18 +250,37 @@ async fn wrong_type_is_a_deserialize_error() {
 }
 
 #[tokio::test]
-async fn empty_batches() {
+async fn empty_batch() {
     let (_server, c) = start().await;
-    let got = c.get_multi::<User, _>(Vec::<&str>::new()).await.unwrap();
-    assert!(got.is_empty());
-    let got: [Option<User>; 0] = c.get_multi([] as [&str; 0]).await.unwrap();
-    assert!(got.is_empty());
-    c.set_multi(Vec::<(&str, User)>::new()).await.unwrap();
-    assert!(c.del_multi(Vec::<&str>::new()).await.unwrap().is_empty());
+    let b = Batch::new();
+    assert!(b.is_empty());
+    let out = c.batch(b).await.unwrap();
+    assert!(out.is_empty());
+    assert_eq!(out.len(), 0);
 }
 
-/// A server that answers with the wrong number of values or flags for an
-/// array of keys is reported as a count mismatch, not a panic.
+#[tokio::test]
+async fn too_many_items_are_refused_before_sending() {
+    let (_server, c) = start().await;
+    let mut b = Batch::new();
+    for _ in 0..=oxicache_wire::MAX_ITEMS {
+        b.get::<u8>("k");
+    }
+    let err = c.batch(b).await.unwrap_err();
+    assert!(
+        matches!(err, Error::TooManyItems(n) if n == oxicache_wire::MAX_ITEMS + 1),
+        "{err}"
+    );
+    // A full batch goes through.
+    let mut b = Batch::new();
+    for _ in 0..oxicache_wire::MAX_ITEMS {
+        b.get::<u8>("k");
+    }
+    assert_eq!(c.batch(b).await.unwrap().len(), oxicache_wire::MAX_ITEMS);
+}
+
+/// A server that answers a batch with the wrong number of items is
+/// reported as a count mismatch, not a panic.
 #[tokio::test]
 async fn wrong_count_from_server_is_an_error() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -293,21 +318,27 @@ async fn wrong_count_from_server_is_an_error() {
             self.task.await.unwrap();
         }
     }
-    // Zero values for two keys.
+    // Zero answers for two items.
     let mut reply = oxicache_wire::encode_header(0, 4).to_vec();
     reply.extend_from_slice(&0u32.to_le_bytes());
     let (addr, fake) = scripted(reply).await;
     let c = Client::connect(addr, "t").await.unwrap();
-    let err = c.get_multi::<String, _>(["a", "b"]).await.unwrap_err();
-    assert_eq!(err.to_string(), "server answered 0 values for 2 keys");
+    let mut b = Batch::new();
+    b.get::<String>("a");
+    b.del("b");
+    let err = c.batch(b).await.unwrap_err();
+    assert_eq!(err.to_string(), "server answered 0 items for a batch of 2");
     fake.finish().await;
-    // One flag for two keys.
-    let mut reply = oxicache_wire::encode_header(0, 5).to_vec();
+    // One answer for two items.
+    let mut reply = oxicache_wire::encode_header(0, 9).to_vec();
     reply.extend_from_slice(&1u32.to_le_bytes());
-    reply.push(1);
+    reply.extend_from_slice(&oxicache_wire::encode_header(0, 0));
     let (addr, fake) = scripted(reply).await;
     let c = Client::connect(addr, "t").await.unwrap();
-    let err = c.del_multi(["a", "b"]).await.unwrap_err();
-    assert_eq!(err.to_string(), "server answered 1 values for 2 keys");
+    let mut b = Batch::new();
+    b.del("a");
+    b.del("b");
+    let err = c.batch(b).await.unwrap_err();
+    assert_eq!(err.to_string(), "server answered 1 items for a batch of 2");
     fake.finish().await;
 }

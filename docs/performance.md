@@ -459,3 +459,30 @@ sockets, `EPIOCSPARAMS` (50 µs, budget 64) on tokio's epoll fds, both, and
 shapes (both settable unprivileged on this kernel). Loopback traffic has no NAPI context
 to poll, so nothing can change here; it would need a real NIC to evaluate, and then a
 knob, which the server does not have. Rejected, no code kept.
+
+## Round 12: protocol change — single-key ops and BATCH (2026-08-30)
+
+The wire protocol lost its multi-key bodies: GET/SET/DEL carry one key, and BATCH carries any
+mix of them as nested frames, answered one nested frame each. The server serves runs of the
+same op in a batch together (the old `get_many` prefetch pass, one epoch pin per SET/DEL
+run), and streams the replies under a header patched at the end (`FrameWriter::begin`/`end`;
+`Piece::Own` keeps spilled chunks mutable for that) — the first version collected replies in
+a `Vec` and cloned every hit's entry to know the length up front, which cost +8 % on 16-key
+gets and +17 % at 64×2.
+
+Same client build technique as round 11 (the client changed with the protocol, so this is a
+client+server comparison), server CPU/req and req/s, 2 runs:
+
+| profile | before (round 11) | after |
+|---|---|---|
+| 8×16, single key, 128 B | 1.43 µs, 1.39M | 1.35–1.42 µs, 1.44–1.53M |
+| 8×16, 16-key batch, 128 B | 5.95 µs, 480k | 6.1–6.2 µs, 435k |
+| 8×16, 16-key batch, 1 KiB, 50 % writes | 45 µs, 89k | **38–39 µs, 105k** |
+| 64×2, 16-key batch, 128 B | 10.3 µs, 310k | 10.8 µs, 306k |
+
+Batch items carry a 5-byte header each way instead of the 4–5 bytes the packed lists used, so
+the small-value batches pay ~1–2 % more bytes and the client encodes/indexes one frame per
+item; the 1 KiB profile gains from SET replies no longer being one status for the whole
+batch (nothing to roll back) and from the writer's `len` counter replacing a size pass. The
+client's `Outcome` indexes replies by offset into the one response buffer — no `Bytes` slice
+(refcount) per item, only for the slots that are read.

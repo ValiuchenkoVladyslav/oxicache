@@ -4,7 +4,7 @@
  * includes this directory), which fails if any of them stops erroring.
  */
 import { expect, test } from "bun:test";
-import type { Client, Fill, Value } from "../src/index";
+import { type Client, op, type Value } from "../src/index";
 
 type Equal<A, B> =
   (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2
@@ -32,97 +32,51 @@ class Point {
 declare const c: Client;
 declare const user: User;
 
-// Single in, single out; array in, array out; return generic first.
 async function _shapes() {
-  // One key: one value. Several keys: a tuple of that length. Array: a list.
+  // One key in, one value out; the type is the generic, `Value` by default.
   const one = await c.get<User>("k");
   assertType<Equal<typeof one, User | null>>();
-  const two = await c.get<[User, User]>("a", new Uint8Array(1));
-  assertType<Equal<typeof two, [User | null, User | null]>>();
-  const dflt2 = await c.get("a", "b");
-  assertType<Equal<typeof dflt2, [Value | null, Value | null]>>();
-  const [x, y] = two;
-  assertType<Equal<typeof x, User | null>>();
-  assertType<Equal<typeof y, User | null>>();
-  // Per-key types as a tuple, length enforced.
-  const mixed = await c.get<[User, number]>("a", "b");
-  assertType<Equal<typeof mixed, [User | null, number | null]>>();
-  const [mu, mn] = mixed;
-  assertType<Equal<typeof mu, User | null>>();
-  assertType<Equal<typeof mn, number | null>>();
-  const mixed3 = await c.get<[string, User[], Uint8Array]>("a", "b", "c");
-  assertType<
-    Equal<typeof mixed3, [string | null, User[] | null, Uint8Array | null]>
-  >();
-  const dm = await c.get<[User, number]>(...(["a", "b"] as const));
-  assertType<Equal<typeof dm, [User | null, number | null]>>();
-  // @ts-expect-error too few types for two keys
-  await c.get<[User]>("a", "b");
-  // @ts-expect-error too many types for two keys
-  await c.get<[User, number, string]>("a", "b");
-  // @ts-expect-error a plain array type is not a per-key tuple
-  await c.get<User[]>("a", "b");
-  // No single-type shorthand for several keys: the tuple is mandatory.
-  // @ts-expect-error one type for two keys
-  await c.get<User>("a", "b");
-  // @ts-expect-error one primitive type for two keys
-  await c.get<string>("a", "b");
-  const sixteen = await c.get<Fill<16, number>>(
-    "1",
-    "2",
-    "3",
-    "4",
-    "5",
-    "6",
-    "7",
-    "8",
-    "9",
-    "10",
-    "11",
-    "12",
-    "13",
-    "14",
-    "15",
-    "16",
-  );
-  assertType<Equal<(typeof sixteen)["length"], 16>>();
-  assertType<Equal<(typeof sixteen)[0], number | null>>();
-  const dyn: string[] = ["a", "b"];
-  const fromArray = await c.get<User>(dyn);
-  assertType<Equal<typeof fromArray, (User | null)[]>>();
-  const fromTuple = await c.get<User>(["a", "b"]);
-  assertType<Equal<typeof fromTuple, (User | null)[]>>();
   const dflt = await c.get("k");
   assertType<Equal<typeof dflt, Value | null>>();
   const d1 = await c.del("k");
   assertType<Equal<typeof d1, boolean>>();
-  const dn = await c.del("k", "j");
-  assertType<Equal<typeof dn, [boolean, boolean]>>();
-  const dArr = await c.del(dyn);
-  assertType<Equal<typeof dArr, boolean[]>>();
-  // @ts-expect-error several keys in must not be assignable to single out
-  const _wrong: User | null = await c.get<[User, User]>("k", "j");
-  // @ts-expect-error a spread of unknown length must use the array form
-  await c.get<[User, User]>(...dyn);
-  // biome-ignore format: the error must land on the line under @ts-expect-error
-  // @ts-expect-error more than 16 literal keys must use the array form
-  await c.get<Fill<17, number>>("1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17");
+  // @ts-expect-error keys are Bin, not arbitrary values
+  await c.get(42);
+  // @ts-expect-error one key per call; several go in a batch
+  await c.get("a", "b");
+  // @ts-expect-error one key per call; several go in a batch
+  await c.del("a", "b");
 
-  // Accepted values: literals, interfaces, classes, primitives, mixed batches.
+  // A batch is typed positionally after its ops.
+  const [u, s, gone] = await c.batch([
+    op.get<User>("u"),
+    op.set("k", 1),
+    op.del("t"),
+  ]);
+  assertType<Equal<typeof u, User | null>>();
+  assertType<Equal<typeof s, undefined>>();
+  assertType<Equal<typeof gone, boolean>>();
+  const mixed = await c.batch([op.get<[User, number]>("a"), op.get("b")]);
+  assertType<Equal<typeof mixed, [[User, number] | null, Value | null]>>();
+  await c.batch([]);
+  // A list built at runtime is a list of results.
+  const dyn = ["a", "b"].map((k) => op.get<User>(k));
+  const fromArray = await c.batch(dyn);
+  assertType<Equal<typeof fromArray, (User | null)[]>>();
+  // @ts-expect-error a batch takes ops, not keys
+  await c.batch(["a", "b"]);
+  // @ts-expect-error several results must not be assignable to one
+  const _wrong: User | null = await c.batch([op.get<User>("a")]);
+
+  // Accepted values: literals, interfaces, classes, primitives.
   await c.set("u", user);
   await c.set("p", new Point(1, 2));
   await c.set("lit", { a: 1, b: [1, "2", null, { c: new Date() }] });
   await c.set("big", 10n);
   await c.set("bin", new Uint8Array(2));
   await c.set(new Uint8Array([1]), null);
-  await c.set(["a", 1], ["b", "two"], ["c", user]);
-  await c.set([
-    ["a", 1],
-    ["b", "two"],
-    ["c", user],
-  ]);
-  const dynEntries: [string, number][] = [["a", 1]];
-  await c.set(dynEntries);
+  op.set("u", user);
+  op.set("p", new Point(1, 2));
 
   // Rejected values.
   // @ts-expect-error functions
@@ -137,12 +91,10 @@ async function _shapes() {
   await c.set("m", new Map<string, number>());
   // @ts-expect-error Set
   await c.set("st", new Set<number>());
-  // @ts-expect-error function-valued property in a variadic batch
-  await c.set(["a", 1], ["b", { fn: () => 1 }]);
-  // @ts-expect-error function-valued property in an array batch
-  await c.set([["a", { fn: () => 1 }]]);
-  // @ts-expect-error keys are Bin, not arbitrary values
-  await c.get(42);
+  // @ts-expect-error function-valued property in a batch set
+  op.set("b", { fn: () => 1 });
+  // @ts-expect-error one key and value per set; several go in a batch
+  await c.set(["a", 1], ["b", 2]);
 }
 
 test("types compile", () => {

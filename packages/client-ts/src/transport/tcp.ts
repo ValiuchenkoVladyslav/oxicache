@@ -19,6 +19,7 @@ import { isIP, connect as netConnect, type Socket } from "node:net";
 import { checkServerIdentity, connect as tlsConnect } from "node:tls";
 import {
   ClosedError,
+  isAnswer,
   StatusError,
   type TlsOptions,
   type Transport,
@@ -31,6 +32,7 @@ import {
   FrameReader,
   KEEPALIVE_MS,
   Op,
+  type Reply,
   Status,
   toBytes,
 } from "../wire.js";
@@ -63,7 +65,7 @@ export const BACKOFF_MAX_MS = 5_000;
 interface Pending {
   /** Kept until the reply arrives, so a lost connection can re-issue it. */
   frame: Uint8Array;
-  resolve: (body: Uint8Array) => void;
+  resolve: (reply: Reply) => void;
   reject: (err: Error) => void;
   /**
    * Whether losing the connection re-issues this call on the next one; a
@@ -179,7 +181,7 @@ class Link {
   }
 
   /** Queue one frame; `retry` says whether a lost connection re-issues it. */
-  call(frame: Uint8Array, retry: boolean): Promise<Uint8Array> {
+  call(frame: Uint8Array, retry: boolean): Promise<Reply> {
     return new Promise((resolve, reject) => {
       this.send({ frame, resolve, reject, retry });
     });
@@ -253,8 +255,8 @@ class Link {
         const p = this.takePending();
         if (p === undefined)
           throw new DecodeError("unsolicited response from server");
-        if (status === Status.Ok) {
-          p.resolve(f.body);
+        if (isAnswer(status)) {
+          p.resolve({ status, body: f.body });
         } else {
           p.reject(new StatusError(status as Status, utf8.decode(f.body)));
         }
@@ -363,7 +365,7 @@ export class TcpTransport implements Transport {
     await this.request(encodePingFrame());
   }
 
-  request(frame: Uint8Array): Promise<Uint8Array> {
+  request(frame: Uint8Array): Promise<Reply> {
     if (this.dead) return Promise.reject(this.dead);
     return new Promise((resolve, reject) => {
       this.enqueue({ frame, resolve, reject, retry: true });

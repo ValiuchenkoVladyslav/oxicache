@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use oxicache_client::{Client, ServerName, Tls};
+use oxicache_client::{Batch, Client, ServerName, Tls};
 
 mod cli;
 use cli::warn_if_overridden;
@@ -126,7 +126,17 @@ async fn main() -> Result<()> {
     match args.cmd {
         Cmd::Get { keys } => {
             // Any MessagePack value prints; strings without their quotes.
-            let vals = client.get_multi::<rmpv::Value, _>(keys.as_slice()).await?;
+            let vals: Vec<Option<rmpv::Value>> = if let [key] = keys.as_slice() {
+                vec![client.get(key).await?]
+            } else {
+                let mut b = Batch::new();
+                let slots: Vec<_> = keys.iter().map(|k| b.get::<rmpv::Value>(k)).collect();
+                let out = client.batch(b).await?;
+                slots
+                    .into_iter()
+                    .map(|s| out.get(s))
+                    .collect::<oxicache_client::Result<_>>()?
+            };
             for (k, v) in keys.iter().zip(vals) {
                 match v {
                     Some(rmpv::Value::String(s)) => println!("{k}: {}", s.as_str().unwrap_or("")),
@@ -141,11 +151,33 @@ async fn main() -> Result<()> {
                 .chunks(2)
                 .map(|c| (c[0].as_str(), c[1].as_str()))
                 .collect();
-            client.set_multi(pairs.iter().copied()).await?;
+            if let [(k, v)] = pairs.as_slice() {
+                client.set(k, v).await?;
+            } else {
+                let mut b = Batch::new();
+                let slots = pairs
+                    .iter()
+                    .map(|(k, v)| b.set(k, v))
+                    .collect::<oxicache_client::Result<Vec<_>>>()?;
+                let out = client.batch(b).await?;
+                for s in slots {
+                    out.get(s)?;
+                }
+            }
             println!("OK ({} entries)", pairs.len());
         }
         Cmd::Del { keys } => {
-            let flags = client.del_multi(keys.as_slice()).await?;
+            let flags: Vec<bool> = if let [key] = keys.as_slice() {
+                vec![client.del(key).await?]
+            } else {
+                let mut b = Batch::new();
+                let slots: Vec<_> = keys.iter().map(|k| b.del(k)).collect();
+                let out = client.batch(b).await?;
+                slots
+                    .into_iter()
+                    .map(|s| out.get(s))
+                    .collect::<oxicache_client::Result<_>>()?
+            };
             for (k, f) in keys.iter().zip(flags) {
                 println!("{k}: {}", if f { "deleted" } else { "(nil)" });
             }
@@ -248,17 +280,32 @@ async fn bench(
                             &keys[i..i + key_len]
                         })
                         .collect();
-                    if (next() % 10_000) as f64 / 10_000.0 < write_ratio {
-                        let pairs: Vec<(&[u8], &str)> =
-                            ks.iter().map(|k| (*k, value.as_str())).collect();
-                        client.set_multi(pairs.iter().copied()).await?;
+                    let write = (next() % 10_000) as f64 / 10_000.0 < write_ratio;
+                    // Skip over each value without building it: the bench
+                    // measures the cache, not deserialisation.
+                    type Skip = serde::de::IgnoredAny;
+                    if let [k] = ks.as_slice() {
+                        if write {
+                            client.set(k, value.as_str()).await?;
+                        } else if client.get::<Skip>(k).await?.is_some() {
+                            hits.fetch_add(1, Relaxed);
+                        }
                     } else {
-                        // Skip over each value without building it: the
-                        // bench measures the cache, not deserialisation.
-                        let r = client
-                            .get_multi::<serde::de::IgnoredAny, _>(ks.as_slice())
-                            .await?;
-                        hits.fetch_add(r.iter().flatten().count() as u64, Relaxed);
+                        let mut b = Batch::new();
+                        if write {
+                            for k in &ks {
+                                b.set(k, value.as_str())?;
+                            }
+                            client.batch(b).await?;
+                        } else {
+                            let slots: Vec<_> = ks.iter().map(|k| b.get::<Skip>(k)).collect();
+                            let out = client.batch(b).await?;
+                            for s in slots {
+                                if out.get(s)?.is_some() {
+                                    hits.fetch_add(1, Relaxed);
+                                }
+                            }
+                        }
                     }
                     ops.fetch_add(batch as u64, Relaxed);
                     reqs.fetch_add(1, Relaxed);

@@ -4,6 +4,7 @@ import {
   ClosedError,
   HEADER_LEN,
   Op,
+  op,
   Status,
   StatusError,
 } from "../src/index";
@@ -26,7 +27,7 @@ describe("http transport e2e", () => {
     expect((await res.arrayBuffer()).byteLength).toBe(0);
   });
 
-  test("get/set/del in every shape, values are binary msgpack", async () => {
+  test("get/set/del/batch, values are binary msgpack", async () => {
     const c = await Client.connect(
       http({ url: `${server.url}/`, token: "any" }),
     );
@@ -37,18 +38,23 @@ describe("http transport e2e", () => {
     expect(got.id).toBe(7);
     expect(got.when.getTime()).toBe(1234567890123);
     expect(got.big).toBe(2n ** 70n);
-    await c.set(["a", 1], ["b", "two"]);
-    expect(await c.get<[number, string, null]>("a", "b", "zz")).toEqual([
-      1,
-      "two",
-      null,
-    ]);
+    await c.batch([op.set("a", 1), op.set("b", "two")]);
+    expect(
+      await c.batch([op.get<number>("a"), op.get<string>("b"), op.get("zz")]),
+    ).toEqual([1, "two", null]);
     const keys = Array.from({ length: 30 }, (_, i) => `hk${i}`);
-    await c.set(keys.map((k, i) => [k, i] as const));
-    expect(await c.get<number>(keys)).toEqual(keys.map((_, i) => i));
-    expect(await c.del("a", "nope")).toEqual([true, false]);
-    expect(await c.del(keys)).toEqual(keys.map(() => true));
-    expect(await c.get([])).toEqual([]);
+    await c.batch(keys.map((k, i) => op.set(k, i)));
+    expect(await c.batch(keys.map((k) => op.get<number>(k)))).toEqual(
+      keys.map((_, i) => i),
+    );
+    expect(await c.batch([op.del("a"), op.del("nope")])).toEqual([true, false]);
+    expect(await c.del("b")).toBe(true);
+    expect(await c.del("b")).toBe(false);
+    expect(await c.batch(keys.map((k) => op.del(k)))).toEqual(
+      keys.map(() => true),
+    );
+    expect(await c.batch([])).toEqual([]);
+    await c.set("b", "two");
     // Concurrent calls each get their own exchange and their own answer.
     const many = await Promise.all(
       Array.from({ length: 50 }, (_, i) => c.get(i % 2 ? "b" : "h")),
@@ -78,8 +84,8 @@ describe("http transport e2e", () => {
 
   test("server statuses become StatusError", async () => {
     const t = http({ url: server.url, token: "any" });
-    // A malformed body: the frame says one key but carries none.
-    const bad = new Uint8Array([Op.Get, 4, 0, 0, 0, 1, 0, 0, 0]);
+    // A malformed body: the SET says a 9-byte key but carries one.
+    const bad = new Uint8Array([Op.Set, 5, 0, 0, 0, 9, 0, 0, 0, 1]);
     const err = await t.request(bad).catch((e) => e);
     expect(err).toBeInstanceOf(StatusError);
     expect((err as StatusError).status).toBe(Status.BadRequest);
@@ -117,7 +123,10 @@ describe("http transport e2e", () => {
       "server returned HTTP 502: bad gateway",
     );
     // AUTH has nothing to send: the token is a header on every request.
-    expect((await t.request(AUTH_FRAME)).length).toBe(0);
+    expect((await t.request(AUTH_FRAME)).body.length).toBe(0);
+    // A key the server does not have is a 404 without a body: an answer.
+    const miss = await t.request(new Uint8Array([Op.Get, 1, 0, 0, 0, 0x7a]));
+    expect(miss).toEqual({ status: Status.NotFound, body: new Uint8Array(0) });
   });
 
   test("a frame body is posted verbatim", async () => {
@@ -135,7 +144,10 @@ describe("http transport e2e", () => {
       },
     });
     const frame = new Uint8Array([Op.Del, 2, 0, 0, 0, 7, 8]);
-    expect(await t.request(frame)).toEqual(new Uint8Array([0, 0, 0, 0]));
+    expect(await t.request(frame)).toEqual({
+      status: Status.Ok,
+      body: new Uint8Array([0, 0, 0, 0]),
+    });
     const s = must(seen);
     expect(s.url).toBe("http://cache.example/del");
     expect([...s.body]).toEqual([...frame.subarray(HEADER_LEN)]);
