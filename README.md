@@ -10,7 +10,7 @@ runtimes without sockets), tokio multi-threaded runtime. No persistence.
 |---|---|
 | `crates/wire` (`oxicache-wire`) | binary request/response framing shared by both sides |
 | `crates/server` (`oxicache-server`) | `oxicache-server` binary: sharded S3-FIFO engine + TCP and HTTP front ends |
-| `crates/client-rs` (`oxicache-client`) | Rust `Client` library (bytes; any serde type through a caller-supplied `Format` with the `serde` feature) + `oxicache-cli` |
+| `crates/client-rs` (`oxicache-client`) | Rust `Client` library (any serde type, stored as MessagePack) + `oxicache-cli` |
 | `packages/client-ts` (`@oxicache/client`) | TypeScript `Client` library: TCP transport for Bun, HTTP transport for anything with `fetch` |
 
 ## Protocol
@@ -80,41 +80,34 @@ cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 
 `get`/`set`/`del` act on one key; `get_multi`/`set_multi`/`del_multi` on several. Keys are
 any bytes (`&str`, `String`, `&[u8]`, `Vec<u8>`, `[u8; N]`); a batch of keys is a tuple (up to
 16), an array, a `Vec` or a slice, and comes back the same shape — an array for a tuple or
-array, a `Vec` for a `Vec` or slice. `Client::connect(addr, format, token)` authenticates as
-it connects (a refused token means no client) and fixes what values are for the life of the
-client — there is no client without a token or a format: `Raw` for bytes (`Bytes` out,
-`AsRef<[u8]>` in), or with `oxicache-client = { features = ["serde"] }` any `Format`, which
-makes the same method names take any `Serialize` value and decode into any `DeserializeOwned`
-type. The crate ships no data format and never inspects the bytes: `Format` is a two-method
-trait — JSON, MessagePack, postcard, … — and only that choice decides what the cache stores.
+array, a `Vec` for a `Vec` or slice. `Client::connect(addr, token)` authenticates as it
+connects (a refused token means no client). Values are any `Serialize` type in and any
+`DeserializeOwned` type out, stored as MessagePack through `rmp-serde` with structs as maps —
+the same encoding the TypeScript client writes, so both clients read each other's values
+(`Vec<u8>` is a MessagePack array; wrap it in `serde_bytes` for a `bin`). `get` and
+`get_multi` decode as part of the call: the type argument names the value types only.
 
 ```rust
-struct Json;
-impl Format for Json {
-    fn encode<T: Serialize + ?Sized>(&self, v: &T) -> Result<Vec<u8>, BoxError> { Ok(serde_json::to_vec(v)?) }
-    fn decode<T: DeserializeOwned>(&self, b: &[u8]) -> Result<T, BoxError> { Ok(serde_json::from_slice(b)?) }
-}
-let client = Client::connect(addr, Json, "s3cret").await?;
+let client = Client::connect(addr, "s3cret").await?;
 
 #[derive(Serialize, Deserialize)] struct User { id: u64, name: String }
 client.set("user:7", User { id: 7, name: "alice".into() }).await?;
-let user = client.get::<User>("user:7").await?;                            // Option<User>
+let user = client.get::<User>("user:7").await?;                                   // Option<User>
 
-// several keys: name the value types, one per key for a tuple, one for all otherwise;
+// several keys: one value type per key for a tuple, one for all otherwise;
 // every slot is an Option, None for a missing key
-let (user, hits) = client.get_multi(("user:7", "hits:7")).decode::<(User, u64)>().await?;
-let users = client.get_multi(["user:7", "user:8"]).decode::<User>().await?; // [Option<User>; 2]
-let users = client.get_multi(ids).decode::<User>().await?;                  // Vec<Option<User>>
-let (user, hits): (Option<User>, Option<u64>) =                             // or from the binding
-    client.get_multi(("user:7", "hits:7")).decode().await?;
-let raw = client.get_multi(ids).await?;                                     // Vec<Option<Bytes>>, any client
+let (user, hits) = client.get_multi::<(User, u64), _>(("user:7", "hits:7")).await?;
+let users = client.get_multi::<User, _>(["user:7", "user:8"]).await?;             // [Option<User>; 2]
+let users = client.get_multi::<User, _>(ids).await?;                              // Vec<Option<User>>
+let (user, hits): (Option<User>, Option<u64>) =                                   // or from the binding
+    client.get_multi(("user:7", "hits:7")).await?;
 client.set_multi([("a", 1), ("b", 2)]).await?;
 let [a, b] = client.del_multi(("a", "b")).await?;
 ```
 
 A tuple of keys must be paired with a tuple of exactly as many value types; a mismatch does
-not compile. A format failure surfaces as `Error::Serialize` / `Error::Deserialize`; a
-`Client::connect(addr, Raw, token)` reads the stored bytes as they are.
+not compile. An encoding failure surfaces as `Error::Serialize`, a stored value that is not
+the named type as `Error::Deserialize`; the connection stays usable after either.
 
 ## TypeScript client
 
@@ -169,7 +162,7 @@ one does not end the transport. `http({ fetch })` takes a custom `fetch` for age
 ```sh
 bun install            # installs the husky pre-commit hook
 bun test               # client-ts unit + e2e tests over both transports (builds and spawns the debug server)
-cargo test --workspace --all-features # wire, server and client-rs unit + e2e tests
+cargo test --workspace # wire, server and client-rs unit + e2e tests
 ```
 
 The pre-commit hook (`.husky/pre-commit`) runs `cargo fmt --check`, `clippy -D warnings`,

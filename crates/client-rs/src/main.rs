@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use oxicache_client::{Client, Raw};
+use oxicache_client::Client;
 use oxicache_wire::cli::warn_if_overridden;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -77,11 +77,13 @@ async fn main() -> Result<()> {
     let token = args.token.as_bytes();
     match args.cmd {
         Cmd::Get { keys } => {
-            let client = Client::connect(args.addr, Raw, token).await?;
-            let vals = client.get_multi(keys.as_slice()).await?;
+            let client = Client::connect(args.addr, token).await?;
+            // Any MessagePack value prints; strings without their quotes.
+            let vals = client.get_multi::<rmpv::Value, _>(keys.as_slice()).await?;
             for (k, v) in keys.iter().zip(vals) {
                 match v {
-                    Some(v) => println!("{k}: {}", String::from_utf8_lossy(&v)),
+                    Some(rmpv::Value::String(s)) => println!("{k}: {}", s.as_str().unwrap_or("")),
+                    Some(v) => println!("{k}: {v}"),
                     None => println!("{k}: (nil)"),
                 }
             }
@@ -90,16 +92,17 @@ async fn main() -> Result<()> {
             if kv.len() % 2 != 0 {
                 return Err("set expects key value pairs".into());
             }
-            let client = Client::connect(args.addr, Raw, token).await?;
-            let pairs: Vec<(&[u8], &[u8])> = kv
+            let client = Client::connect(args.addr, token).await?;
+            // Values are stored as MessagePack strings.
+            let pairs: Vec<(&str, &str)> = kv
                 .chunks(2)
-                .map(|c| (c[0].as_bytes(), c[1].as_bytes()))
+                .map(|c| (c[0].as_str(), c[1].as_str()))
                 .collect();
             client.set_multi(pairs.iter().copied()).await?;
             println!("OK ({} entries)", pairs.len());
         }
         Cmd::Del { keys } => {
-            let client = Client::connect(args.addr, Raw, token).await?;
+            let client = Client::connect(args.addr, token).await?;
             let flags = client.del_multi(keys.as_slice()).await?;
             for (k, f) in keys.iter().zip(flags) {
                 println!("{k}: {}", if f { "deleted" } else { "(nil)" });
@@ -146,7 +149,7 @@ async fn bench(
     let ops = Arc::new(AtomicU64::new(0));
     let reqs = Arc::new(AtomicU64::new(0));
     let hits = Arc::new(AtomicU64::new(0));
-    let value = vec![b'x'; value_size];
+    let value = "x".repeat(value_size);
     // One contiguous buffer with a fixed stride: picking a key is index
     // arithmetic, not a pointer chase into a separate allocation per key.
     let key_len = "bench:00000000".len();
@@ -158,7 +161,7 @@ async fn bench(
 
     let mut clients = Vec::with_capacity(conns);
     for _ in 0..conns {
-        clients.push(Client::connect(addr, Raw, token).await?);
+        clients.push(Client::connect(addr, token).await?);
     }
     let start = Instant::now();
     let deadline = start + Duration::from_secs(seconds);
@@ -190,11 +193,15 @@ async fn bench(
                         })
                         .collect();
                     if (next() % 10_000) as f64 / 10_000.0 < write_ratio {
-                        let pairs: Vec<(&[u8], &[u8])> =
-                            ks.iter().map(|k| (*k, value.as_slice())).collect();
+                        let pairs: Vec<(&[u8], &str)> =
+                            ks.iter().map(|k| (*k, value.as_str())).collect();
                         client.set_multi(pairs.iter().copied()).await?;
                     } else {
-                        let r = client.get_multi(ks.as_slice()).await?;
+                        // Skip over each value without building it: the
+                        // bench measures the cache, not deserialisation.
+                        let r = client
+                            .get_multi::<serde::de::IgnoredAny, _>(ks.as_slice())
+                            .await?;
                         hits.fetch_add(r.iter().flatten().count() as u64, Relaxed);
                     }
                     ops.fetch_add(batch as u64, Relaxed);

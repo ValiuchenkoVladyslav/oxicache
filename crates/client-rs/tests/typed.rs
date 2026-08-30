@@ -1,28 +1,11 @@
-#![cfg(feature = "serde")]
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use oxicache_client::{BoxError, Client, Error, Format, Raw};
+use oxicache_client::{Client, Error};
 use oxicache_server::{Cache, Options, Server};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-/// The client ships no format; the tests bring JSON, which also proves the
-/// encoding is the caller's business.
-#[derive(Clone, Copy)]
-struct Json;
-
-impl Format for Json {
-    fn encode<T: Serialize + ?Sized>(&self, value: &T) -> Result<Vec<u8>, BoxError> {
-        Ok(serde_json::to_vec(value)?)
-    }
-    fn decode<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, BoxError> {
-        Ok(serde_json::from_slice(bytes)?)
-    }
-}
-
-async fn start() -> (Arc<Server>, Client<Json>) {
+async fn start() -> (Arc<Server>, Client) {
     let cache = Arc::new(Cache::new(64 << 20, 2));
     let opts = Options {
         token: b"t".to_vec(),
@@ -30,9 +13,7 @@ async fn start() -> (Arc<Server>, Client<Json>) {
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
-    let client = Client::connect(server.local_addr(), Json, "t")
-        .await
-        .unwrap();
+    let client = Client::connect(server.local_addr(), "t").await.unwrap();
     (server, client)
 }
 
@@ -91,8 +72,7 @@ async fn tuple_with_a_type_per_key() {
 
     // Value types only, no `Option`s to spell out.
     let (user, hits, tags, missing) = c
-        .get_multi(("user", "hits", "tags", "nope"))
-        .decode::<(User, u64, Vec<String>, String)>()
+        .get_multi::<(User, u64, Vec<String>, String), _>(("user", "hits", "tags", "nope"))
         .await
         .unwrap();
     assert_eq!(user, Some(alice()));
@@ -101,27 +81,22 @@ async fn tuple_with_a_type_per_key() {
     assert_eq!(missing, None);
 
     // Inferred from the binding.
-    let (hits, user): (Option<u64>, Option<User>) =
-        c.get_multi(("hits", "user")).decode().await.unwrap();
+    let (hits, user): (Option<u64>, Option<User>) = c.get_multi(("hits", "user")).await.unwrap();
     assert_eq!(hits, Some(42));
     assert_eq!(user.map(|u| u.id), Some(7));
 
     // Wrong type for one slot fails the whole call, and only that call.
     let err = c
-        .get_multi(("user", "hits"))
-        .decode::<(User, String)>()
+        .get_multi::<(User, String), _>(("user", "hits"))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::Deserialize(_)), "{err}");
-    // Awaited directly, a format client hands out the bytes.
-    let [raw] = c.get_multi(("hits",)).await.unwrap();
-    assert_eq!(raw.as_deref(), Some(&b"42"[..]));
 
     assert_eq!(
         c.del_multi(("user", "hits", "nope")).await.unwrap(),
         [true, true, false]
     );
-    let single: (Option<User>,) = c.get_multi(("user",)).decode().await.unwrap();
+    let single: (Option<User>,) = c.get_multi(("user",)).await.unwrap();
     assert_eq!(single, (None,));
 }
 
@@ -131,18 +106,14 @@ async fn arrays_and_vecs_share_one_type() {
     c.set_multi([("1", "one"), ("2", "two")]).await.unwrap();
 
     // Array: fixed length in the type.
-    let got = c
-        .get_multi(["2", "1", "3"])
-        .decode::<String>()
-        .await
-        .unwrap();
+    let got = c.get_multi::<String, _>(["2", "1", "3"]).await.unwrap();
     assert_eq!(got, [Some("two".into()), Some("one".into()), None]);
 
     // Vec and slice: runtime length.
     let ids: Vec<String> = (1..=3).map(|i| i.to_string()).collect();
-    let got = c.get_multi(ids.clone()).decode::<String>().await.unwrap();
+    let got = c.get_multi::<String, _>(ids.clone()).await.unwrap();
     assert_eq!(got, vec![Some("one".into()), Some("two".into()), None]);
-    let got: Vec<Option<String>> = c.get_multi(ids.as_slice()).decode().await.unwrap();
+    let got: Vec<Option<String>> = c.get_multi(ids.as_slice()).await.unwrap();
     assert_eq!(got.len(), 3);
 
     assert_eq!(c.del_multi(["1", "9"]).await.unwrap(), [true, false]);
@@ -161,7 +132,7 @@ async fn sixteen_key_tuple() {
         .unwrap();
     type U = u32;
     let got = c
-        .get_multi((
+        .get_multi::<(U, U, U, U, U, U, U, U, U, U, U, U, U, U, U, U), _>((
             [0u8],
             [1u8],
             [2u8],
@@ -179,7 +150,6 @@ async fn sixteen_key_tuple() {
             [14u8],
             [15u8],
         ))
-        .decode::<(U, U, U, U, U, U, U, U, U, U, U, U, U, U, U, U)>()
         .await
         .unwrap();
     assert_eq!(got.0, Some(0));
@@ -219,52 +189,45 @@ async fn primitives_and_collections() {
     assert_eq!(pair, Some((1, "x".into())));
 }
 
+/// Values are plain MessagePack with structs as maps: what the TypeScript
+/// client writes and reads.
 #[tokio::test]
-async fn keys_are_shared_between_formats_values_are_not() {
+async fn values_are_msgpack_maps() {
     let (server, c) = start().await;
-    let raw = Client::connect(server.local_addr(), Raw, "t")
-        .await
-        .unwrap();
-    c.set("k", "typed").await.unwrap();
-    // Same key; the bytes are whatever the format wrote (JSON here).
-    assert_eq!(
-        raw.get("k").await.unwrap().as_deref(),
-        Some(&b"\"typed\""[..])
-    );
-    raw.set("k", b"raw").await.unwrap();
-    let err = c.get::<String>("k").await.unwrap_err();
-    assert!(matches!(err, Error::Deserialize(_)), "{err}");
-    assert!(matches!(c.format(), Json));
-}
-
-/// A format that cannot encode or decode reports through the client's error.
-#[tokio::test]
-async fn format_errors_are_reported() {
-    struct Broken;
-    impl Format for Broken {
-        fn encode<T: Serialize + ?Sized>(&self, _: &T) -> Result<Vec<u8>, BoxError> {
-            Err("no encoding".into())
-        }
-        fn decode<T: DeserializeOwned>(&self, _: &[u8]) -> Result<T, BoxError> {
-            Err("no decoding".into())
-        }
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct P {
+        x: u8,
+        y: String,
     }
-    let (server, c) = start().await;
-    c.set("k", 1).await.unwrap();
-    let b = Client::connect(server.local_addr(), Broken, "t")
-        .await
-        .unwrap();
-    let err = b.set("k", 1).await.unwrap_err();
-    assert_eq!(err.to_string(), "serialize: no encoding");
-    assert!(matches!(err, Error::Serialize(_)));
-    let err = b.get::<u32>("k").await.unwrap_err();
-    assert_eq!(err.to_string(), "deserialize: no decoding");
-    // Nothing to decode, nothing fails.
-    let none = b.get_multi(Vec::<&str>::new()).decode::<u32>().await;
-    assert!(none.unwrap().is_empty());
-    assert_eq!(b.get::<u32>("missing").await.unwrap(), None);
-    // Keys never touch the format.
-    assert!(b.del("k").await.unwrap());
+    c.set(
+        "p",
+        P {
+            x: 1,
+            y: "z".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let raw = c.get::<rmpv::Value>("p").await.unwrap().unwrap();
+    assert_eq!(
+        raw,
+        rmpv::Value::Map(vec![("x".into(), 1.into()), ("y".into(), "z".into())])
+    );
+    // And a map written as a generic value reads back as the struct.
+    let c2 = Client::connect(server.local_addr(), "t").await.unwrap();
+    c2.set(
+        "q",
+        rmpv::Value::Map(vec![("x".into(), 1.into()), ("y".into(), "z".into())]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        c.get::<P>("q").await.unwrap(),
+        Some(P {
+            x: 1,
+            y: "z".into()
+        })
+    );
 }
 
 #[tokio::test]
@@ -281,13 +244,9 @@ async fn wrong_type_is_a_deserialize_error() {
 #[tokio::test]
 async fn empty_batches() {
     let (_server, c) = start().await;
-    let got = c
-        .get_multi(Vec::<&str>::new())
-        .decode::<User>()
-        .await
-        .unwrap();
+    let got = c.get_multi::<User, _>(Vec::<&str>::new()).await.unwrap();
     assert!(got.is_empty());
-    let got: [Option<User>; 0] = c.get_multi([] as [&str; 0]).decode().await.unwrap();
+    let got: [Option<User>; 0] = c.get_multi([] as [&str; 0]).await.unwrap();
     assert!(got.is_empty());
     c.set_multi(Vec::<(&str, User)>::new()).await.unwrap();
     assert!(c.del_multi(Vec::<&str>::new()).await.unwrap().is_empty());
@@ -336,12 +295,8 @@ async fn wrong_count_from_server_is_an_error() {
     let mut reply = oxicache_wire::encode_header(0, 4).to_vec();
     reply.extend_from_slice(&0u32.to_le_bytes());
     let (addr, fake) = scripted(reply).await;
-    let c = Client::connect(addr, Json, "t").await.unwrap();
-    let err = c
-        .get_multi(["a", "b"])
-        .decode::<String>()
-        .await
-        .unwrap_err();
+    let c = Client::connect(addr, "t").await.unwrap();
+    let err = c.get_multi::<String, _>(["a", "b"]).await.unwrap_err();
     assert_eq!(err.to_string(), "server answered 0 values for 2 keys");
     fake.finish().await;
     // One flag for two keys.
@@ -349,7 +304,7 @@ async fn wrong_count_from_server_is_an_error() {
     reply.extend_from_slice(&1u32.to_le_bytes());
     reply.push(1);
     let (addr, fake) = scripted(reply).await;
-    let c = Client::connect(addr, Raw, "t").await.unwrap();
+    let c = Client::connect(addr, "t").await.unwrap();
     let err = c.del_multi(["a", "b"]).await.unwrap_err();
     assert_eq!(err.to_string(), "server answered 1 values for 2 keys");
     fake.finish().await;

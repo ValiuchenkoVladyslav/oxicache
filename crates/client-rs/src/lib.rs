@@ -1,20 +1,37 @@
 //! TCP client for oxicache. One [`Client`] owns one connection and is cheap
 //! to clone; calls from any number of tasks are pipelined onto it and matched
 //! to responses in order. Every client authenticates with a token as it
-//! connects. Keys are bytes; what values are is fixed at
-//! [`Client::connect`] by the format it is given: [`Raw`] for bytes, or
-//! (with the `serde` feature) any serde type through a
-//! [`Format`](typed::Format) — the same method names, the value types
-//! picked by the caller.
+//! connects. Keys are bytes; values are any serde type, stored as MessagePack
+//! (`rmp-serde`, structs as maps — the same encoding the TypeScript client
+//! writes, so both clients can read each other's values). `get` and
+//! `get_multi` decode into the type the caller names; there is no byte-level
+//! value API.
+//!
+//! ```ignore
+//! let c = Client::connect(addr, "s3cret").await?;
+//! c.set("user:7", &user).await?;
+//! let user = c.get::<User>("user:7").await?;                                   // Option<User>
+//! let (user, hits) = c.get_multi::<(User, u64), _>(("user:7", "hits:7")).await?;
+//! let users = c.get_multi::<User, _>(["user:7", "user:8"]).await?;             // [Option<User>; 2]
+//! let users = c.get_multi::<User, _>(ids).await?;                              // Vec<Option<User>>
+//! let (user, hits): (Option<User>, Option<u64>) =                              // or from the binding
+//!     c.get_multi(("user:7", "hits:7")).await?;
+//! c.set_multi([("a", 1), ("b", 2)]).await?;
+//! ```
+//!
+//! `get_multi`'s type argument names the value types only — one per key for
+//! a tuple of keys (a mismatched count does not compile), a single type for
+//! an array, `Vec` or slice of keys — and every slot comes back as an
+//! `Option`, `None` for a missing key.
 
-use std::future::{Future, IntoFuture};
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use oxicache_wire::io::{BUF, FrameReader, FrameWriter};
 use oxicache_wire::{self as wire, Op, Status};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
@@ -33,20 +50,13 @@ pub enum Error {
     Decode(#[from] wire::DecodeError),
     #[error("response of {0} bytes exceeds the client limit of {MAX_FRAME}")]
     ResponseTooLarge(usize),
-    /// The [`Format`](typed::Format) failed to encode a value.
-    #[cfg(feature = "serde")]
     #[error("serialize: {0}")]
-    Serialize(#[source] BoxError),
-    /// The [`Format`](typed::Format) failed to decode a value.
-    #[cfg(feature = "serde")]
+    Serialize(#[from] rmp_serde::encode::Error),
     #[error("deserialize: {0}")]
-    Deserialize(#[source] BoxError),
+    Deserialize(#[from] rmp_serde::decode::Error),
     #[error("server answered {got} values for {expected} keys")]
     Count { expected: usize, got: usize },
 }
-
-/// Error type a [`Format`](typed::Format) reports with.
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -55,18 +65,12 @@ const MAX_FRAME: usize = wire::MAX_FRAME;
 
 type Reply = oneshot::Sender<Result<Bytes>>;
 
-/// One connection. `F` says what values are: [`Raw`] bytes, or (with the
-/// `serde` feature) anything a [`Format`](typed::Format) can encode.
+/// One connection.
 #[derive(Clone)]
-pub struct Client<F> {
+pub struct Client {
     tx: mpsc::Sender<(Op, Bytes, Reply)>,
     _conn: Arc<Connection>,
-    format: F,
 }
-
-/// Values as they are: `Bytes` out, `AsRef<[u8]>` in.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Raw;
 
 /// A batch of keys for the `_multi` methods: a tuple `(K1, K2, …)` of up to
 /// 16 keys, an array `[K; N]`, a `Vec<K>` or a `&[K]`, each key any
@@ -173,12 +177,10 @@ impl Drop for Connection {
     }
 }
 
-impl<F> Client<F> {
+impl Client {
     /// Connect and authenticate with `token` before returning; a wrong
-    /// token is an [`Error::Status`] with `Unauthorized`. `format` says what
-    /// values are — [`Raw`] bytes, or any [`Format`](typed::Format) with
-    /// the `serde` feature. A client cannot exist without either.
-    pub async fn connect(addr: SocketAddr, format: F, token: impl AsRef<[u8]>) -> Result<Self> {
+    /// token is an [`Error::Status`] with `Unauthorized`.
+    pub async fn connect(addr: SocketAddr, token: impl AsRef<[u8]>) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
         let (r, w) = stream.into_split();
@@ -189,16 +191,11 @@ impl<F> Client<F> {
         let client = Self {
             tx,
             _conn: Arc::new(Connection { writer, reader }),
-            format,
         };
         client
             .call(Op::Auth, Bytes::copy_from_slice(token.as_ref()))
             .await?;
         Ok(client)
-    }
-
-    pub fn format(&self) -> &F {
-        &self.format
     }
 
     async fn call(&self, op: Op, body: Bytes) -> Result<Bytes> {
@@ -210,12 +207,49 @@ impl<F> Client<F> {
         rx.await.map_err(|_| Error::Closed)?
     }
 
-    /// Fetch many keys: one slot per key in request order, `None` for a
-    /// missing one; an array for a tuple or array of keys, a `Vec` for a
-    /// `Vec` or slice. Awaited directly it yields bytes; with the `serde`
-    /// feature, `.decode::<Vs>()` on a format client yields values.
-    pub fn get_multi<Ks: Keys>(&self, keys: Ks) -> GetMulti<'_, F, Ks> {
-        GetMulti { client: self, keys }
+    /// Fetch one key, decoding its value as `V`; `None` if it is missing.
+    pub async fn get<V: DeserializeOwned>(&self, key: impl AsRef<[u8]>) -> Result<Option<V>> {
+        Ok(self.get_multi::<(V,), _>((key,)).await?.0)
+    }
+
+    /// Fetch many keys, decoding every value as `Vs` says: one slot per key
+    /// in request order, `None` for a missing one. `Vs` is a tuple of value
+    /// types for a tuple of keys (one per key) and a single type for an
+    /// array, `Vec` or slice of keys; the result is an array for a tuple or
+    /// array of keys, a `Vec` for a `Vec` or slice. `Vs` may also be left to
+    /// inference from the binding.
+    pub async fn get_multi<Vs, Ks: Values<Vs>>(&self, keys: Ks) -> Result<Ks::Output> {
+        let ks = keys.keys();
+        let values = wire::decode_values(
+            self.call(Op::Get, wire::encode_keys(ks.iter().copied()))
+                .await?,
+        )?;
+        expect_count(&values, ks.len())?;
+        Ks::decode(values)
+    }
+
+    /// Store one key/value pair.
+    pub async fn set<V: Serialize>(&self, key: impl AsRef<[u8]>, value: V) -> Result<()> {
+        self.set_multi([(key, value)]).await
+    }
+
+    /// Store many key/value pairs from any iterator of `(key, value)`.
+    pub async fn set_multi<K, V, I>(&self, entries: I) -> Result<()>
+    where
+        K: AsRef<[u8]>,
+        V: Serialize,
+        I: IntoIterator<Item = (K, V)>,
+    {
+        let entries = entries
+            .into_iter()
+            .map(|(k, v)| Ok((k, encode(&v)?)))
+            .collect::<Result<Vec<(K, Vec<u8>)>>>()?;
+        self.call(
+            Op::Set,
+            wire::encode_entries(entries.iter().map(|(k, v)| (k.as_ref(), v.as_slice()))),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Delete one key; returns whether it existed.
@@ -236,67 +270,76 @@ impl<F> Client<F> {
     }
 }
 
-/// A pending `get_multi`; see [`Client::get_multi`].
-#[must_use = "a request is only sent when awaited or decoded"]
-pub struct GetMulti<'a, F, Ks> {
-    client: &'a Client<F>,
-    keys: Ks,
+/// MessagePack with structs as maps, so values round-trip with the
+/// TypeScript client.
+fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    Ok(rmp_serde::to_vec_named(value)?)
 }
 
-impl<F, Ks: Keys> GetMulti<'_, F, Ks> {
-    /// Send the request; the reply is one `Option<Bytes>` per key.
-    pub(crate) async fn fetch(&self) -> Result<Vec<Option<Bytes>>> {
-        let ks = self.keys.keys();
-        let values = wire::decode_values(
-            self.client
-                .call(Op::Get, wire::encode_keys(ks.iter().copied()))
-                .await?,
-        )?;
-        expect_count(&values, ks.len())?;
-        Ok(values)
+fn decode<V: DeserializeOwned>(value: Option<Bytes>) -> Result<Option<V>> {
+    Ok(value.map(|v| rmp_serde::from_slice(&v)).transpose()?)
+}
+
+/// What `get_multi::<Vs, _>` over this key batch returns: `(Option<V1>, …)`
+/// for a tuple of keys with `Vs = (V1, …)`, `[Option<V>; N]` or
+/// `Vec<Option<V>>` for an array, `Vec` or slice of keys with `Vs = V`.
+pub trait Values<Vs>: Keys {
+    type Output;
+    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output>;
+}
+
+macro_rules! impl_value_tuples {
+    ($($n:literal => ($($i:tt $K:ident $V:ident),+);)+) => {$(
+        impl<$($K: AsRef<[u8]>, $V: DeserializeOwned),+> Values<($($V,)+)> for ($($K,)+) {
+            type Output = ($(Option<$V>,)+);
+            fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
+                expect_count(&values, $n)?;
+                let mut it = values.into_iter();
+                Ok(($(decode::<$V>(it.next().unwrap())?,)+))
+            }
+        }
+    )+};
+}
+
+impl_value_tuples! {
+    1 => (0 K0 V0);
+    2 => (0 K0 V0, 1 K1 V1);
+    3 => (0 K0 V0, 1 K1 V1, 2 K2 V2);
+    4 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3);
+    5 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4);
+    6 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5);
+    7 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6);
+    8 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7);
+    9 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8);
+    10 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9);
+    11 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10);
+    12 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11);
+    13 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11, 12 K12 V12);
+    14 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11, 12 K12 V12, 13 K13 V13);
+    15 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11, 12 K12 V12, 13 K13 V13, 14 K14 V14);
+    16 => (0 K0 V0, 1 K1 V1, 2 K2 V2, 3 K3 V3, 4 K4 V4, 5 K5 V5, 6 K6 V6, 7 K7 V7, 8 K8 V8, 9 K9 V9, 10 K10 V10, 11 K11 V11, 12 K12 V12, 13 K13 V13, 14 K14 V14, 15 K15 V15);
+}
+
+impl<K: AsRef<[u8]>, V: DeserializeOwned, const N: usize> Values<V> for [K; N] {
+    type Output = [Option<V>; N];
+    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
+        Self::batch(values.into_iter().map(decode).collect::<Result<_>>()?)
     }
 }
 
-impl<'a, F: Sync, Ks: Keys + Send + Sync + 'a> IntoFuture for GetMulti<'a, F, Ks> {
-    type Output = Result<Ks::Batch<Option<Bytes>>>;
-    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
-    fn into_future(self) -> Self::IntoFuture {
-        Box::pin(async move { Ks::batch(self.fetch().await?) })
+impl<K: AsRef<[u8]>, V: DeserializeOwned> Values<V> for Vec<K> {
+    type Output = Vec<Option<V>>;
+    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
+        values.into_iter().map(decode).collect()
     }
 }
 
-impl Client<Raw> {
-    /// Fetch one key.
-    pub async fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Bytes>> {
-        Ok(self.get_multi((key,)).fetch().await?.pop().flatten())
-    }
-
-    /// Store one key/value pair.
-    pub async fn set(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
-        self.set_multi([(key, value)]).await
-    }
-
-    /// Store many key/value pairs.
-    pub async fn set_multi<K, V, I>(&self, entries: I) -> Result<()>
-    where
-        K: AsRef<[u8]>,
-        V: AsRef<[u8]>,
-        I: IntoIterator<Item = (K, V)>,
-    {
-        let entries: Vec<(K, V)> = entries.into_iter().collect();
-        self.call(
-            Op::Set,
-            wire::encode_entries(entries.iter().map(|(k, v)| (k.as_ref(), v.as_ref()))),
-        )
-        .await?;
-        Ok(())
+impl<K: AsRef<[u8]>, V: DeserializeOwned> Values<V> for &[K] {
+    type Output = Vec<Option<V>>;
+    fn decode(values: Vec<Option<Bytes>>) -> Result<Self::Output> {
+        values.into_iter().map(decode).collect()
     }
 }
-
-#[cfg(feature = "serde")]
-pub mod typed;
-#[cfg(feature = "serde")]
-pub use typed::{Format, Values};
 
 /// Writes queued requests, coalescing everything already queued into one flush.
 async fn write_loop<W: AsyncWrite + Unpin>(
