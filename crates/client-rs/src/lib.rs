@@ -812,6 +812,10 @@ impl<K: AsRef<[u8]>, V: DeserializeOwned> Values<V> for &[K] {
 /// Stops as soon as the reader does (`stop` resolves when the reader
 /// drops its end), so the socket is closed the moment the connection is
 /// known to be gone rather than at the next write.
+/// A flush this small waits one scheduler turn for more requests to
+/// coalesce (see `write_loop`); a larger one goes out at once.
+const YIELD_BELOW: usize = BUF / 4;
+
 async fn write_loop<W: AsyncWrite + Unpin>(
     mut w: W,
     mut rx: mpsc::Receiver<Request>,
@@ -835,17 +839,35 @@ async fn write_loop<W: AsyncWrite + Unpin>(
             _ = &mut stop => return,
         };
         match msg {
-            Some(mut msg) => loop {
-                let (op, body, reply) = msg;
-                if pending.send(reply).is_err() {
-                    return;
+            Some(mut msg) => {
+                let (mut yielded, mut queued) = (false, 0);
+                loop {
+                    let (op, body, reply) = msg;
+                    if pending.send(reply).is_err() {
+                        return;
+                    }
+                    queued += body.len();
+                    out.frame(op as u8, body);
+                    match rx.try_recv() {
+                        Ok(next) => msg = next,
+                        // The callers woken by the last reply batch are
+                        // about to queue their next request; one scheduler
+                        // turn lets them, so this flush carries those too.
+                        // Only worth it while the flush is small: large
+                        // bodies already fill a packet each, and holding
+                        // them back only delays the server.
+                        Err(_) if !yielded && queued < YIELD_BELOW => {
+                            yielded = true;
+                            tokio::task::yield_now().await;
+                            match rx.try_recv() {
+                                Ok(next) => msg = next,
+                                Err(_) => break,
+                            }
+                        }
+                        Err(_) => break,
+                    }
                 }
-                out.frame(op as u8, body);
-                match rx.try_recv() {
-                    Ok(next) => msg = next,
-                    Err(_) => break,
-                }
-            },
+            }
             None => {
                 // The reply goes through the same in-order queue as every
                 // request, so the reader matches it; nobody waits on the

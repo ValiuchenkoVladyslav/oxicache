@@ -400,3 +400,62 @@ Decision: neither. The measurable TLS overhead that was syscall-shaped is gone w
 `Drained`; what is left is crypto and copies at sizes where the kernel does them no
 cheaper. If a future profile shows syscalls above ~2 per request (many connections, no
 pipelining), the cheap first step is `--per-core` plus `SO_BUSY_POLL`, not io_uring.
+
+## memcached comparison (2026-08-30)
+
+memcached 1.6.45 (`docker.io/library/memcached`, rootless podman on the host network,
+`-t 12 -m 1024`) driven by memtier_benchmark 2.5.1, same box, same method: server
+user+sys from `/proc` over a 6 s run after a 2 s warm-up, divided by requests. memtier
+pipelines 16 requests per connection like our bench; with `--multi-key-get` it turns the
+Set:Get ratio into the width of one mget, and memcached has no multi-key set, so the
+batched shapes are only comparable per key-op. memtier is a C client and drives ~2× the
+requests per second our tokio bench does; the loopback bench is client-bound on both sides,
+so only server CPU per request is compared.
+
+| shape | memcached | oxicache (client before / after round 11) |
+|---|---|---|
+| single key, 8×16, 128 B, 10 % writes | 1.5 µs/req (1.88M req/s; 1.4 µs when rate-limited to 900k) | 2.5 → **1.4 µs/req** (0.9M → 1.4M req/s) |
+| single key, 8×16, 1 KiB, 50 % writes | 3.5 µs/req (1.25M req/s) | 3.1–3.8 µs/req (0.6–0.7M) |
+| single key, 64×2, 128 B, 10 % writes | 5.3 µs/req (0.65M; 96 % misses — cheaper) | 6.3 µs/req (0.38M, 62 % hits) |
+| 16-key batches, 8×16, 128 B, 10 % writes | 1.07 µs per key-op (mget 16 + single-key sets, 9.1 µs/req) | **0.43 → 0.37 µs per key-op** (6.9 → 5.9 µs/req) |
+| 16-key batches, 64×2, 128 B | 1.4 µs per key-op (9-key mget) | **0.69 → 0.64 µs per key-op** (11 → 10.3 µs/req) |
+
+So: per key in a batch, oxicache is ~2.5–3× cheaper; per single-key request the two are
+now at parity (1.4 vs 1.5 µs). The single-key gap before round 11 was not in user time
+(oxicache 0.72 µs/req vs memcached 0.63) and not in syscall count (0.47 per request:
+recv 0.17, writev 0.17, epoll 0.07, futex 0.06); it was kernel time, 1.67 vs 0.83 µs/req,
+because the server saw ~5.7 requests per `recv` from our client where memtier writes its
+16-deep pipeline in one packet. Round 11 fixed that on the client side.
+
+## Round 11: client write packing, busy polling (2026-08-30)
+
+The Rust client's writer already coalesced whatever was queued when it woke, but it woke
+on the first queued request: the other callers released by the same reply batch were
+still being scheduled, so a flush carried ~1.4 requests and the server got ~5.7 per
+`recv`. Now the writer yields one scheduler turn before flushing when the pending flush
+is under 16 KiB (`YIELD_BELOW`), then drains again. Server-side packing on single-key
+requests went from 0.174 to 0.072 `recv` per request (14 requests per read).
+
+Server CPU per request and req/s, old vs new client, same server binary, 2 alternating runs:
+
+| profile | old client | new client |
+|---|---|---|
+| 8×16, single key, 128 B, 10 % writes | 2.42 µs, 934k | **1.43 µs, 1.39M** (−41 %) |
+| 8×16, 16 keys, 128 B, 10 % writes | 6.8 µs, 424k | **5.95 µs, 480k** (−12 %) |
+| 8×16, 16 keys, 1 KiB, 50 % writes | 43.3–45.6 µs, 83–96k | 45.0 µs, 89k (neutral; a request is one 16 KiB flush, above the yield threshold) |
+| 64×2, 16 keys, 128 B | 11.5 µs, 255k | **10.3 µs, 310k** (−10 %) |
+
+Without the size cap the 1 KiB profile lost 5–10 % (the yield delayed 16 KiB requests
+that already fill their packets); with it, neutral.
+
+The TypeScript client needed nothing: its microtask flush runs after every continuation
+released by a `data` event, so the server already sees ~16 requests per `recv` (0.06
+`recv`/request measured with the shim). Its lower req/s is its own CPU (msgpack, promise
+machinery), not the wire.
+
+Busy polling, tried on the server with the new client: `SO_BUSY_POLL=50` on accepted
+sockets, `EPIOCSPARAMS` (50 µs, budget 64) on tokio's epoll fds, both, and
+`prefer_busy_poll` — all within ±3 % of the baseline on single-key, 16-key and 64×2
+shapes (both settable unprivileged on this kernel). Loopback traffic has no NAPI context
+to poll, so nothing can change here; it would need a real NIC to evaluate, and then a
+knob, which the server does not have. Rejected, no code kept.
