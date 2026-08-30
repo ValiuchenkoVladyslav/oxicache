@@ -527,11 +527,11 @@ describe("reconnect", () => {
     // anchored before the call whose failure starts it, so a loaded machine
     // can only lengthen what is measured, never shorten it.
     let before = Date.now();
-    await expect(c.ping()).rejects.toThrow("Failed to connect");
+    await expect(c.ping()).rejects.toThrow("ECONNREFUSED");
     for (const wait of [100, 200]) {
       const next = Date.now();
       // biome-ignore lint/performance/noAwaitInLoops: the waits are sequential by design
-      await expect(c.ping()).rejects.toThrow("Failed to connect");
+      await expect(c.ping()).rejects.toThrow("ECONNREFUSED");
       expect(Date.now() - before).toBeGreaterThanOrEqual(wait);
       before = next;
     }
@@ -545,7 +545,7 @@ describe("reconnect", () => {
     // Three refusals put the next wait at 400 ms; close() ends it early.
     for (let i = 0; i < 3; i++) {
       // biome-ignore lint/performance/noAwaitInLoops: the failures are sequential by design
-      await expect(c.ping()).rejects.toThrow("Failed to connect");
+      await expect(c.ping()).rejects.toThrow("ECONNREFUSED");
     }
     const t0 = Date.now();
     const waiting = c.ping();
@@ -760,7 +760,7 @@ describe("tcp transport over tls", () => {
         token: "any",
         tls: { ca: CA_PEM, serverName: "10.9.9.9" },
       }),
-    ).rejects.toThrow(ClosedError);
+    ).rejects.toThrow("10.9.9.9 is not in the cert");
     const ip = await tcp({
       port: server.port,
       token: "any",

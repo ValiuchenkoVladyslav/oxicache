@@ -45,10 +45,11 @@ describe("module graph", () => {
     expect(names).toContain("value.ts");
   });
 
-  test("the tcp transport is where Bun.connect lives", async () => {
+  test("the tcp transport is where node sockets live", async () => {
     const files = await reachable("transport/tcp.ts");
     const tcp = files.get(resolve(src, "transport/tcp.ts"));
-    expect(tcp).toContain("Bun.connect(");
+    expect(tcp).toContain('from "node:net"');
+    expect(tcp).not.toMatch(BUN_GLOBAL);
   });
 
   test("package.json is side-effect free with a subpath per transport", async () => {

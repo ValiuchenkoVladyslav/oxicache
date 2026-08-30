@@ -1,7 +1,7 @@
 /**
  * HTTP transport: one `fetch` per request, the frame body as the request
  * body, the op as the path. Runs anywhere `fetch` does (Bun, Node 18+, edge
- * runtimes, lambdas); nothing here touches Bun's socket API.
+ * runtimes, lambdas); nothing here touches a socket API.
  */
 import {
   ClosedError,

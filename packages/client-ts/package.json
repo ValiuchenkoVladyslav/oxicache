@@ -1,7 +1,7 @@
 {
   "name": "@oxicache/client",
   "version": "0.1.0",
-  "description": "TypeScript client for oxicache: TCP transport for Bun, HTTP transport for anywhere with fetch",
+  "description": "TypeScript client for oxicache: TCP transport for Node and Bun, HTTP transport for anywhere with fetch",
   "license": "MIT",
   "type": "module",
   "sideEffects": false,

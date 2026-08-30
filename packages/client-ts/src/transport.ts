@@ -32,7 +32,7 @@ export class ClosedError extends Error {
 
 /**
  * Carries request frames to a server and brings response bodies back.
- * `@oxicache/client/transport/tcp` (Bun sockets, pipelined) and
+ * `@oxicache/client/transport/tcp` (`node:net` sockets, pipelined) and
  * `@oxicache/client/transport/http` (`fetch`) are the built-in ones; anything
  * with this shape can be handed to `Client.connect`.
  */

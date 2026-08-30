@@ -1,7 +1,8 @@
 /**
- * TCP transport for the Bun runtime: one socket (`Bun.connect`, or
- * `node:tls` for TLS), requests pipelined onto it. Everything issued in the same tick goes out in one
- * write and responses are matched to callers in order. The server closes a
+ * TCP transport on `node:net` (`node:tls` with `tls`), so it runs on Node
+ * and Bun alike: one socket, requests pipelined onto it. Everything issued
+ * in the same tick goes out in one write and responses are matched to
+ * callers in order. The server closes a
  * connection that sends nothing for its idle timeout, so after `keepaliveMs`
  * without a write the transport pings by itself.
  *
@@ -14,7 +15,7 @@
  * that error, as does `close()`. Status and encoding errors are the call's
  * alone; the connection stays.
  */
-import { isIP } from "node:net";
+import { isIP, connect as netConnect, type Socket } from "node:net";
 import { checkServerIdentity, connect as tlsConnect } from "node:tls";
 import {
   ClosedError,
@@ -49,8 +50,7 @@ export interface TcpOptions {
    * Speak TLS, for a server started with `OXICACHE_TLS_CERT`. `true` trusts
    * the system roots and checks the certificate against `hostname`; an
    * object names a private CA (`ca`) or another name (`serverName`). Every
-   * reconnect repeats the handshake. The TLS socket is `node:tls`, since
-   * `Bun.connect` does not verify server certificates (Bun 1.3).
+   * reconnect repeats the handshake.
    */
   tls?: boolean | TlsOptions;
 }
@@ -80,99 +80,46 @@ const ignore = () => {
   // nothing to do
 };
 
-/** What a link needs from its socket, whichever API is underneath. */
-interface Wire {
-  /** Bytes accepted now; the rest is written again on `drain`. */
-  write(data: Uint8Array): number;
-  /** Hang up after what has been written. */
-  end(): void;
-  /** Hang up now. */
-  terminate(): void;
-}
-
-/** The socket's callbacks into its link. */
-interface Handlers {
-  data(chunk: Uint8Array): void;
-  drain(): void;
-  gone(err?: unknown): void;
-}
-
-/** A plain `Bun.connect` socket; resolves once it is open. */
-async function bunWire(
-  hostname: string,
-  port: number,
-  h: Handlers,
-): Promise<Wire> {
-  const gone = (_s: unknown, err?: unknown) => h.gone(err);
-  const socket = await Bun.connect({
-    hostname,
-    port,
-    socket: {
-      data: (_s, chunk) => h.data(chunk),
-      drain: () => h.drain(),
-      close: gone,
-      error: gone,
-      connectError: gone,
-      end: gone,
-    },
-  });
-  return {
-    write: (data) => socket.write(data),
-    end: () => socket.end(),
-    terminate: () => socket.terminate(),
-  };
-}
-
 /**
- * A `node:tls` socket; resolves once the handshake is done and the
- * certificate checked, rejects if it is refused. Node buffers every write
- * in full, so `write` never reports a short count.
+ * A connected socket: plain, or with the TLS handshake done and the
+ * certificate checked. Rejects with the socket's error (`ECONNREFUSED`, a
+ * refused certificate) if it never gets there.
  */
-function tlsWire(
+function open(
   hostname: string,
   port: number,
-  tls: TlsOptions,
-  h: Handlers,
-): Promise<Wire> {
+  tls: TlsOptions | null,
+): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    // SNI cannot carry an IP, so an IP name is checked against the
-    // certificate directly instead of being sent.
-    const name = tls.serverName ?? hostname;
-    const sni = isIP(name) ? undefined : name;
-    // node:tls takes PEM as text or a Buffer, not a bare Uint8Array.
-    const pem = (c: string | Uint8Array) =>
-      typeof c === "string" ? c : Buffer.from(c);
-    const socket = tlsConnect({
-      host: hostname,
-      port,
-      ...(tls.ca !== undefined && {
-        ca: Array.isArray(tls.ca) ? tls.ca.map(pem) : pem(tls.ca),
-      }),
-      ...(sni !== undefined && { servername: sni }),
-      checkServerIdentity: (_host, cert) => checkServerIdentity(name, cert),
-    });
-    socket.setNoDelay(true);
-    let open = false;
-    socket.once("secureConnect", () => {
-      open = true;
-      resolve({
-        write: (data) => {
-          socket.write(data);
-          return data.length;
+    let socket: Socket;
+    if (tls) {
+      // SNI cannot carry an IP, so an IP name is checked against the
+      // certificate directly instead of being sent.
+      const name = tls.serverName ?? hostname;
+      // node:tls takes PEM as text or a Buffer, not a bare Uint8Array.
+      const pem = (c: string | Uint8Array) =>
+        typeof c === "string" ? c : Buffer.from(c);
+      socket = tlsConnect(
+        {
+          host: hostname,
+          port,
+          ...(tls.ca !== undefined && {
+            ca: Array.isArray(tls.ca) ? tls.ca.map(pem) : pem(tls.ca),
+          }),
+          ...(!isIP(name) && { servername: name }),
+          checkServerIdentity: (_host, cert) => checkServerIdentity(name, cert),
         },
-        end: () => socket.end(),
-        terminate: () => socket.destroy(),
-      });
-    });
-    socket.on("data", (chunk: Uint8Array) => h.data(chunk));
-    socket.on("drain", () => h.drain());
-    const gone = (err?: unknown) => {
-      if (open) h.gone(err);
-      else reject(new ClosedError(err));
-    };
-    socket.on("error", gone);
-    socket.on("close", gone);
-    socket.on("end", gone);
+        () => resolve(socket),
+      );
+    } else {
+      socket = netConnect({ host: hostname, port }, () => resolve(socket));
+    }
+    socket.setNoDelay(true);
+    // Until it is open the socket has no link to report to.
+    const failed = (err?: unknown) =>
+      reject(err instanceof Error ? err : new ClosedError(err));
+    socket.once("error", failed);
+    socket.once("close", failed);
   });
 }
 
@@ -186,13 +133,12 @@ class Link {
   private head = 0;
   private outbox: Uint8Array[] = [];
   private outboxBytes = 0;
-  private unsent: Uint8Array | null = null;
   private flushScheduled: boolean = false;
   private lost: ClosedError | null = null;
   private readonly reader: FrameReader;
   private readonly keepaliveMs: number;
   private keepalive: ReturnType<typeof setTimeout> | undefined;
-  private socket!: Wire;
+  private socket!: Socket;
 
   // Explicit rather than a field initialiser: Bun's coverage counts a
   // synthesised constructor as a function it never sees run.
@@ -214,16 +160,15 @@ class Link {
     keepaliveMs: number,
   ): Promise<Link> {
     const link = new Link(owner, keepaliveMs);
+    const socket = await open(hostname, port, tls);
+    link.socket = socket;
+    socket.removeAllListeners("error").removeAllListeners("close");
+    socket.on("data", (chunk: Uint8Array) => link.onData(chunk));
     // Any way the socket goes away ends with the same bookkeeping.
-    const handlers: Handlers = {
-      data: (chunk) => link.onData(chunk),
-      drain: () => link.flush(),
-      gone: (err) => link.lose(err),
-    };
-    link.socket = tls
-      ? await tlsWire(hostname, port, tls, handlers)
-      : await bunWire(hostname, port, handlers);
-    if (link.lost) throw link.lost;
+    const gone = (err?: unknown) => link.lose(err);
+    socket.on("error", gone);
+    socket.on("close", gone);
+    socket.on("end", gone);
     try {
       await link.call(encodeRawFrame(Op.Auth, token), false);
     } catch (e) {
@@ -259,18 +204,12 @@ class Link {
     this.lose();
   }
 
-  /** Write what is queued, coalescing multiple frames into one syscall. */
+  /**
+   * Write what is queued, coalescing multiple frames into one write; the
+   * socket buffers whatever the kernel does not take at once.
+   */
   private flush(): void {
-    if (this.lost) return;
-    if (this.unsent !== null) {
-      const n = this.socket.write(this.unsent);
-      if (n < this.unsent.length) {
-        this.unsent = this.unsent.subarray(Math.max(n, 0));
-        return; // `drain` will call us again
-      }
-      this.unsent = null;
-    }
-    if (this.outbox.length === 0) return;
+    if (this.lost || this.outbox.length === 0) return;
     let data: Uint8Array;
     if (this.outbox.length === 1) {
       // biome-ignore lint/style/noNonNullAssertion: length === 1 was just checked
@@ -285,8 +224,7 @@ class Link {
     }
     this.outbox = [];
     this.outboxBytes = 0;
-    const n = this.socket.write(data);
-    if (n < data.length) this.unsent = data.subarray(Math.max(n, 0));
+    this.socket.write(data);
     this.armKeepalive();
   }
 
@@ -328,7 +266,7 @@ class Link {
       const err = e instanceof Error ? e : new Error(String(e));
       this.takePending()?.reject(err);
       this.owner.condemn(new ClosedError(err));
-      this.socket.terminate();
+      this.socket.destroy();
       this.lose(err);
     }
   }
@@ -353,7 +291,6 @@ class Link {
     clearTimeout(this.keepalive);
     this.outbox = [];
     this.outboxBytes = 0;
-    this.unsent = null;
     const waiting = this.pending.slice(this.head);
     this.pending.length = 0;
     this.head = 0;

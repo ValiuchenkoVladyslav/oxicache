@@ -11,7 +11,7 @@ runtimes without sockets), tokio multi-threaded runtime. No persistence.
 | `crates/wire` (`oxicache-wire`) | binary request/response framing shared by both sides |
 | `crates/server` (`oxicache-server`) | `oxicache-server` binary: sharded S3-FIFO engine + TCP and HTTP front ends |
 | `crates/client-rs` (`oxicache-client`) | Rust `Client` library (any serde type, stored as MessagePack) + `oxicache-cli` |
-| `packages/client-ts` (`@oxicache/client`) | TypeScript `Client` library: TCP transport for Bun, HTTP transport for anything with `fetch` |
+| `packages/client-ts` (`@oxicache/client`) | TypeScript `Client` library: TCP transport for Node and Bun, HTTP transport for anything with `fetch` |
 
 ## Protocol
 
@@ -181,12 +181,12 @@ the client usable. Dropping the last clone closes the connection.
 `packages/client-ts` is a `Client` over a pluggable `Transport`, each transport on its own
 subpath so a bundle only carries the one it imports (the package is `sideEffects: false`):
 
-- `@oxicache/client/transport/tcp` — `Bun.connect` (a `node:tls` socket with `tls`, since
-  `Bun.connect` does not verify server certificates), with the same framing, pipelining and
-  in-order response matching as the Rust client. Bun only.
+- `@oxicache/client/transport/tcp` — a `node:net` socket (`node:tls` with `tls`), with the
+  same framing, pipelining and in-order response matching as the Rust client. Node 18+ and
+  Bun.
 - `@oxicache/client/transport/http` — one `fetch` per call against the server's HTTP listener.
   Runs wherever `fetch` does: Bun, Node 18+, edge runtimes, lambdas. Importing it, or the main
-  entry, never touches Bun's socket API.
+  entry, never touches a socket API.
 
 Keys are `string` (UTF-8) or `Uint8Array`; values are any MessagePack-representable data
 (`null`, booleans, numbers, `bigint`, strings, `Uint8Array`, `Date`, arrays, plain objects,
