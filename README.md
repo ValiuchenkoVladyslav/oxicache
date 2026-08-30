@@ -101,6 +101,21 @@ OXICACHE_TOKEN=s3cret OXICACHE_HTTP_ADDR=0.0.0.0:4434 OXICACHE_CAPACITY=1G cargo
 A missing token, an unparseable value or an unreadable certificate file is a startup error
 naming the variable. SIGINT or SIGTERM stops accepting and drains open connections before exit.
 
+### Container
+
+The `Dockerfile` builds the release binary (workspace profile: fat LTO, one codegen unit)
+and ships it on `debian:bookworm-slim`; it works with podman and docker alike:
+
+```sh
+podman build -t oxicache .
+podman run --rm --network host -e OXICACHE_TOKEN=s3cret oxicache
+```
+
+Prefer `--network host` for a cache: rootless port mapping (`-p 4433:4433`) routes every
+byte through the `pasta` userspace proxy, which caps throughput well below what the server
+can do (measured in docs/performance.md). With TLS, mount the PEM and point
+`OXICACHE_TLS_CERT` at it: `-v ./server.pem:/server.pem:ro,Z -e OXICACHE_TLS_CERT=/server.pem`.
+
 ```sh
 cargo run --release -p oxicache-client -- set a 1 b 2
 cargo run --release -p oxicache-client -- get a b c

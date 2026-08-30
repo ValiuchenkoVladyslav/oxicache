@@ -486,3 +486,19 @@ item; the 1 KiB profile gains from SET replies no longer being one status for th
 batch (nothing to roll back) and from the writer's `len` counter replacing a size pass. The
 client's `Outcome` indexes replies by offset into the one response buffer — no `Bytes` slice
 (refcount) per item, only for the slots that are read.
+
+## Container (2026-08-30)
+
+The `Dockerfile` (rust:1-bookworm builder → debian:bookworm-slim runtime, same release
+profile) benched with the same harness, server CPU/req from `/proc` of the containerised
+process (visible from the host under rootless podman):
+
+- **`--network host`: containerisation costs nothing.** Alternating runs of the native
+  binary and the image binary on the 16-key 128 B profile land in the same 5.9–7.5 µs
+  spread; single-key runs are identical (1.36 µs, ~1.5M req/s). The image's binary is
+  byte-different (upstream rustc/LLVM 22.1.8 vs Void's 22.1.4) but measures the same. An
+  early reading of +20 % for the container was leftover load, not the container.
+- **Rootless port mapping (`-p 4433:4433`) is the expensive mode**: every byte crosses the
+  `pasta` userspace proxy. 16-key profile: 312k req/s vs ~430k, pasta burns 1.4 µs/req of
+  its own (0.45 cores at this load) and the server's own CPU/req rises to ~8.2 µs (worse
+  batching through the relay). Use `--network host` for a cache, as the README says.
