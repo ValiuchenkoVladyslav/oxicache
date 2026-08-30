@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use oxicache_server::{Cache, Options, Server};
 
-async fn start(token: Option<&[u8]>) -> Arc<Server> {
+async fn start(token: &[u8]) -> Arc<Server> {
     let cache = Arc::new(Cache::new(64 << 20, 2));
     let opts = Options {
-        token: token.map(<[u8]>::to_vec),
+        token: token.to_vec(),
     };
-    let server = Arc::new(Server::bind_with("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
+    let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
     server
@@ -45,7 +45,7 @@ fn text(o: &Output) -> (String, String) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_set_del() {
-    let server = start(Some(b"t")).await;
+    let server = start(b"t").await;
     let addr = server.local_addr().to_string();
     let env = [("OXICACHE_TOKEN", "t")];
     let out = cli(&["--addr", &addr, "set", "a", "1", "b", "2"], &env).await;
@@ -61,7 +61,7 @@ async fn get_set_del() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn errors_are_reported() {
-    let server = start(None).await;
+    let server = start(b"t").await;
     let addr = server.local_addr().to_string();
     let out = cli(&["--addr", &addr, "--token", "t", "set", "a"], &[]).await;
     assert!(!out.status.success());
@@ -76,7 +76,7 @@ async fn errors_are_reported() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn token_and_env_overrides() {
-    let server = start(Some(b"s3cret")).await;
+    let server = start(b"s3cret").await;
     let addr = server.local_addr().to_string();
     let out = cli(
         &["--addr", &addr, "--token", "s3cret", "set", "k", "v"],
@@ -104,7 +104,7 @@ async fn token_and_env_overrides() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn bench_runs() {
-    let server = start(None).await;
+    let server = start(b"t").await;
     let addr = server.local_addr().to_string();
     let out = cli(
         &[

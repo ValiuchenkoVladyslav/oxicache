@@ -3,9 +3,8 @@
 //! responses are flushed with one vectored write once the buffered input has
 //! been drained, so pipelined requests share a single syscall each way.
 //!
-//! With a token configured, a connection must authenticate with one `Auth`
-//! frame before anything else; the check is a single well-predicted branch
-//! per frame afterwards.
+//! A connection must authenticate with one `Auth` frame before anything
+//! else; the check is a single well-predicted branch per frame afterwards.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -36,33 +35,31 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Pause after a failed `accept`, so fd exhaustion does not spin a worker.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Settings for [`Server::bind_with`].
-#[derive(Clone, Debug, Default)]
+/// Settings for [`Server::bind`].
+#[derive(Clone, Debug)]
 pub struct Options {
     /// Shared secret every connection must present in an `Auth` frame before
-    /// its first request; `None` disables authentication.
-    pub token: Option<Vec<u8>>,
+    /// its first request. Must not be empty: there is no unauthenticated
+    /// mode.
+    pub token: Vec<u8>,
 }
 
 pub struct Server {
     listener: std::net::TcpListener,
     cache: Arc<Cache>,
-    token: Option<Arc<[u8]>>,
+    token: Arc<[u8]>,
 }
 
 impl Server {
-    /// Bind `addr` serving `cache`, without authentication.
-    pub fn bind(addr: SocketAddr, cache: Arc<Cache>) -> Result<Self> {
-        Self::bind_with(addr, cache, Options::default())
-    }
-
-    /// Bind with explicit [`Options`].
-    pub fn bind_with(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
+    /// Bind `addr` serving `cache`; every connection must authenticate with
+    /// `opts.token`.
+    pub fn bind(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
+        let token = token(opts)?;
         let listener = listener(addr).map_err(|source| Error::Bind { addr, source })?;
         Ok(Self {
             listener,
             cache,
-            token: opts.token.map(Arc::from),
+            token,
         })
     }
 
@@ -97,6 +94,14 @@ impl Server {
     }
 }
 
+/// Validate the shared secret; shared by both front ends.
+pub(crate) fn token(opts: Options) -> Result<Arc<[u8]>> {
+    if opts.token.is_empty() {
+        return Err(Error::EmptyToken);
+    }
+    Ok(Arc::from(opts.token))
+}
+
 /// A non-blocking listening socket with `SO_REUSEADDR`, shared by both front ends.
 pub(crate) fn listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -111,7 +116,7 @@ pub(crate) fn listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListene
 async fn accept_loop(
     listener: std::net::TcpListener,
     cache: Arc<Cache>,
-    token: Option<Arc<[u8]>>,
+    token: Arc<[u8]>,
     conns: &mut JoinSet<()>,
 ) {
     let listener = TcpListener::from_std(listener).expect("register listener");
@@ -123,7 +128,7 @@ async fn accept_loop(
                 let (cache, token) = (cache.clone(), token.clone());
                 conns.spawn(async move {
                     debug!(%remote, "connection open");
-                    if let Err(e) = serve_connection(stream, &cache, token.as_deref()).await {
+                    if let Err(e) = serve_connection(stream, &cache, &token).await {
                         debug!(%remote, error = %e, "connection closed");
                     }
                 });
@@ -136,15 +141,11 @@ async fn accept_loop(
     }
 }
 
-async fn serve_connection(
-    stream: TcpStream,
-    cache: &Cache,
-    token: Option<&[u8]>,
-) -> std::io::Result<()> {
+async fn serve_connection(stream: TcpStream, cache: &Cache, token: &[u8]) -> std::io::Result<()> {
     stream.set_nodelay(true)?;
     let (mut r, mut w) = stream.into_split();
-    let mut authed = token.is_none();
-    let mut reader = FrameReader::new(if authed { MAX_FRAME } else { MAX_AUTH_FRAME });
+    let mut authed = false;
+    let mut reader = FrameReader::new(MAX_AUTH_FRAME);
     let mut out = FrameWriter::new();
     loop {
         // Serve every complete frame already buffered, then flush once.
@@ -152,7 +153,7 @@ async fn serve_connection(
             match reader.next_buffered() {
                 Ok(Some((op, body))) if authed => dispatch(op, body, cache, &mut out),
                 Ok(Some((op, body))) => {
-                    let ok = op == Op::Auth as u8 && token.is_some_and(|t| ct_eq(t, body));
+                    let ok = op == Op::Auth as u8 && ct_eq(token, body);
                     if ok {
                         authed = true;
                         reader.set_max_frame(MAX_FRAME);
@@ -234,7 +235,7 @@ pub fn dispatch(op: u8, body: &[u8], cache: &Cache, out: &mut FrameWriter) {
             out.put_slice(&(keys.len() as u32).to_le_bytes());
             cache.del_many(keys, |found| out.put_slice(&[found as u8]));
         }),
-        // Already authenticated (or no token configured): a no-op.
+        // Already authenticated: a no-op.
         Some(Op::Auth) => {
             out.header(Status::Ok as u8, 0);
             Ok(())
@@ -338,27 +339,50 @@ mod tests {
         assert!(cache.get(b"big").is_none());
     }
 
-    fn server(token: Option<&[u8]>) -> Arc<Server> {
+    fn opts() -> Options {
+        Options {
+            token: b"t".to_vec(),
+        }
+    }
+
+    fn server() -> Arc<Server> {
         let cache = Arc::new(Cache::new(1 << 20, 1));
-        let opts = Options {
-            token: token.map(<[u8]>::to_vec),
-        };
-        Arc::new(Server::bind_with("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap())
+        Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts()).unwrap())
     }
 
     #[test]
     fn bind_failure_is_reported() {
-        let first = server(None);
+        let first = server();
         let cache = Arc::new(Cache::new(1 << 20, 1));
-        let err = Server::bind(first.local_addr(), cache)
+        let err = Server::bind(first.local_addr(), cache.clone(), opts())
             .err()
             .expect("port in use");
         assert!(matches!(err, Error::Bind { addr, .. } if addr == first.local_addr()));
+        let err = Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            cache,
+            Options { token: Vec::new() },
+        )
+        .err()
+        .expect("empty token");
+        assert!(matches!(err, Error::EmptyToken), "{err}");
+    }
+
+    /// Authenticate `c` with the test token, as every client must.
+    async fn auth(c: &mut TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        c.write_all(&wire::encode_header(Op::Auth as u8, 1))
+            .await
+            .unwrap();
+        c.write_all(b"t").await.unwrap();
+        let mut hdr = [0u8; wire::HEADER_LEN];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(wire::decode_header(&hdr).0, Status::Ok as u8);
     }
 
     #[tokio::test]
     async fn shutdown_drains_open_connections() {
-        let s = server(None);
+        let s = server();
         let addr = s.local_addr();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let run = tokio::spawn(async move {
@@ -382,10 +406,11 @@ mod tests {
     #[tokio::test]
     async fn oversized_frame_is_refused() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let s = server(None);
+        let s = server();
         let addr = s.local_addr();
         tokio::spawn(async move { s.run().await });
         let mut c = TcpStream::connect(addr).await.unwrap();
+        auth(&mut c).await;
         c.write_all(&wire::encode_header(Op::Get as u8, MAX_FRAME + 1))
             .await
             .unwrap();
@@ -399,7 +424,7 @@ mod tests {
 
     #[tokio::test]
     async fn reset_connection_is_reported_not_fatal() {
-        let s = server(None);
+        let s = server();
         let addr = s.local_addr();
         let srv = s.clone();
         tokio::spawn(async move { srv.run().await });
@@ -414,6 +439,7 @@ mod tests {
         let (st, _) = call(&s.cache, Op::Get as u8, wire::encode_keys([&b"k"[..]]));
         assert_eq!(st, Status::Ok);
         let mut c = TcpStream::connect(addr).await.unwrap();
+        auth(&mut c).await;
         tokio::io::AsyncWriteExt::write_all(&mut c, &wire::encode_header(Op::Get as u8, 0))
             .await
             .unwrap();

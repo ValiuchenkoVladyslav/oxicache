@@ -56,6 +56,9 @@ fn plain(s: &str) -> String {
 #[allow(clippy::zombie_processes)]
 fn start(args: &[&str], env: &[(&str, &str)]) -> Running {
     let mut full = vec!["--addr", "127.0.0.1:0"];
+    if !args.contains(&"--token") {
+        full.extend_from_slice(&["--token", "t"]);
+    }
     full.extend_from_slice(args);
     let mut child = cmd(&full, env).spawn().unwrap();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -124,9 +127,21 @@ impl Running {
     }
 }
 
-fn get(addr: SocketAddr, key: &[u8]) -> (TcpStream, Status, Vec<u8>) {
+/// AUTH with `token`, then GET `key`, on a fresh connection.
+fn get_as(addr: SocketAddr, token: &[u8], key: &[u8]) -> (TcpStream, Status, Vec<u8>) {
     let mut s = TcpStream::connect(addr).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(&wire::encode_header(Op::Auth as u8, token.len()))
+        .unwrap();
+    s.write_all(token).unwrap();
+    let mut hdr = [0u8; wire::HEADER_LEN];
+    s.read_exact(&mut hdr).unwrap();
+    let (status, len) = wire::decode_header(&hdr);
+    if status != Status::Ok as u8 {
+        let mut out = vec![0u8; len];
+        s.read_exact(&mut out).unwrap();
+        return (s, Status::from_u8(status).unwrap(), out);
+    }
     let body = wire::encode_keys([key]);
     s.write_all(&wire::encode_header(Op::Get as u8, body.len()))
         .unwrap();
@@ -137,6 +152,10 @@ fn get(addr: SocketAddr, key: &[u8]) -> (TcpStream, Status, Vec<u8>) {
     let mut out = vec![0u8; len];
     s.read_exact(&mut out).unwrap();
     (s, Status::from_u8(status).unwrap(), out)
+}
+
+fn get(addr: SocketAddr, key: &[u8]) -> (TcpStream, Status, Vec<u8>) {
+    get_as(addr, b"t", key)
 }
 
 #[test]
@@ -160,7 +179,19 @@ fn capacity_suffixes_and_defaults() {
         let r = start(&["--capacity", cap], &[]);
         let (ok, log) = r.interrupt();
         assert!(ok, "{log}");
-        assert!(log.contains("auth=false"), "{log}");
+    }
+}
+
+#[test]
+fn token_is_required_and_non_empty() {
+    for args in [
+        &["--capacity", "1M"][..],
+        &["--capacity", "1M", "--token", ""],
+    ] {
+        let out = cmd(args, &[]).output().unwrap();
+        assert!(!out.status.success());
+        let err = plain(&String::from_utf8_lossy(&out.stderr));
+        assert!(err.contains("token"), "{err}");
     }
 }
 
@@ -185,21 +216,19 @@ fn token_and_env_overrides() {
             ("OXICACHE_TOKEN", "other"),
         ],
     );
-    let (_conn, status, _) = get(r.addr, b"k");
-    assert_eq!(status, Status::Unauthorized);
-    let (ok, log) = r.interrupt();
-    assert!(ok, "{log}");
-    assert!(log.contains("auth=true"), "{log}");
-    for flag in ["--addr=", "--capacity=", "--shards=", "--token overrides"] {
-        assert!(log.contains(flag), "{flag}: {log}");
-    }
-    // An empty token disables authentication.
-    let r = start(&["--capacity", "1M", "--token", ""], &[]);
-    let (_conn, status, _) = get(r.addr, b"k");
+    let (_conn, status, _) = get_as(r.addr, b"other", b"k");
+    assert_eq!(
+        status,
+        Status::Unauthorized,
+        "the flag wins over the variable"
+    );
+    let (_conn, status, _) = get_as(r.addr, b"s3cret", b"k");
     assert_eq!(status, Status::Ok);
     let (ok, log) = r.interrupt();
     assert!(ok, "{log}");
-    assert!(log.contains("auth=false"), "{log}");
+    for flag in ["--addr=", "--capacity=", "--shards=", "--token overrides"] {
+        assert!(log.contains(flag), "{flag}: {log}");
+    }
 }
 
 /// One HTTP/1.1 request; returns the status code and body.
@@ -286,6 +315,8 @@ fn http_bind_failure_is_fatal() {
         &[
             "--addr",
             "127.0.0.1:0",
+            "--token",
+            "t",
             "--capacity",
             "1M",
             "--http-addr",

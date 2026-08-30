@@ -25,10 +25,17 @@ struct Args {
     /// Number of independent cache shards (default: available CPUs).
     #[arg(long, env = "OXICACHE_SHARDS")]
     shards: Option<usize>,
-    /// Shared secret clients must present once per connection (AUTH frame).
-    /// Unset or empty disables authentication.
-    #[arg(long, env = "OXICACHE_TOKEN", hide_env_values = true)]
-    token: Option<String>,
+    /// Shared secret every client must present (AUTH frame on TCP, Bearer
+    /// header on HTTP). Required and non-empty.
+    #[arg(long, env = "OXICACHE_TOKEN", hide_env_values = true, value_parser = parse_token)]
+    token: String,
+}
+
+fn parse_token(s: &str) -> Result<String> {
+    if s.is_empty() {
+        return Err("the token must not be empty".into());
+    }
+    Ok(s.to_string())
 }
 
 fn parse_size(s: &str) -> Result<usize> {
@@ -86,7 +93,7 @@ async fn main() -> Result<()> {
     warn_if_overridden(
         "token",
         "OXICACHE_TOKEN",
-        args.token.as_ref(),
+        Some(&args.token),
         |s| Some(s.to_string()),
         false,
     );
@@ -95,20 +102,19 @@ async fn main() -> Result<()> {
         .shards
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let cache = Arc::new(Cache::new(args.capacity, shards));
-    let token = args.token.filter(|t| !t.is_empty()).map(String::into_bytes);
-    let auth = token.is_some();
-    let opts = Options { token };
-    let server = Server::bind_with(args.addr, cache.clone(), opts.clone())?;
+    let opts = Options {
+        token: args.token.into_bytes(),
+    };
+    let server = Server::bind(args.addr, cache.clone(), opts.clone())?;
     let http = args
         .http_addr
-        .map(|a| HttpServer::bind_with(a, cache, opts))
+        .map(|a| HttpServer::bind(a, cache, opts))
         .transpose()?;
     info!(
         addr = %server.local_addr(),
         http = http.as_ref().map(|h| h.local_addr().to_string()),
         capacity = args.capacity,
         shards,
-        auth,
         "cache ready"
     );
 

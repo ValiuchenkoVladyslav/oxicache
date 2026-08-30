@@ -77,9 +77,13 @@ export interface TestServer {
   stop(): void;
 }
 
-/** Start a server on random loopback ports (TCP and HTTP) and wait until it is listening. */
+/**
+ * Start a server on random loopback ports (TCP and HTTP) and wait until it is
+ * listening. The token is `any` unless `args` set one.
+ */
 export async function startServer(args: string[] = []): Promise<TestServer> {
   await build();
+  const token = args.includes("--token") ? [] : ["--token", "any"];
   const port = freePort();
   const httpPort = freePort();
   const proc = Bun.spawn(
@@ -93,6 +97,7 @@ export async function startServer(args: string[] = []): Promise<TestServer> {
       "64M",
       "--shards",
       "2",
+      ...token,
       ...args,
     ],
     { cwd: root, stdout: "ignore", stderr: "ignore" },

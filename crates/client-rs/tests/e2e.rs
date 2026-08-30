@@ -7,10 +7,13 @@ use oxicache_wire::Status;
 
 async fn start() -> (Arc<Server>, Client<Raw>) {
     let cache = Arc::new(Cache::new(64 << 20, 4));
-    let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache).unwrap());
+    let opts = Options {
+        token: b"t".to_vec(),
+    };
+    let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
-    let client = Client::connect(server.local_addr(), Raw, "any")
+    let client = Client::connect(server.local_addr(), Raw, "t")
         .await
         .unwrap();
     (server, client)
@@ -86,10 +89,19 @@ async fn bad_frame_reports_status() {
     let mut raw = tokio::net::TcpStream::connect(server.local_addr())
         .await
         .unwrap();
+    raw.write_all(&oxicache_wire::encode_header(
+        oxicache_wire::Op::Auth as u8,
+        1,
+    ))
+    .await
+    .unwrap();
+    raw.write_all(b"t").await.unwrap();
+    let mut hdr = [0u8; 5];
+    raw.read_exact(&mut hdr).await.unwrap();
+    assert_eq!(oxicache_wire::decode_header(&hdr).0, Status::Ok as u8);
     raw.write_all(&oxicache_wire::encode_header(42, 0))
         .await
         .unwrap();
-    let mut hdr = [0u8; 5];
     raw.read_exact(&mut hdr).await.unwrap();
     assert_eq!(
         oxicache_wire::decode_header(&hdr).0,
@@ -101,9 +113,9 @@ async fn bad_frame_reports_status() {
 async fn token_auth() {
     let cache = Arc::new(Cache::new(64 << 20, 1));
     let opts = Options {
-        token: Some(b"s3cret".to_vec()),
+        token: b"s3cret".to_vec(),
     };
-    let server = Arc::new(Server::bind_with("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
+    let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
     let addr = server.local_addr();

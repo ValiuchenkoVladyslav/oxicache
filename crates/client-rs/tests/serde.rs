@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use oxicache_client::{BoxError, Client, Error, Format, Raw};
-use oxicache_server::{Cache, Server};
+use oxicache_server::{Cache, Options, Server};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -24,7 +24,10 @@ impl Format for Json {
 
 async fn start() -> (Arc<Server>, Client<Json>) {
     let cache = Arc::new(Cache::new(64 << 20, 2));
-    let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache).unwrap());
+    let opts = Options {
+        token: b"t".to_vec(),
+    };
+    let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
     let client = Client::connect(server.local_addr(), Json, "t")

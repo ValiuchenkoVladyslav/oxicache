@@ -13,7 +13,7 @@
 //! 413 too large   (the body is a UTF-8 message, as on TCP)
 //! ```
 //!
-//! With a token configured, every request except `/health` must carry
+//! Every request except `/health` must carry
 //! `Authorization: Bearer <token>`. HTTP/1.1 only, keep-alive on; there is
 //! no CORS handling.
 
@@ -47,22 +47,19 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 pub struct HttpServer {
     listener: std::net::TcpListener,
     cache: Arc<Cache>,
-    token: Option<Arc<[u8]>>,
+    token: Arc<[u8]>,
 }
 
 impl HttpServer {
-    /// Bind `addr` serving `cache`, without authentication.
-    pub fn bind(addr: SocketAddr, cache: Arc<Cache>) -> Result<Self> {
-        Self::bind_with(addr, cache, Options::default())
-    }
-
-    /// Bind with explicit [`Options`].
-    pub fn bind_with(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
+    /// Bind `addr` serving `cache`; every request except `/health` must
+    /// carry `opts.token`.
+    pub fn bind(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
+        let token = tcp::token(opts)?;
         let listener = tcp::listener(addr).map_err(|source| Error::Bind { addr, source })?;
         Ok(Self {
             listener,
             cache,
-            token: opts.token.map(Arc::from),
+            token,
         })
     }
 
@@ -102,7 +99,7 @@ impl HttpServer {
 async fn accept_loop(
     listener: std::net::TcpListener,
     cache: Arc<Cache>,
-    token: Option<Arc<[u8]>>,
+    token: Arc<[u8]>,
     stop: watch::Receiver<bool>,
     conns: &mut JoinSet<()>,
 ) {
@@ -117,7 +114,7 @@ async fn accept_loop(
                     let _ = stream.set_nodelay(true);
                     let svc = service_fn(move |req| {
                         let (cache, token) = (cache.clone(), token.clone());
-                        async move { Ok::<_, hyper::Error>(handle(req, &cache, token.as_deref()).await) }
+                        async move { Ok::<_, hyper::Error>(handle(req, &cache, &token).await) }
                     });
                     let conn = http1::Builder::new().serve_connection(TokioIo::new(stream), svc);
                     tokio::pin!(conn);
@@ -166,11 +163,7 @@ fn authorized(req: &Request<Incoming>, token: &[u8]) -> bool {
         .is_some_and(|t| tcp::ct_eq(token, t))
 }
 
-async fn handle(
-    req: Request<Incoming>,
-    cache: &Cache,
-    token: Option<&[u8]>,
-) -> Response<Full<Bytes>> {
+async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response<Full<Bytes>> {
     let op = match req.uri().path() {
         // Status code only, no body: a probe target.
         "/health" => return reply(StatusCode::OK, Bytes::new(), false),
@@ -182,9 +175,7 @@ async fn handle(
     if req.method() != Method::POST {
         return text(StatusCode::METHOD_NOT_ALLOWED, "use POST");
     }
-    if let Some(t) = token
-        && !authorized(&req, t)
-    {
+    if !authorized(&req, token) {
         return text(StatusCode::UNAUTHORIZED, "auth required");
     }
     // Refuse by the announced length before reading anything, and by the
@@ -229,13 +220,18 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    fn server(token: Option<&[u8]>) -> Arc<HttpServer> {
-        let cache = Arc::new(Cache::new(1 << 20, 1));
-        let opts = Options {
-            token: token.map(<[u8]>::to_vec),
-        };
-        Arc::new(HttpServer::bind_with("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap())
+    fn opts() -> Options {
+        Options {
+            token: b"s3cret".to_vec(),
+        }
     }
+
+    fn server() -> Arc<HttpServer> {
+        let cache = Arc::new(Cache::new(1 << 20, 1));
+        Arc::new(HttpServer::bind("127.0.0.1:0".parse().unwrap(), cache, opts()).unwrap())
+    }
+
+    const AUTH: [(&str, &str); 1] = [("Authorization", "Bearer s3cret")];
 
     /// Minimal HTTP/1.1 client: one request on `c`, returns status and body.
     async fn call(
@@ -292,34 +288,34 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_on_one_keepalive_connection() {
-        let s = server(None);
+        let s = server();
         let mut c = connect(&s).await;
         let (st, body) = call(&mut c, "GET", "/health", &[], b"").await;
         assert_eq!((st, body.len()), (200, 0));
         let entries = wire::encode_entries([(&b"k"[..], &b"v"[..])]);
-        let (st, body) = call(&mut c, "POST", "/set", &[], &entries).await;
+        let (st, body) = call(&mut c, "POST", "/set", &AUTH, &entries).await;
         assert_eq!((st, body.len()), (200, 0));
         let keys = wire::encode_keys([&b"k"[..], &b"x"[..]]);
-        let (st, body) = call(&mut c, "POST", "/get", &[], &keys).await;
+        let (st, body) = call(&mut c, "POST", "/get", &AUTH, &keys).await;
         assert_eq!(st, 200);
         assert_eq!(
             wire::decode_values(body.into()).unwrap(),
             vec![Some(Bytes::from_static(b"v")), None]
         );
-        let (st, body) = call(&mut c, "POST", "/del", &[], &keys).await;
+        let (st, body) = call(&mut c, "POST", "/del", &AUTH, &keys).await;
         assert_eq!(st, 200);
         assert_eq!(wire::decode_flags(body.into()).unwrap(), vec![true, false]);
     }
 
     #[tokio::test]
     async fn errors_map_to_http_statuses() {
-        let s = server(None);
+        let s = server();
         let mut c = connect(&s).await;
         let (st, body) = call(&mut c, "POST", "/nope", &[], b"").await;
         assert_eq!(st, 404);
         assert_eq!(body, b"unknown path /nope");
         assert_eq!(call(&mut c, "GET", "/get", &[], b"").await.0, 405);
-        let (st, body) = call(&mut c, "POST", "/get", &[], &[9, 0]).await;
+        let (st, body) = call(&mut c, "POST", "/get", &AUTH, &[9, 0]).await;
         assert_eq!(st, 400);
         assert!(
             std::str::from_utf8(&body)
@@ -328,7 +324,7 @@ mod tests {
         );
         // Announced length over the limit: refused without reading the body.
         let mut req = format!(
-            "POST /get HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            "POST /get HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nContent-Length: {}\r\n\r\n",
             MAX_FRAME + 1
         );
         req.push_str("");
@@ -341,14 +337,16 @@ mod tests {
         let mut c = TcpStream::connect(s.local_addr()).await.unwrap();
         let big = vec![0u8; 2 << 20];
         let entries = wire::encode_entries([(&b"big"[..], &big[..])]);
-        assert_eq!(call(&mut c, "POST", "/set", &[], &entries).await.0, 413);
+        assert_eq!(call(&mut c, "POST", "/set", &AUTH, &entries).await.0, 413);
     }
 
     #[tokio::test]
     async fn chunked_body_over_the_limit_is_refused() {
-        let s = server(None);
+        let s = server();
         let mut c = connect(&s).await;
-        c.write_all(b"POST /get HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+        c.write_all(
+            b"POST /get HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )
             .await
             .unwrap();
         let chunk = vec![b'a'; 1 << 20];
@@ -384,7 +382,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_token_is_required_except_for_health() {
-        let s = server(Some(b"s3cret"));
+        let s = server();
         let mut c = connect(&s).await;
         assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 200);
         let keys = wire::encode_keys([&b"k"[..]]);
@@ -409,17 +407,25 @@ mod tests {
 
     #[test]
     fn bind_failure_is_reported() {
-        let first = server(None);
+        let first = server();
         let cache = Arc::new(Cache::new(1 << 20, 1));
-        let err = HttpServer::bind(first.local_addr(), cache)
+        let err = HttpServer::bind(first.local_addr(), cache.clone(), opts())
             .err()
             .expect("port in use");
         assert!(matches!(err, Error::Bind { addr, .. } if addr == first.local_addr()));
+        let err = HttpServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            cache,
+            Options { token: Vec::new() },
+        )
+        .err()
+        .expect("empty token");
+        assert!(matches!(err, Error::EmptyToken));
     }
 
     #[tokio::test]
     async fn shutdown_closes_idle_keepalive_connections() {
-        let s = server(None);
+        let s = server();
         let addr = s.local_addr();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let run = tokio::spawn(async move {
@@ -442,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn broken_request_is_reported_not_fatal() {
-        let s = server(None);
+        let s = server();
         let mut c = connect(&s).await;
         c.write_all(b"NOT HTTP\r\n\r\n").await.unwrap();
         let mut rest = Vec::new();

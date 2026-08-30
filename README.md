@@ -31,12 +31,12 @@ op 4 AUTH body: token    -> empty
 status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized (body = message)
 ```
 
-If the server is started with a token (`--token` or `OXICACHE_TOKEN`), AUTH must be the
-first request on every connection; anything else gets status 4 and the connection is closed.
-Every client always presents one: the Rust `Client::connect(addr, format, token)` and the TS
-transports (`tcp({ …, token })`, `http({ …, token })`) take it as a required argument, and the
-CLI requires `--token` / `OXICACHE_TOKEN` (it also reads the server address from
-`OXICACHE_ADDR`). A server started without a token accepts any. The token travels in clear text — pair it with a private network or a TLS
+The server requires a non-empty token (`--token` or `OXICACHE_TOKEN`); AUTH must be the
+first request on every connection, and anything else gets status 4 and the connection is
+closed. There is no unauthenticated mode on either side: the Rust
+`Client::connect(addr, format, token)` and the TS transports (`tcp({ …, token })`,
+`http({ …, token })`) take the token as a required argument, and the CLI requires `--token` /
+`OXICACHE_TOKEN` (it also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
 tunnel.
 
 ### HTTP
@@ -53,18 +53,17 @@ GET  /health                -> 200, no body; never needs a token
 400 bad request | 401 unauthorized | 404 unknown path | 405 wrong method | 413 too large
 ```
 
-With a token, every request except `/health` carries `Authorization: Bearer <token>`; a refused
-request gets a 401 and its body is never read, so the connection closes. Both listeners serve one
+Every request except `/health` carries `Authorization: Bearer <token>`; a refused request gets
+a 401 and its body is never read, so the connection closes. Both listeners serve one
 cache, so a value written over TCP is readable over HTTP. Keep-alive is on; there is no TLS and
 no CORS handling — put a reverse proxy in front for either.
 
 ## Run
 
 ```sh
-cargo run --release -p oxicache-server -- --addr 0.0.0.0:4433 --http-addr 0.0.0.0:4434 --capacity 1G
+cargo run --release -p oxicache-server -- --addr 0.0.0.0:4433 --http-addr 0.0.0.0:4434 --capacity 1G --token s3cret
 # --shards N      independent S3-FIFO shards (default: CPUs)
-# --token T       require AUTH with this secret (or OXICACHE_TOKEN in the environment);
-#                 clients always send one, so set it
+# --token T       the shared secret (or OXICACHE_TOKEN in the environment); required
 # --http-addr A   also serve the HTTP API on A (off unless given)
 # every server flag has an environment variable: OXICACHE_ADDR, OXICACHE_HTTP_ADDR,
 # OXICACHE_CAPACITY, OXICACHE_SHARDS, OXICACHE_TOKEN; a flag wins over a differing
