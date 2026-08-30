@@ -33,8 +33,10 @@ status    := 0 ok | 1 bad request | 2 unknown op | 3 too large | 4 unauthorized 
 ```
 
 The server requires a non-empty token (`OXICACHE_TOKEN`); AUTH must be the
-first request on every connection, and anything else gets status 4 and the connection is
-closed. There is no unauthenticated mode on either side: the Rust
+first request on every connection, and anything else (PING included) gets status 4 and the
+connection is closed. A TCP connection that has not authenticated within 30 s of being
+accepted is dropped; that cap is fixed, not a setting. There is no unauthenticated mode on
+either side: the Rust
 `Client::connect(addr, format, token)` and the TS transports (`tcp({ …, token })`,
 `http({ …, token })`) take the token as a required argument, and the CLI requires `--token` /
 `OXICACHE_TOKEN` (it also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
@@ -60,8 +62,9 @@ GET  /health                -> 200, no body; never needs a token
 400 bad request | 401 unauthorized | 404 unknown path | 405 wrong method | 413 too large
 ```
 
-Every request except `/health` carries `Authorization: Bearer <token>`; a refused request gets
-a 401 and its body is never read, so the connection closes. Both listeners serve one
+Every request except `/health` carries `Authorization: Bearer <token>`. Every response sent
+before the token has been verified — `/health`, 401, 404, 405 — carries `Connection: close`,
+so no connection stays open without the token. Both listeners serve one
 cache, so a value written over TCP is readable over HTTP. Keep-alive is on; there is no TLS and
 no CORS handling — put a reverse proxy in front for either.
 

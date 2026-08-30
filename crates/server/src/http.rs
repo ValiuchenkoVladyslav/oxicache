@@ -177,6 +177,16 @@ fn text(code: StatusCode, msg: impl Into<Bytes>) -> Response<Full<Bytes>> {
     reply(code, msg.into(), false)
 }
 
+/// Every response sent before the token has been verified closes the
+/// connection: an unauthenticated peer never gets to keep one alive.
+fn closing(mut res: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+    res.headers_mut().insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("close"),
+    );
+    res
+}
+
 fn authorized(req: &Request<Incoming>, token: &[u8]) -> bool {
     req.headers()
         .get(header::AUTHORIZATION)
@@ -187,18 +197,18 @@ fn authorized(req: &Request<Incoming>, token: &[u8]) -> bool {
 async fn handle(req: Request<Incoming>, cache: &Cache, token: &[u8]) -> Response<Full<Bytes>> {
     let op = match req.uri().path() {
         // Status code only, no body: a probe target.
-        "/health" => return reply(StatusCode::OK, Bytes::new(), false),
+        "/health" => return closing(reply(StatusCode::OK, Bytes::new(), false)),
         "/get" => Op::Get,
         "/set" => Op::Set,
         "/del" => Op::Del,
         "/ping" => Op::Ping,
-        p => return text(StatusCode::NOT_FOUND, format!("unknown path {p}")),
+        p => return closing(text(StatusCode::NOT_FOUND, format!("unknown path {p}"))),
     };
     if req.method() != Method::POST {
-        return text(StatusCode::METHOD_NOT_ALLOWED, "use POST");
+        return closing(text(StatusCode::METHOD_NOT_ALLOWED, "use POST"));
     }
     if !authorized(&req, token) {
-        return text(StatusCode::UNAUTHORIZED, "auth required");
+        return closing(text(StatusCode::UNAUTHORIZED, "auth required"));
     }
     // Refuse by the announced length before reading anything, and by the
     // actual length while reading, so an unannounced (chunked) body is
@@ -321,6 +331,8 @@ mod tests {
         let mut c = connect(&s).await;
         let (st, body) = call(&mut c, "GET", "/health", &[], b"").await;
         assert_eq!((st, body.len()), (200, 0));
+        // `/health` closed that one; the token keeps the next one open.
+        let mut c = connect(&s).await;
         let entries = wire::encode_entries([(&b"k"[..], &b"v"[..])]);
         let (st, body) = call(&mut c, "POST", "/set", &AUTH, &entries).await;
         assert_eq!((st, body.len()), (200, 0));
@@ -343,7 +355,9 @@ mod tests {
         let (st, body) = call(&mut c, "POST", "/nope", &[], b"").await;
         assert_eq!(st, 404);
         assert_eq!(body, b"unknown path /nope");
+        let mut c = connect(&s).await;
         assert_eq!(call(&mut c, "GET", "/get", &[], b"").await.0, 405);
+        let mut c = connect(&s).await;
         let (st, body) = call(&mut c, "POST", "/get", &AUTH, &[9, 0]).await;
         assert_eq!(st, 400);
         assert!(
@@ -426,8 +440,9 @@ mod tests {
         let mut c = connect(&s).await;
         assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 200);
         let keys = wire::encode_keys([&b"k"[..]]);
-        // A refused request's body is never read, so hyper closes the
-        // connection after the 401; each attempt gets a fresh one.
+        // Every response before the token is verified closes the
+        // connection, so each attempt gets a fresh one.
+        let mut c = connect(&s).await;
         let (st, body) = call(&mut c, "POST", "/get", &[], &keys).await;
         assert_eq!((st, &body[..]), (401, &b"auth required"[..]));
         for auth in ["Bearer s3cre", "Basic s3cret", "bearer s3cret"] {
@@ -485,11 +500,47 @@ mod tests {
         assert!(rest.is_empty());
     }
 
+    /// No keep-alive without the token: `/health`, an unknown path, a
+    /// wrong method and a refused request all end the connection at once,
+    /// even with a body that hyper had already read and no idle timeout.
+    #[tokio::test]
+    async fn responses_before_auth_close_the_connection() {
+        let s = server_with(opts().idle_timeout(None));
+        let keys = wire::encode_keys([&b"k"[..]]);
+        for (method, path, headers, body, code) in [
+            ("GET", "/health", &[][..], &b""[..], 200),
+            ("POST", "/nope", &[], &b""[..], 404),
+            ("GET", "/get", &[], &b""[..], 405),
+            ("POST", "/get", &[], &b""[..], 401),
+            (
+                "POST",
+                "/ping",
+                &[("Authorization", "Bearer wrong")],
+                &keys[..],
+                401,
+            ),
+        ] {
+            let mut c = connect(&s).await;
+            assert_eq!(call(&mut c, method, path, headers, body).await.0, code);
+            let mut rest = Vec::new();
+            tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut rest))
+                .await
+                .expect("closed by the server")
+                .unwrap();
+            assert!(rest.is_empty(), "{method} {path}");
+        }
+        // With the token the connection stays open across requests.
+        let mut c = connect(&s).await;
+        let right = [("Authorization", "Bearer s3cret")];
+        assert_eq!(call(&mut c, "POST", "/ping", &right, b"").await.0, 200);
+        assert_eq!(call(&mut c, "POST", "/ping", &right, b"").await.0, 200);
+    }
+
     #[tokio::test]
     async fn idle_keepalive_connection_is_closed_after_the_timeout() {
         let s = server_with(opts().idle_timeout(Some(Duration::from_millis(200))));
         let mut c = connect(&s).await;
-        assert_eq!(call(&mut c, "GET", "/health", &[], b"").await.0, 200);
+        assert_eq!(call(&mut c, "POST", "/ping", &AUTH, b"").await.0, 200);
         let start = std::time::Instant::now();
         let mut rest = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut rest))

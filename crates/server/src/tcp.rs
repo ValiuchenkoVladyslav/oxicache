@@ -19,6 +19,7 @@ use oxicache_wire::{self as wire, Op, Status};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::cache::{Cache, Entry};
@@ -35,6 +36,11 @@ pub const MAX_AUTH_FRAME: usize = 4 << 10;
 pub const MAX_RESPONSE: usize = wire::MAX_FRAME;
 /// How long in-flight connections get to finish their current batch at shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Hard cap from accept to a successful AUTH, on both front ends. It is not
+/// configurable: an unauthenticated peer gets no say in how long it may sit
+/// on a connection slot, and the idle timeout (which it could keep resetting
+/// with partial input) does not apply until it has authenticated.
+pub const AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 /// Pause after a failed `accept`, so fd exhaustion does not spin a worker.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
@@ -316,6 +322,7 @@ async fn serve_connection(
     stream.set_nodelay(true)?;
     let (mut r, mut w) = stream.into_split();
     let mut authed = false;
+    let auth_deadline = Instant::now() + AUTH_TIMEOUT;
     let mut reader = FrameReader::new(MAX_AUTH_FRAME);
     let mut out = FrameWriter::new();
     loop {
@@ -346,14 +353,20 @@ async fn serve_connection(
                 }
             }
         }
-        // The flush is under the same clock: a peer that stops reading would
-        // otherwise park this task (and its connection slot) forever.
-        let Some(()) = within(idle, out.flush(&mut w)).await? else {
+        // Until AUTH the deadline is fixed; after it the idle clock restarts
+        // at every wait, so a peer only has to move something within each
+        // `idle` window, not finish a request. The flush is under the same
+        // clock: a peer that stops reading would otherwise park this task
+        // (and its connection slot) forever.
+        let deadline = if authed {
+            idle.map(|d| Instant::now() + d)
+        } else {
+            Some(auth_deadline)
+        };
+        let Some(()) = by(deadline, out.flush(&mut w)).await? else {
             return Ok(true);
         };
-        // The clock restarts at every wait, so a peer only has to move
-        // something within each `idle` window, not finish a request.
-        let Some(filled) = within(idle, reader.fill(&mut r)).await? else {
+        let Some(filled) = by(deadline, reader.fill(&mut r)).await? else {
             return Ok(true);
         };
         if !filled {
@@ -362,13 +375,13 @@ async fn serve_connection(
     }
 }
 
-/// Run `fut` with the idle deadline, if there is one; `None` means it hit it.
-async fn within<T>(
-    idle: Option<Duration>,
+/// Run `fut` until `deadline`, if there is one; `None` means it hit it.
+async fn by<T>(
+    deadline: Option<Instant>,
     fut: impl Future<Output = std::io::Result<T>>,
 ) -> std::io::Result<Option<T>> {
-    match idle {
-        Some(d) => match tokio::time::timeout(d, fut).await {
+    match deadline {
+        Some(at) => match tokio::time::timeout_at(at, fut).await {
             Ok(res) => res.map(Some),
             Err(_) => Ok(None),
         },
@@ -747,6 +760,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(wire::decode_header(&hdr).0, Status::BadRequest as u8);
+    }
+
+    /// The cap is fixed from accept; trickling bytes does not extend it,
+    /// and no idle timeout (here: none at all) softens it.
+    #[tokio::test(start_paused = true)]
+    async fn unauthenticated_connection_is_cut_at_the_hard_cap() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let s = server_with(opts().idle_timeout(None));
+        let addr = s.local_addr();
+        tokio::spawn(async move { s.run().await });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        // Half an AUTH header, then silence: never a complete frame.
+        c.write_all(&[Op::Auth as u8, 1]).await.unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(AUTH_TIMEOUT * 2, c.read_to_end(&mut rest))
+            .await
+            .expect("closed by the server")
+            .unwrap();
+        assert!(rest.is_empty(), "no reply to an incomplete frame");
+        assert!(start.elapsed() >= AUTH_TIMEOUT, "cut early");
     }
 
     #[tokio::test]
