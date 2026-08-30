@@ -23,7 +23,6 @@ fn cmd(args: &[&str], env: &[(&str, &str)]) -> Command {
         .env_remove("OXICACHE_TCP_ADDR")
         .env_remove("OXICACHE_HTTP_ADDR")
         .env_remove("OXICACHE_CAPACITY")
-        .env_remove("OXICACHE_SHARDS")
         .env_remove("OXICACHE_TOKEN")
         .env_remove("OXICACHE_IDLE_TIMEOUT")
         .env_remove("OXICACHE_MAX_CONNS")
@@ -167,7 +166,7 @@ fn get(addr: SocketAddr, key: &[u8]) -> (TcpStream, Status, Vec<u8>) {
 
 #[test]
 fn serves_and_shuts_down_cleanly() {
-    let r = start(&[("OXICACHE_CAPACITY", "1M"), ("OXICACHE_SHARDS", "1")]);
+    let r = start(&[("OXICACHE_CAPACITY", "1M")]);
     let (conn, status, body) = get(r.addr, b"missing");
     assert_eq!(status, Status::Ok);
     assert_eq!(wire::decode_values(body.into()).unwrap(), vec![None]);
@@ -182,7 +181,7 @@ fn serves_and_shuts_down_cleanly() {
 
 #[test]
 fn sigterm_drains_and_exits_cleanly() {
-    let r = start(&[("OXICACHE_CAPACITY", "1M"), ("OXICACHE_SHARDS", "1")]);
+    let r = start(&[("OXICACHE_CAPACITY", "1M")]);
     let (conn, status, _) = get(r.addr, b"missing");
     assert_eq!(status, Status::Ok);
     let (ok, log) = r.signal("TERM");
@@ -272,8 +271,6 @@ fn rejects_bad_values_naming_the_variable() {
     for (var, bad) in [
         ("OXICACHE_TCP_ADDR", "nowhere"),
         ("OXICACHE_HTTP_ADDR", "nowhere"),
-        ("OXICACHE_SHARDS", "0"),
-        ("OXICACHE_SHARDS", "many"),
         ("OXICACHE_IDLE_TIMEOUT", "0"),
         ("OXICACHE_IDLE_TIMEOUT", "1.5"),
         ("OXICACHE_MAX_CONNS", "0"),
@@ -313,7 +310,6 @@ fn http(
 fn http_front_end_serves_alongside_tcp() {
     let mut r = start(&[
         ("OXICACHE_CAPACITY", "1M"),
-        ("OXICACHE_SHARDS", "1"),
         ("OXICACHE_HTTP_ADDR", "127.0.0.1:0"),
         ("OXICACHE_TOKEN", "t0k"),
     ]);

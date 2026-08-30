@@ -82,7 +82,6 @@ OXICACHE_TOKEN=s3cret OXICACHE_HTTP_ADDR=0.0.0.0:4434 OXICACHE_CAPACITY=1G cargo
 | `OXICACHE_TCP_ADDR` | `0.0.0.0:4433` | address the TCP front end listens on |
 | `OXICACHE_HTTP_ADDR` | unset (HTTP off) | also serve the HTTP API on this address |
 | `OXICACHE_CAPACITY` | `1G` | memory budget for cached entries; `K`/`M`/`G` suffixes |
-| `OXICACHE_SHARDS` | available CPUs | independent S3-FIFO shards |
 | `OXICACHE_TOKEN` | required | the shared secret; must not be empty |
 | `OXICACHE_IDLE_TIMEOUT` | `300` | close a connection that sends nothing for this many seconds |
 | `OXICACHE_MAX_CONNS` | `10000` | at most this many open connections, TCP and HTTP together; beyond it the listeners stop accepting until one closes |
@@ -267,7 +266,7 @@ The pre-commit hook (`.husky/pre-commit`) runs `cargo fmt --check`, `clippy -D w
   lookup re-checks, so a present key is never invisible. Replaced and
   evicted entries are retired through the epoch collector and reclaimed after every write
   batch, so memory stays bounded under sustained writes.
-- Keys hash once (`rapidhash::fast`, randomly seeded); top bits pick one of N S3-FIFO shards (default: CPU count),
+- Keys hash once (`rapidhash::fast`, randomly seeded); top bits pick one of N S3-FIFO shards (one per CPU),
   each a mutex over its small/main/ghost queues, used only by writes and eviction. Reads
   never lock; they bump a relaxed atomic frequency counter capped at 3.
 - Entries are immutable; delete/overwrite marks them dead and they are skipped lazily at

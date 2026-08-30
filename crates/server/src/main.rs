@@ -5,7 +5,6 @@
 //! OXICACHE_TCP_ADDR      address the TCP front end listens on (default 0.0.0.0:4433)
 //! OXICACHE_HTTP_ADDR     address for the HTTP front end, same protocol plus /health (default: off)
 //! OXICACHE_CAPACITY      memory budget for cached entries, e.g. 512M, 4G (default 1G)
-//! OXICACHE_SHARDS        independent cache shards (default: available CPUs)
 //! OXICACHE_TOKEN         shared secret every client must present; required, non-empty
 //! OXICACHE_IDLE_TIMEOUT  close a connection that sends nothing for this many seconds (default 300)
 //! OXICACHE_MAX_CONNS     most open connections, TCP and HTTP together (default 10000)
@@ -35,7 +34,6 @@ struct Config {
     tcp_addr: SocketAddr,
     http_addr: Option<SocketAddr>,
     capacity: NonZeroUsize,
-    shards: NonZeroUsize,
     token: String,
     idle_timeout: NonZeroU64,
     max_conns: NonZeroUsize,
@@ -53,16 +51,6 @@ impl Config {
                 "OXICACHE_CAPACITY",
                 Some(DEFAULT_CAPACITY),
                 Self::parse_size,
-            )?,
-            shards: Self::env(
-                "OXICACHE_SHARDS",
-                // One per CPU, so writers on different cores rarely share a lock.
-                Some(
-                    &std::thread::available_parallelism()
-                        .unwrap_or(NonZeroUsize::MIN)
-                        .to_string(),
-                ),
-                |s| Ok(s.parse()?),
             )?,
             token: Self::env("OXICACHE_TOKEN", None, Self::parse_token)?,
             idle_timeout: Self::env(
@@ -143,7 +131,9 @@ async fn main() -> Result<()> {
 
     let args = Config::from_env()?;
 
-    let cache = Arc::new(Cache::new(args.capacity, args.shards));
+    // One shard per CPU, so writers on different cores rarely share a lock.
+    let shards = std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN);
+    let cache = Arc::new(Cache::new(args.capacity, shards));
     // One `Options` for both listeners, so they share one connection budget.
     let opts = Options::new(args.token)
         .idle_timeout(Some(Duration::from_secs(args.idle_timeout.get())))
@@ -165,7 +155,7 @@ async fn main() -> Result<()> {
         addr = %server.local_addr(),
         http = http.as_ref().map(|h| h.local_addr().to_string()),
         capacity = args.capacity,
-        shards = args.shards,
+        shards,
         idle_timeout = args.idle_timeout,
         max_conns = args.max_conns,
         tls = args.tls_cert.as_ref().map(|p| p.display().to_string()),
