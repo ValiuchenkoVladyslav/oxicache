@@ -9,6 +9,8 @@
 //! OXICACHE_TOKEN         shared secret every client must present; required, non-empty
 //! OXICACHE_IDLE_TIMEOUT  close a connection that sends nothing for this many seconds (default 300)
 //! OXICACHE_MAX_CONNS     most open connections, TCP and HTTP together (default 10000)
+//! OXICACHE_TLS_CERT      PEM file with the certificate chain and private key; set = both
+//!                        listeners speak TLS (default: unset, plain TCP and HTTP)
 //! ```
 //!
 //! A missing token or an unparseable value fails startup like a bind error
@@ -16,6 +18,7 @@
 
 use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +39,7 @@ struct Config {
     token: String,
     idle_timeout: NonZeroU64,
     max_conns: NonZeroUsize,
+    tls_cert: Option<PathBuf>,
 }
 
 impl Config {
@@ -69,6 +73,12 @@ impl Config {
                 Some(&oxicache_server::DEFAULT_MAX_CONNECTIONS.to_string()),
                 |s| Ok(s.parse()?),
             )?,
+            tls_cert: Self::env_opt("OXICACHE_TLS_CERT", |s| {
+                if s.is_empty() {
+                    return Err("must be a path".into());
+                }
+                Ok(PathBuf::from(s))
+            })?,
         })
     }
 
@@ -135,7 +145,14 @@ async fn main() -> Result<()> {
     // One `Options` for both listeners, so they share one connection budget.
     let opts = Options::new(args.token)
         .idle_timeout(Some(Duration::from_secs(args.idle_timeout.get())))
-        .max_connections(Some(args.max_conns));
+        .max_connections(Some(args.max_conns))
+        .tls(
+            args.tls_cert
+                .as_deref()
+                .map(oxicache_server::tls::server_config)
+                .transpose()
+                .map_err(|e| format!("OXICACHE_TLS_CERT: {e}"))?,
+        );
     let server = Server::bind(args.addr, cache.clone(), opts.clone())?;
     let http = args
         .http_addr
@@ -149,6 +166,7 @@ async fn main() -> Result<()> {
         shards = args.shards,
         idle_timeout = args.idle_timeout,
         max_conns = args.max_conns,
+        tls = args.tls_cert.as_ref().map(|p| p.display().to_string()),
         "cache ready"
     );
 

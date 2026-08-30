@@ -36,8 +36,13 @@
 //! or a server that does not speak the protocol is permanent: the client is
 //! dead and every call fails with that error. Status, encoding and decoding
 //! errors are the call's alone; the connection stays.
+//!
+//! A server started with `OXICACHE_TLS_CERT` speaks TLS; connect to it with
+//! [`Client::connect_tls`] and a [`Tls`] naming what to trust and who the
+//! server must be.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
@@ -51,6 +56,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::Instant;
+use tokio_rustls::TlsConnector;
+
+pub use rustls;
+pub use rustls_pki_types::ServerName;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -72,6 +81,13 @@ pub enum Error {
     Deserialize(#[from] rmp_serde::decode::Error),
     #[error("server answered {got} values for {expected} keys")]
     Count { expected: usize, got: usize },
+    #[error("reading {}: {source}", path.display())]
+    Pem {
+        path: std::path::PathBuf,
+        source: rustls_pki_types::pem::Error,
+    },
+    #[error("tls: {0}")]
+    Tls(#[from] rustls::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -86,6 +102,52 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 type Reply = oneshot::Sender<Result<Bytes>>;
 type Request = (Op, Bytes, Reply);
+
+/// How to speak TLS to the server: what its certificate must chain to
+/// and the name (DNS or IP) it must be issued for. Build one with
+/// [`Tls::trusting`] for a private CA, or fill the fields with any
+/// [`rustls::ClientConfig`] (system roots, client certificates, …).
+#[derive(Clone)]
+pub struct Tls {
+    pub server_name: ServerName<'static>,
+    pub config: Arc<rustls::ClientConfig>,
+}
+
+impl Tls {
+    /// Trust the CA certificates in the PEM file `ca` and require the
+    /// server's certificate to be issued for `server_name`. TLS 1.3 only,
+    /// like the server.
+    pub fn trusting(ca: &Path, server_name: ServerName<'static>) -> Result<Self> {
+        use rustls_pki_types::CertificateDer;
+        use rustls_pki_types::pem::PemObject;
+        let read = |source| Error::Pem {
+            path: ca.to_path_buf(),
+            source,
+        };
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_file_iter(ca).map_err(read)? {
+            roots.add(cert.map_err(read)?)?;
+        }
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        Ok(Self {
+            server_name,
+            config: Arc::new(config),
+        })
+    }
+}
+
+impl std::fmt::Debug for Tls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tls")
+            .field("server_name", &self.server_name)
+            .finish_non_exhaustive()
+    }
+}
 
 /// A connection to one server, kept alive across losses: cheap to clone,
 /// shared by any number of tasks. See the crate docs for what is retried.
@@ -304,10 +366,13 @@ impl Conn {
     /// Connect and authenticate; the tasks are running when this returns.
     async fn open(
         addr: SocketAddr,
+        tls: Option<&Tls>,
         token: &Bytes,
         keepalive: Duration,
     ) -> std::result::Result<Arc<Self>, Failed> {
-        let conn = Self::connect(addr, keepalive).await.map_err(Failed::of)?;
+        let conn = Self::connect(addr, tls, keepalive)
+            .await
+            .map_err(Failed::of)?;
         match conn.send(Op::Auth, token.clone()).await {
             Ok(_) => Ok(conn),
             // Hung up during AUTH: the reader knows whether the server
@@ -321,10 +386,37 @@ impl Conn {
         }
     }
 
-    async fn connect(addr: SocketAddr, keepalive: Duration) -> Result<Arc<Self>> {
+    /// A failed handshake (refused certificate included) is an I/O error
+    /// like a refused connection: worth another try later, since the server
+    /// may be restarted with a certificate this client trusts.
+    async fn connect(
+        addr: SocketAddr,
+        tls: Option<&Tls>,
+        keepalive: Duration,
+    ) -> Result<Arc<Self>> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
-        let (r, w) = stream.into_split();
+        match tls {
+            None => {
+                let (r, w) = stream.into_split();
+                Ok(Self::spawn(r, w, keepalive))
+            }
+            Some(tls) => {
+                let stream = TlsConnector::from(tls.config.clone())
+                    .connect(tls.server_name.clone(), stream)
+                    .await?;
+                let (r, w) = tokio::io::split(stream);
+                Ok(Self::spawn(r, w, keepalive))
+            }
+        }
+    }
+
+    /// Start the I/O tasks on a connected stream.
+    fn spawn<R, W>(r: R, w: W, keepalive: Duration) -> Arc<Self>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let (tx, rx) = mpsc::channel::<Request>(1024);
         let (pending_tx, pending_rx) = mpsc::unbounded_channel::<Reply>();
         let (stop_tx, stop_rx) = oneshot::channel();
@@ -338,12 +430,12 @@ impl Conn {
             lost.clone(),
         ));
         let reader = tokio::spawn(read_loop(r, pending_rx, stop_tx, lost.clone()));
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             tx,
             lost,
             writer,
             reader,
-        }))
+        })
     }
 
     /// Queue one request and wait for its reply. `Closed` means this
@@ -417,6 +509,7 @@ impl Backoff {
 /// callers that find the link down wait for the one attempt in progress.
 struct Inner {
     addr: SocketAddr,
+    tls: Option<Tls>,
     token: Bytes,
     keepalive: Duration,
     link: RwLock<Link>,
@@ -480,7 +573,7 @@ impl Inner {
             return Err(last.error());
         }
         tokio::time::sleep_until(backoff.not_before).await;
-        let outcome = Conn::open(self.addr, &self.token, self.keepalive).await;
+        let outcome = Conn::open(self.addr, self.tls.as_ref(), &self.token, self.keepalive).await;
         self.attempts.fetch_add(1, Ordering::Release);
         match outcome {
             Ok(conn) => {
@@ -504,27 +597,37 @@ impl Client {
     /// Connect and authenticate with `token` before returning; a wrong
     /// token is an [`Error::Status`] with `Unauthorized`.
     pub async fn connect(addr: SocketAddr, token: impl AsRef<[u8]>) -> Result<Self> {
-        Self::connect_with(addr, token, wire::KEEPALIVE).await
+        Self::connect_with(addr, None, token, wire::KEEPALIVE).await
     }
 
-    /// [`connect`](Self::connect) with a heartbeat interval other than
-    /// [`KEEPALIVE`](wire::KEEPALIVE): after `keepalive` without a write the
-    /// client pings so the server's idle timeout does not close it. Only
-    /// tests against a server with a short idle timeout need this.
+    /// [`connect`](Self::connect) over TLS: the handshake happens first,
+    /// checking the server against `tls`, and every reconnect repeats it.
+    /// A failed handshake is an [`Error::Io`].
+    pub async fn connect_tls(addr: SocketAddr, tls: Tls, token: impl AsRef<[u8]>) -> Result<Self> {
+        Self::connect_with(addr, Some(tls), token, wire::KEEPALIVE).await
+    }
+
+    /// [`connect`](Self::connect) or [`connect_tls`](Self::connect_tls) with
+    /// a heartbeat interval other than [`KEEPALIVE`](wire::KEEPALIVE): after
+    /// `keepalive` without a write the client pings so the server's idle
+    /// timeout does not close it. Only tests against a server with a short
+    /// idle timeout need this.
     #[doc(hidden)]
     pub async fn connect_with(
         addr: SocketAddr,
+        tls: Option<Tls>,
         token: impl AsRef<[u8]>,
         keepalive: Duration,
     ) -> Result<Self> {
         assert!(!keepalive.is_zero(), "a zero keepalive would ping non-stop");
         let token = Bytes::copy_from_slice(token.as_ref());
-        let conn = Conn::open(addr, &token, keepalive)
+        let conn = Conn::open(addr, tls.as_ref(), &token, keepalive)
             .await
             .map_err(|f| f.error())?;
         Ok(Self {
             inner: Arc::new(Inner {
                 addr,
+                tls,
                 token,
                 keepalive,
                 link: RwLock::new(Link::Up(conn)),

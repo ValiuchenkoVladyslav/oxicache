@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
-use oxicache_client::Client;
+use oxicache_client::{Client, ServerName, Tls};
 
 mod cli;
 use cli::warn_if_overridden;
@@ -15,12 +16,16 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 #[derive(Parser)]
 #[command(version)]
 struct Args {
-    /// Server address.
+    /// Server address, `host:port`; with --tls-ca the host is also the name
+    /// the server's certificate must be issued for.
     #[arg(long, env = "OXICACHE_ADDR", default_value = "127.0.0.1:4433")]
-    addr: SocketAddr,
+    addr: String,
     /// Shared secret presented on every connection.
     #[arg(long, env = "OXICACHE_TOKEN", hide_env_values = true)]
     token: String,
+    /// Connect over TLS, trusting the CA certificates in this PEM file.
+    #[arg(long, value_name = "PEM")]
+    tls_ca: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -77,9 +82,49 @@ async fn main() -> Result<()> {
         false,
     );
     let token = args.token.as_bytes();
+    let (host, _) = args
+        .addr
+        .rsplit_once(':')
+        .ok_or("--addr must be host:port")?;
+    if let Cmd::Set { kv } = &args.cmd
+        && kv.len() % 2 != 0
+    {
+        return Err("set expects key value pairs".into());
+    }
+    // `localhost` may resolve to ::1 before 127.0.0.1; the first address
+    // that accepts is the server's, for every connection from here on.
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&args.addr).await?.collect();
+    if addrs.is_empty() {
+        return Err(format!("{}: no address", args.addr).into());
+    }
+    let tls = match args.tls_ca.as_deref() {
+        Some(ca) => {
+            let name = ServerName::try_from(host.trim_matches(['[', ']']).to_string())?;
+            Some(Tls::trusting(ca, name)?)
+        }
+        None => None,
+    };
+    let mut last = None;
+    let mut connected = None;
+    for &a in &addrs {
+        match connect(a, tls.as_ref(), token).await {
+            Ok(c) => {
+                connected = Some((a, c));
+                break;
+            }
+            // Only an address nobody answered on is worth skipping: a
+            // server that answered (a refused token, say) is the server.
+            Err(e @ (oxicache_client::Error::Io(_) | oxicache_client::Error::Closed)) => {
+                last = Some(e);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let Some((addr, client)) = connected else {
+        return Err(last.expect("at least one address").into());
+    };
     match args.cmd {
         Cmd::Get { keys } => {
-            let client = Client::connect(args.addr, token).await?;
             // Any MessagePack value prints; strings without their quotes.
             let vals = client.get_multi::<rmpv::Value, _>(keys.as_slice()).await?;
             for (k, v) in keys.iter().zip(vals) {
@@ -91,10 +136,6 @@ async fn main() -> Result<()> {
             }
         }
         Cmd::Set { kv } => {
-            if kv.len() % 2 != 0 {
-                return Err("set expects key value pairs".into());
-            }
-            let client = Client::connect(args.addr, token).await?;
             // Values are stored as MessagePack strings.
             let pairs: Vec<(&str, &str)> = kv
                 .chunks(2)
@@ -104,7 +145,6 @@ async fn main() -> Result<()> {
             println!("OK ({} entries)", pairs.len());
         }
         Cmd::Del { keys } => {
-            let client = Client::connect(args.addr, token).await?;
             let flags = client.del_multi(keys.as_slice()).await?;
             for (k, f) in keys.iter().zip(flags) {
                 println!("{k}: {}", if f { "deleted" } else { "(nil)" });
@@ -119,8 +159,10 @@ async fn main() -> Result<()> {
             write_ratio,
             seconds,
         } => {
+            drop(client);
             bench(
-                args.addr,
+                addr,
+                tls,
                 token,
                 conns,
                 pipeline,
@@ -136,9 +178,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn connect(
+    addr: SocketAddr,
+    tls: Option<&Tls>,
+    token: &[u8],
+) -> oxicache_client::Result<Client> {
+    match tls {
+        Some(tls) => Client::connect_tls(addr, tls.clone(), token).await,
+        None => Client::connect(addr, token).await,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn bench(
     addr: SocketAddr,
+    tls: Option<Tls>,
     token: &[u8],
     conns: usize,
     pipeline: usize,
@@ -163,7 +217,7 @@ async fn bench(
 
     let mut clients = Vec::with_capacity(conns);
     for _ in 0..conns {
-        clients.push(Client::connect(addr, token).await?);
+        clients.push(connect(addr, tls.as_ref(), token).await?);
     }
     let start = Instant::now();
     let deadline = start + Duration::from_secs(seconds);

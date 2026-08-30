@@ -27,6 +27,7 @@ fn cmd(args: &[&str], env: &[(&str, &str)]) -> Command {
         .env_remove("OXICACHE_TOKEN")
         .env_remove("OXICACHE_IDLE_TIMEOUT")
         .env_remove("OXICACHE_MAX_CONNS")
+        .env_remove("OXICACHE_TLS_CERT")
         .env_remove("RUST_LOG")
         .envs(env.iter().copied())
         .stdout(Stdio::piped())
@@ -366,4 +367,99 @@ fn http_bind_failure_is_fatal() {
         ],
     );
     assert!(err.contains("Bind") && err.contains("AddrInUse"), "{err}");
+}
+
+const SERVER_PEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tls/server.pem");
+const CA_PEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tls/ca.pem");
+
+/// A blocking TLS stream to `addr`, trusting the fixture CA.
+fn tls_connect(addr: SocketAddr) -> rustls::StreamOwned<rustls::ClientConnection, TcpStream> {
+    use rustls_pki_types::pem::PemObject;
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls_pki_types::CertificateDer::from_pem_file(CA_PEM).unwrap())
+        .unwrap();
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let conn = rustls::ClientConnection::new(
+        std::sync::Arc::new(config),
+        rustls_pki_types::ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap();
+    let s = TcpStream::connect(addr).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    rustls::StreamOwned::new(conn, s)
+}
+
+#[test]
+fn tls_cert_enables_tls_on_both_listeners() {
+    let mut r = start(&[
+        ("OXICACHE_CAPACITY", "1M"),
+        ("OXICACHE_HTTP_ADDR", "127.0.0.1:0"),
+        ("OXICACHE_TLS_CERT", SERVER_PEM),
+    ]);
+    let h = r.http_addr();
+    // TCP: AUTH then PING through the handshake.
+    let mut s = tls_connect(r.addr);
+    s.write_all(&wire::encode_header(Op::Auth as u8, 1))
+        .unwrap();
+    s.write_all(b"t").unwrap();
+    let mut hdr = [0u8; wire::HEADER_LEN];
+    s.read_exact(&mut hdr).unwrap();
+    assert_eq!(wire::decode_header(&hdr), (Status::Ok as u8, 0));
+    s.write_all(&wire::encode_header(Op::Ping as u8, 0))
+        .unwrap();
+    s.read_exact(&mut hdr).unwrap();
+    assert_eq!(wire::decode_header(&hdr), (Status::Ok as u8, 0));
+    // HTTP: /health over TLS.
+    let mut s = tls_connect(h);
+    s.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .unwrap();
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw);
+    assert!(
+        raw.starts_with(b"HTTP/1.1 200"),
+        "{}",
+        String::from_utf8_lossy(&raw)
+    );
+    // Plain clients get nothing.
+    let mut plain = TcpStream::connect(r.addr).unwrap();
+    plain
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    plain
+        .write_all(&wire::encode_header(Op::Auth as u8, 1))
+        .unwrap();
+    plain.write_all(b"t").unwrap();
+    let mut rest = Vec::new();
+    plain.read_to_end(&mut rest).unwrap();
+    // At most a TLS alert record (content type 21), never a frame.
+    assert!(rest.is_empty() || rest[0] == 0x15, "{rest:?}");
+    let (ok, log) = r.interrupt();
+    assert!(ok, "{log}");
+    assert!(
+        log.contains("listening (tcp)") && log.contains("tls=true"),
+        "{log}"
+    );
+    assert!(log.contains("server.pem"), "{log}");
+}
+
+#[test]
+fn tls_cert_must_be_a_readable_pem() {
+    for bad in ["", "/nonexistent/server.pem", CA_PEM] {
+        let err = fails(
+            &[],
+            &[
+                ("OXICACHE_TOKEN", "t"),
+                ("OXICACHE_CAPACITY", "1M"),
+                ("OXICACHE_TLS_CERT", bad),
+            ],
+        );
+        assert!(err.contains("OXICACHE_TLS_CERT"), "{bad:?}: {err}");
+    }
 }

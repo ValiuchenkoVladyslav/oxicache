@@ -3,6 +3,12 @@ import type { Subprocess } from "bun";
 
 const root = resolve(import.meta.dir, "../../..");
 const bin = resolve(root, "target/debug/oxicache-server");
+/** The fixture leaf certificate + key (`localhost`, `127.0.0.1`, `::1`). */
+export const SERVER_PEM = resolve(root, "testdata/tls/server.pem");
+/** The fixture CA that issued it, as PEM text for a client to trust. */
+export const CA_PEM = await Bun.file(
+  resolve(root, "testdata/tls/ca.pem"),
+).text();
 
 let built: Promise<void> | undefined;
 
@@ -71,7 +77,7 @@ async function waitForListen(
 export interface TestServer {
   port: number;
   httpPort: number;
-  /** Base URL of the HTTP listener. */
+  /** Base URL of the HTTP listener, `https://` when started with `OXICACHE_TLS_CERT`. */
   url: string;
   proc: Subprocess;
   /** Kill the server; resolves once it has exited and its ports are free again. */
@@ -115,5 +121,12 @@ export async function startServer(
     await stop();
     throw e;
   }
-  return { port, httpPort, url: `http://127.0.0.1:${httpPort}`, proc, stop };
+  const scheme = env.OXICACHE_TLS_CERT ? "https" : "http";
+  return {
+    port,
+    httpPort,
+    url: `${scheme}://127.0.0.1:${httpPort}`,
+    proc,
+    stop,
+  };
 }

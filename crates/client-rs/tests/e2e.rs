@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use oxicache_client::{Client, Error};
+use oxicache_client::{Client, Error, ServerName, Tls};
 use oxicache_server::{Cache, Options, Server};
 use oxicache_wire::Status;
 
@@ -77,13 +77,13 @@ async fn keepalive_outlives_the_server_idle_timeout() {
     let addr = server.local_addr();
     // Pinging every 200 ms keeps the connection open across 1.5 s of silence;
     // the margins are wide because a loaded runner can stall timers.
-    let quiet = Client::connect_with(addr, "t", Duration::from_millis(200))
+    let quiet = Client::connect_with(addr, None, "t", Duration::from_millis(200))
         .await
         .unwrap();
     // The same silence with a heartbeat that never comes due loses the
     // connection, which is what proves the first client survived because
     // of its pings; the next call gets a new one without being told.
-    let silent = Client::connect_with(addr, "t", Duration::from_secs(60))
+    let silent = Client::connect_with(addr, None, "t", Duration::from_secs(60))
         .await
         .unwrap();
     quiet.set("k", 1u8).await.unwrap();
@@ -453,7 +453,7 @@ async fn a_lost_heartbeat_does_not_reconnect_by_itself() {
         }
     })
     .await;
-    let c = Client::connect_with(fake.addr, "t", Duration::from_millis(20))
+    let c = Client::connect_with(fake.addr, None, "t", Duration::from_millis(20))
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -722,4 +722,73 @@ async fn failed_reconnects_back_off() {
         before = next;
     }
     assert_eq!(c.reconnects(), 0);
+}
+
+const SERVER_PEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tls/server.pem");
+const CA_PEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tls/ca.pem");
+
+fn tls_opts() -> Options {
+    Options::new(b"t".to_vec()).tls(Some(
+        oxicache_server::tls::server_config(std::path::Path::new(SERVER_PEM)).unwrap(),
+    ))
+}
+
+fn trusting(name: &str) -> Tls {
+    Tls::trusting(
+        std::path::Path::new(CA_PEM),
+        ServerName::try_from(name.to_string()).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn tls_round_trips_and_reconnects() {
+    let server = serve(tls_opts());
+    let addr = server.local_addr();
+    let client = Client::connect_tls(addr, trusting("127.0.0.1"), "t")
+        .await
+        .unwrap();
+    client.set("k", "v").await.unwrap();
+    assert_eq!(
+        client.get::<String>("k").await.unwrap().as_deref(),
+        Some("v")
+    );
+    // A restart is a new handshake as well as a new AUTH.
+    let addr = server.stop().await;
+    let server = Served::bind(addr, tls_opts());
+    assert_eq!(client.get::<String>("k").await.unwrap(), None);
+    assert_eq!(client.reconnects(), 1);
+    assert_eq!(server.open_connections(), 1);
+}
+
+#[tokio::test]
+async fn tls_refuses_an_untrusted_server() {
+    let server = serve(tls_opts());
+    let addr = server.local_addr();
+    // The certificate is for localhost / 127.0.0.1, not this name.
+    let err = Client::connect_tls(addr, trusting("example.com"), "t")
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Io(_)), "{err}");
+    assert!(
+        err.to_string().contains("certificate") || err.to_string().contains("Name"),
+        "{err}"
+    );
+    // A plain client against a TLS server gets no protocol answer.
+    let err = Client::connect(addr, "t").await.err().unwrap();
+    assert!(matches!(err, Error::Closed | Error::Io(_)), "{err}");
+    // And a TLS client against a plain server does not get through either.
+    let plain = serve(Options::new(b"t".to_vec()));
+    let err = Client::connect_tls(plain.local_addr(), trusting("localhost"), "t")
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::Io(_)), "{err}");
+    let err = Tls::trusting(
+        std::path::Path::new("/nonexistent/ca.pem"),
+        ServerName::try_from("localhost").unwrap(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Pem { .. }), "{err}");
 }

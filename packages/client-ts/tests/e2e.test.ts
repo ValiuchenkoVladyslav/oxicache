@@ -11,7 +11,7 @@ import {
 import { tcp } from "../src/transport/tcp";
 import { type Frame, FrameReader } from "../src/wire";
 import { must } from "./must";
-import { startServer, type TestServer } from "./server";
+import { CA_PEM, SERVER_PEM, startServer, type TestServer } from "./server";
 
 /** A complete response frame. */
 function frame(status: number, body: number[] = []): Uint8Array {
@@ -713,5 +713,62 @@ describe("keepalive", () => {
     } finally {
       fake.stop();
     }
+  });
+});
+
+describe("tcp transport over tls", () => {
+  let server: TestServer;
+  beforeAll(async () => {
+    server = await startServer({ OXICACHE_TLS_CERT: SERVER_PEM });
+  });
+  afterAll(async () => {
+    await server.stop();
+  });
+
+  test("round trip with a private CA, reconnect repeats the handshake", async () => {
+    const t = await tcp({
+      port: server.port,
+      token: "any",
+      tls: { ca: CA_PEM },
+    });
+    const c = await Client.connect(t);
+    await c.set("t", "secure");
+    expect(await c.get<string>("t")).toBe("secure");
+    const port = server.port;
+    await server.stop();
+    server = await startServer({ OXICACHE_TLS_CERT: SERVER_PEM }, port);
+    expect(await c.get("t")).toBeNull();
+    expect(t.reconnects).toBe(1);
+    c.close();
+  });
+
+  test("an untrusted certificate or a plain client is refused", async () => {
+    await expect(
+      tcp({ port: server.port, token: "any", tls: true }),
+    ).rejects.toThrow();
+    await expect(
+      tcp({
+        port: server.port,
+        token: "any",
+        tls: { ca: CA_PEM, serverName: "example.com" },
+      }),
+    ).rejects.toThrow();
+    // An IP name is checked against the certificate's IP SANs.
+    await expect(
+      tcp({
+        port: server.port,
+        token: "any",
+        tls: { ca: CA_PEM, serverName: "10.9.9.9" },
+      }),
+    ).rejects.toThrow(ClosedError);
+    const ip = await tcp({
+      port: server.port,
+      token: "any",
+      tls: { ca: CA_PEM, serverName: "127.0.0.1" },
+    });
+    ip.close();
+    await expect(tcp({ port: server.port, token: "any" })).rejects.toThrow(
+      ClosedError,
+    );
   });
 });

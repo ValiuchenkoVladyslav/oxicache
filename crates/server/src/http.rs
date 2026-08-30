@@ -32,14 +32,16 @@ use hyper::{Method, Request, Response, StatusCode, header};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use oxicache_wire::io::FrameWriter;
 use oxicache_wire::{self as wire, Op, Status};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::cache::Cache;
 use crate::error::{Error, Result};
-use crate::tcp::{self, ConnLimit, MAX_FRAME, Options};
+use crate::tcp::{self, AUTH_TIMEOUT, ConnLimit, MAX_FRAME, Options};
 
 /// How long in-flight requests get to finish at shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -51,6 +53,7 @@ pub struct HttpServer {
     token: Arc<[u8]>,
     idle_timeout: Option<Duration>,
     limit: Option<Arc<ConnLimit>>,
+    tls: Option<TlsAcceptor>,
 }
 
 impl HttpServer {
@@ -65,6 +68,7 @@ impl HttpServer {
             token,
             idle_timeout: opts.idle_timeout,
             limit: opts.limit,
+            tls: opts.tls.map(TlsAcceptor::from),
         })
     }
 
@@ -77,6 +81,11 @@ impl HttpServer {
         self.limit.as_ref().map(|l| l.open())
     }
 
+    /// Whether connections are served over TLS (`https://`).
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
     /// Accept connections on the current runtime until the task is dropped.
     pub async fn run(&self) {
         self.run_until(std::future::pending::<()>()).await;
@@ -85,7 +94,7 @@ impl HttpServer {
     /// Accept connections until `shutdown` resolves, then stop accepting,
     /// tell open connections to finish their current request and close.
     pub async fn run_until(&self, shutdown: impl Future<Output = ()>) {
-        info!(addr = %self.local_addr(), "listening (http)");
+        info!(addr = %self.local_addr(), tls = self.is_tls(), "listening (http)");
         let l = self.listener.try_clone().expect("clone listener");
         let (stop_tx, stop_rx) = watch::channel(false);
         let mut conns = JoinSet::new();
@@ -118,32 +127,29 @@ async fn accept_loop(
         let permit = tcp::admit(server.limit.as_ref()).await;
         match listener.accept().await {
             Ok((stream, remote)) => {
-                let (cache, token, mut stop) =
+                let (cache, token, stop) =
                     (server.cache.clone(), server.token.clone(), stop.clone());
-                let idle = server.idle_timeout;
+                let (idle, tls) = (server.idle_timeout, server.tls.clone());
                 let slot = tcp::Slot::open(server.limit.as_ref(), permit);
                 conns.spawn(async move {
                     let _slot = slot;
                     debug!(%remote, "http connection open");
                     let _ = stream.set_nodelay(true);
-                    let svc = service_fn(move |req| {
-                        let (cache, token) = (cache.clone(), token.clone());
-                        async move { Ok::<_, hyper::Error>(handle(req, &cache, &token).await) }
-                    });
-                    // hyper re-arms its header timeout for every request on
-                    // a keep-alive connection, so it doubles as the idle
-                    // timeout. `None` is passed explicitly: with a timer
-                    // installed hyper would otherwise fall back to its own
-                    // 30 s default.
-                    let mut builder = http1::Builder::new();
-                    builder.timer(TokioTimer::new()).header_read_timeout(idle);
-                    let conn = builder.serve_connection(TokioIo::new(stream), svc);
-                    tokio::pin!(conn);
-                    let res = tokio::select! {
-                        r = conn.as_mut() => r,
-                        _ = stop.changed() => {
-                            conn.as_mut().graceful_shutdown();
-                            conn.await
+                    let res = match tls {
+                        None => serve(stream, cache, token, idle, stop).await,
+                        // The handshake is under the same hard cap as AUTH
+                        // on TCP: a peer that never finishes one does not
+                        // get to sit on a slot.
+                        Some(acceptor) => {
+                            match tokio::time::timeout(AUTH_TIMEOUT, acceptor.accept(stream)).await
+                            {
+                                Ok(Ok(stream)) => serve(stream, cache, token, idle, stop).await,
+                                Ok(Err(e)) => Err(e.into()),
+                                Err(_) => {
+                                    debug!(%remote, "tls handshake timed out");
+                                    Ok(())
+                                }
+                            }
                         }
                     };
                     if let Err(e) = res {
@@ -157,6 +163,37 @@ async fn accept_loop(
             }
         }
     }
+}
+
+/// Serve HTTP/1.1 on one stream until it closes or `stop` says to finish
+/// the current request and close.
+async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    cache: Arc<Cache>,
+    token: Arc<[u8]>,
+    idle: Option<Duration>,
+    mut stop: watch::Receiver<bool>,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let svc = service_fn(move |req| {
+        let (cache, token) = (cache.clone(), token.clone());
+        async move { Ok::<_, hyper::Error>(handle(req, &cache, &token).await) }
+    });
+    // hyper re-arms its header timeout for every request on a keep-alive
+    // connection, so it doubles as the idle timeout. `None` is passed
+    // explicitly: with a timer installed hyper would otherwise fall back to
+    // its own 30 s default.
+    let mut builder = http1::Builder::new();
+    builder.timer(TokioTimer::new()).header_read_timeout(idle);
+    let conn = builder.serve_connection(TokioIo::new(stream), svc);
+    tokio::pin!(conn);
+    let res = tokio::select! {
+        r = conn.as_mut() => r,
+        _ = stop.changed() => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    };
+    Ok(res?)
 }
 
 fn reply(code: StatusCode, body: Bytes, binary: bool) -> Response<Full<Bytes>> {
@@ -273,8 +310,8 @@ mod tests {
     const AUTH: [(&str, &str); 1] = [("Authorization", "Bearer s3cret")];
 
     /// Minimal HTTP/1.1 client: one request on `c`, returns status and body.
-    async fn call(
-        c: &mut TcpStream,
+    async fn call<S: AsyncRead + AsyncWrite + Unpin>(
+        c: &mut S,
         method: &str,
         path: &str,
         headers: &[(&str, &str)],
@@ -592,6 +629,43 @@ mod tests {
             .expect("served once the slot frees up")
             .unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+    }
+
+    #[tokio::test]
+    async fn tls_serves_the_same_api() {
+        let s = server_with(opts().tls(Some(crate::tls::testing::server())));
+        assert!(s.is_tls());
+        let addr = s.local_addr();
+        let srv = s.clone();
+        tokio::spawn(async move { srv.run().await });
+        let (connector, name) = crate::tls::testing::client();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut c = connector.connect(name, tcp).await.unwrap();
+        let entries = wire::encode_entries([(&b"k"[..], &b"v"[..])]);
+        assert_eq!(call(&mut c, "POST", "/set", &AUTH, &entries).await.0, 200);
+        let keys = wire::encode_keys([&b"k"[..]]);
+        let (st, body) = call(&mut c, "POST", "/get", &AUTH, &keys).await;
+        assert_eq!(st, 200);
+        assert_eq!(
+            wire::decode_values(body.into()).unwrap(),
+            vec![Some(Bytes::from_static(b"v"))]
+        );
+        // Plain HTTP to a TLS listener gets no HTTP answer at all.
+        let mut plain = TcpStream::connect(addr).await.unwrap();
+        plain
+            .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), plain.read_to_end(&mut rest))
+            .await
+            .expect("closed by the server")
+            .unwrap();
+        assert!(
+            !rest.starts_with(b"HTTP/"),
+            "{}",
+            String::from_utf8_lossy(&rest)
+        );
     }
 
     #[tokio::test]

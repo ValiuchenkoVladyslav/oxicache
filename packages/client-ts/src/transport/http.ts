@@ -3,7 +3,12 @@
  * body, the op as the path. Runs anywhere `fetch` does (Bun, Node 18+, edge
  * runtimes, lambdas); nothing here touches Bun's socket API.
  */
-import { ClosedError, StatusError, type Transport } from "../transport.js";
+import {
+  ClosedError,
+  StatusError,
+  type TlsOptions,
+  type Transport,
+} from "../transport.js";
 import { encodePingFrame, HEADER_LEN, Op, Status } from "../wire.js";
 
 export interface HttpOptions {
@@ -13,10 +18,21 @@ export interface HttpOptions {
   token: string;
   /** `fetch` to use instead of the global one (custom agents, tests). */
   fetch?: Fetch;
+  /**
+   * TLS settings for an `https://` URL, passed to `fetch` as its `tls`
+   * option. Bun honours it (`{ ca }` with the PEM of a private CA,
+   * `serverName`); other runtimes ignore it, so there trust a private CA
+   * through the runtime (`NODE_EXTRA_CA_CERTS`) or a custom `fetch`
+   * instead. A publicly trusted certificate needs nothing here.
+   */
+  tls?: TlsOptions;
 }
 
 /** The part of `fetch` the transport uses. */
-export type Fetch = (url: string, init: RequestInit) => Promise<Response>;
+export type Fetch = (
+  url: string,
+  init: RequestInit & { tls?: TlsOptions },
+) => Promise<Response>;
 
 const PATH: Readonly<Record<Op, string>> = {
   [Op.Get]: "/get",
@@ -42,6 +58,7 @@ class HttpTransport implements Transport {
   private readonly base: string;
   private readonly headers: Record<string, string>;
   private readonly fetch: Fetch;
+  private readonly tls: TlsOptions | undefined;
   private closed: ClosedError | null = null;
 
   constructor(opts: HttpOptions) {
@@ -51,6 +68,7 @@ class HttpTransport implements Transport {
       authorization: `Bearer ${opts.token}`,
     };
     this.fetch = opts.fetch ?? globalThis.fetch;
+    this.tls = opts.tls;
   }
 
   async request(frame: Uint8Array): Promise<Uint8Array> {
@@ -64,6 +82,7 @@ class HttpTransport implements Transport {
       headers: this.headers,
       // The view is always over a plain ArrayBuffer; the cast only narrows the generic.
       body: frame.subarray(HEADER_LEN) as Uint8Array<ArrayBuffer>,
+      ...(this.tls && { tls: this.tls }),
     });
     const body = new Uint8Array(await res.arrayBuffer());
     if (res.ok) return body;

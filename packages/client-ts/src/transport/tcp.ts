@@ -1,6 +1,6 @@
 /**
- * TCP transport for the Bun runtime: one `Bun.connect` socket, requests
- * pipelined onto it. Everything issued in the same tick goes out in one
+ * TCP transport for the Bun runtime: one socket (`Bun.connect`, or
+ * `node:tls` for TLS), requests pipelined onto it. Everything issued in the same tick goes out in one
  * write and responses are matched to callers in order. The server closes a
  * connection that sends nothing for its idle timeout, so after `keepaliveMs`
  * without a write the transport pings by itself.
@@ -14,8 +14,14 @@
  * that error, as does `close()`. Status and encoding errors are the call's
  * alone; the connection stays.
  */
-import type { Socket } from "bun";
-import { ClosedError, StatusError, type Transport } from "../transport.js";
+import { isIP } from "node:net";
+import { checkServerIdentity, connect as tlsConnect } from "node:tls";
+import {
+  ClosedError,
+  StatusError,
+  type TlsOptions,
+  type Transport,
+} from "../transport.js";
 import {
   type Bin,
   DecodeError,
@@ -39,6 +45,14 @@ export interface TcpOptions {
    * positive; defaults to `KEEPALIVE_MS` (100 s, a third of that timeout).
    */
   keepaliveMs?: number;
+  /**
+   * Speak TLS, for a server started with `OXICACHE_TLS_CERT`. `true` trusts
+   * the system roots and checks the certificate against `hostname`; an
+   * object names a private CA (`ca`) or another name (`serverName`). Every
+   * reconnect repeats the handshake. The TLS socket is `node:tls`, since
+   * `Bun.connect` does not verify server certificates (Bun 1.3).
+   */
+  tls?: boolean | TlsOptions;
 }
 
 /** Wait before the second reconnect attempt in a row; the first is immediate. */
@@ -66,6 +80,102 @@ const ignore = () => {
   // nothing to do
 };
 
+/** What a link needs from its socket, whichever API is underneath. */
+interface Wire {
+  /** Bytes accepted now; the rest is written again on `drain`. */
+  write(data: Uint8Array): number;
+  /** Hang up after what has been written. */
+  end(): void;
+  /** Hang up now. */
+  terminate(): void;
+}
+
+/** The socket's callbacks into its link. */
+interface Handlers {
+  data(chunk: Uint8Array): void;
+  drain(): void;
+  gone(err?: unknown): void;
+}
+
+/** A plain `Bun.connect` socket; resolves once it is open. */
+async function bunWire(
+  hostname: string,
+  port: number,
+  h: Handlers,
+): Promise<Wire> {
+  const gone = (_s: unknown, err?: unknown) => h.gone(err);
+  const socket = await Bun.connect({
+    hostname,
+    port,
+    socket: {
+      data: (_s, chunk) => h.data(chunk),
+      drain: () => h.drain(),
+      close: gone,
+      error: gone,
+      connectError: gone,
+      end: gone,
+    },
+  });
+  return {
+    write: (data) => socket.write(data),
+    end: () => socket.end(),
+    terminate: () => socket.terminate(),
+  };
+}
+
+/**
+ * A `node:tls` socket; resolves once the handshake is done and the
+ * certificate checked, rejects if it is refused. Node buffers every write
+ * in full, so `write` never reports a short count.
+ */
+function tlsWire(
+  hostname: string,
+  port: number,
+  tls: TlsOptions,
+  h: Handlers,
+): Promise<Wire> {
+  return new Promise((resolve, reject) => {
+    // SNI cannot carry an IP, so an IP name is checked against the
+    // certificate directly instead of being sent.
+    const name = tls.serverName ?? hostname;
+    const sni = isIP(name) ? undefined : name;
+    // node:tls takes PEM as text or a Buffer, not a bare Uint8Array.
+    const pem = (c: string | Uint8Array) =>
+      typeof c === "string" ? c : Buffer.from(c);
+    const socket = tlsConnect({
+      host: hostname,
+      port,
+      ...(tls.ca !== undefined && {
+        ca: Array.isArray(tls.ca) ? tls.ca.map(pem) : pem(tls.ca),
+      }),
+      ...(sni !== undefined && { servername: sni }),
+      checkServerIdentity: (_host, cert) => checkServerIdentity(name, cert),
+    });
+    socket.setNoDelay(true);
+    let open = false;
+    socket.once("secureConnect", () => {
+      open = true;
+      resolve({
+        write: (data) => {
+          socket.write(data);
+          return data.length;
+        },
+        end: () => socket.end(),
+        terminate: () => socket.destroy(),
+      });
+    });
+    socket.on("data", (chunk: Uint8Array) => h.data(chunk));
+    socket.on("drain", () => h.drain());
+    const gone = (err?: unknown) => {
+      if (open) h.gone(err);
+      else reject(new ClosedError(err));
+    };
+    socket.on("error", gone);
+    socket.on("close", gone);
+    socket.on("end", gone);
+  });
+}
+
 /**
  * One live socket with its own in-order pending queue, write coalescing
  * and heartbeat. It reports to its owner when it is lost, handing over
@@ -82,7 +192,7 @@ class Link {
   private readonly reader: FrameReader;
   private readonly keepaliveMs: number;
   private keepalive: ReturnType<typeof setTimeout> | undefined;
-  private socket!: Socket<undefined>;
+  private socket!: Wire;
 
   // Explicit rather than a field initialiser: Bun's coverage counts a
   // synthesised constructor as a function it never sees run.
@@ -99,24 +209,20 @@ class Link {
     owner: TcpTransport,
     hostname: string,
     port: number,
+    tls: TlsOptions | null,
     token: Uint8Array,
     keepaliveMs: number,
   ): Promise<Link> {
     const link = new Link(owner, keepaliveMs);
     // Any way the socket goes away ends with the same bookkeeping.
-    const gone = (_s: unknown, err?: unknown) => link.lose(err);
-    link.socket = await Bun.connect({
-      hostname,
-      port,
-      socket: {
-        data: (_s, chunk) => link.onData(chunk),
-        drain: () => link.flush(),
-        close: gone,
-        error: gone,
-        connectError: gone,
-        end: gone,
-      },
-    });
+    const handlers: Handlers = {
+      data: (chunk) => link.onData(chunk),
+      drain: () => link.flush(),
+      gone: (err) => link.lose(err),
+    };
+    link.socket = tls
+      ? await tlsWire(hostname, port, tls, handlers)
+      : await bunWire(hostname, port, handlers);
     if (link.lost) throw link.lost;
     try {
       await link.call(encodeRawFrame(Op.Auth, token), false);
@@ -274,6 +380,7 @@ export class TcpTransport implements Transport {
   private constructor(
     private readonly hostname: string,
     private readonly port: number,
+    private readonly tls: TlsOptions | null,
     private readonly token: Uint8Array,
     private readonly keepaliveMs: number,
   ) {}
@@ -289,6 +396,7 @@ export class TcpTransport implements Transport {
     const t = new TcpTransport(
       opts.hostname ?? "127.0.0.1",
       opts.port,
+      opts.tls === true ? {} : opts.tls === false ? null : (opts.tls ?? null),
       toBytes(opts.token),
       keepaliveMs,
     );
@@ -413,6 +521,7 @@ export class TcpTransport implements Transport {
       this,
       this.hostname,
       this.port,
+      this.tls,
       this.token,
       this.keepaliveMs,
     );

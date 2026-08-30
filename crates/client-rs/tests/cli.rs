@@ -7,11 +7,14 @@ use std::sync::Arc;
 use oxicache_server::{Cache, Options, Server};
 
 async fn start(token: &[u8]) -> Arc<Server> {
+    start_with(Options::new(token.to_vec())).await
+}
+
+async fn start_with(opts: Options) -> Arc<Server> {
     let cache = Arc::new(Cache::new(
         NonZeroUsize::new(64 << 20).unwrap(),
         NonZeroUsize::new(2).unwrap(),
     ));
-    let opts = Options::new(token.to_vec());
     let server = Arc::new(Server::bind("127.0.0.1:0".parse().unwrap(), cache, opts).unwrap());
     let s = server.clone();
     tokio::spawn(async move { s.run().await });
@@ -136,4 +139,40 @@ async fn bench_runs() {
     let (stdout, stderr) = text(&out);
     assert!(out.status.success(), "{stderr}");
     assert!(stdout.contains("req/s"), "{stdout}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_ca_connects_over_tls() {
+    const SERVER_PEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tls/server.pem");
+    const CA_PEM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/tls/ca.pem");
+    let tls = oxicache_server::tls::server_config(std::path::Path::new(SERVER_PEM)).unwrap();
+    let server = start_with(Options::new(b"t".to_vec()).tls(Some(tls))).await;
+    let port = server.local_addr().port();
+    let env = [("OXICACHE_TOKEN", "t")];
+    // `localhost` resolves to ::1 too on many hosts; the CLI tries each address.
+    let addr = format!("localhost:{port}");
+    let out = cli(
+        &["--addr", &addr, "--tls-ca", CA_PEM, "set", "a", "1"],
+        &env,
+    )
+    .await;
+    assert!(out.status.success(), "{}", text(&out).1);
+    let addr = format!("127.0.0.1:{port}");
+    let out = cli(&["--addr", &addr, "--tls-ca", CA_PEM, "get", "a"], &env).await;
+    assert!(out.status.success(), "{}", text(&out).1);
+    assert_eq!(text(&out).0, "a: 1\n");
+    // Without --tls-ca the CLI speaks plain TCP and the TLS server hangs up.
+    let out = cli(&["--addr", &addr, "get", "a"], &env).await;
+    assert!(!out.status.success());
+    let out = cli(
+        &["--addr", &addr, "--tls-ca", "/nonexistent.pem", "get", "a"],
+        &env,
+    )
+    .await;
+    assert!(!out.status.success());
+    assert!(
+        text(&out).1.contains("/nonexistent.pem"),
+        "{}",
+        text(&out).1
+    );
 }

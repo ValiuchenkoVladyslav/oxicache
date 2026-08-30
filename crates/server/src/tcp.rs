@@ -16,10 +16,12 @@ use std::time::Duration;
 use bytes::Bytes;
 use oxicache_wire::io::{FrameReader, FrameWriter};
 use oxicache_wire::{self as wire, Op, Status};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::cache::{Cache, Entry};
@@ -60,6 +62,10 @@ pub struct Options {
     /// Cap on open connections across every listener bound with this
     /// `Options`; `None` is unlimited.
     pub limit: Option<Arc<ConnLimit>>,
+    /// Serve TLS with this configuration (see
+    /// [`tls::server_config`](crate::tls::server_config)); `None` is plain
+    /// TCP. The handshake counts against the [`AUTH_TIMEOUT`].
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 /// Idle timeout every `Options` starts with: three client heartbeats
@@ -78,6 +84,7 @@ impl Options {
             token: token.into(),
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             limit: Some(Arc::new(ConnLimit::new(DEFAULT_MAX_CONNECTIONS))),
+            tls: None,
         }
     }
 
@@ -91,6 +98,11 @@ impl Options {
         self.limit = max.map(|n| Arc::new(ConnLimit::new(n)));
         self
     }
+
+    pub fn tls(mut self, config: Option<Arc<rustls::ServerConfig>>) -> Self {
+        self.tls = config;
+        self
+    }
 }
 
 /// The token is a secret; a `{:?}` in a log must not print it.
@@ -100,6 +112,7 @@ impl std::fmt::Debug for Options {
             .field("token", &"<redacted>")
             .field("idle_timeout", &self.idle_timeout)
             .field("limit", &self.limit)
+            .field("tls", &self.tls.is_some())
             .finish()
     }
 }
@@ -210,6 +223,7 @@ pub struct Server {
     token: Arc<[u8]>,
     idle_timeout: Option<Duration>,
     limit: Option<Arc<ConnLimit>>,
+    tls: Option<TlsAcceptor>,
 }
 
 impl Server {
@@ -224,6 +238,7 @@ impl Server {
             token,
             idle_timeout: opts.idle_timeout,
             limit: opts.limit,
+            tls: opts.tls.map(TlsAcceptor::from),
         })
     }
 
@@ -236,6 +251,11 @@ impl Server {
         self.limit.as_ref().map(|l| l.open())
     }
 
+    /// Whether connections are served over TLS.
+    pub fn is_tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
     /// Accept connections on the current runtime until the task is dropped.
     pub async fn run(&self) {
         self.run_until(std::future::pending::<()>()).await;
@@ -244,7 +264,7 @@ impl Server {
     /// Accept connections until `shutdown` resolves, then stop accepting and
     /// give open connections a moment to flush the batch they are serving.
     pub async fn run_until(&self, shutdown: impl Future<Output = ()>) {
-        info!(addr = %self.local_addr(), "listening (tcp)");
+        info!(addr = %self.local_addr(), tls = self.is_tls(), "listening (tcp)");
         let l = self.listener.try_clone().expect("clone listener");
         let mut conns = JoinSet::new();
         tokio::select! {
@@ -291,13 +311,14 @@ async fn accept_loop(listener: std::net::TcpListener, server: &Server, conns: &m
         match listener.accept().await {
             Ok((stream, remote)) => {
                 let (cache, token) = (server.cache.clone(), server.token.clone());
-                let idle = server.idle_timeout;
+                let (idle, tls) = (server.idle_timeout, server.tls.clone());
                 let slot = Slot::open(server.limit.as_ref(), permit);
                 conns.spawn(async move {
                     // Held until the connection is done, whatever the reason.
                     let _slot = slot;
                     debug!(%remote, "connection open");
-                    match serve_connection(stream, &cache, &token, idle).await {
+                    let res = serve(stream, tls, &cache, &token, idle).await;
+                    match res {
                         Ok(true) => debug!(%remote, "idle connection closed"),
                         Ok(false) => {}
                         Err(e) => debug!(%remote, error = %e, "connection closed"),
@@ -312,17 +333,45 @@ async fn accept_loop(listener: std::net::TcpListener, server: &Server, conns: &m
     }
 }
 
-/// Serve one connection to its end; `Ok(true)` means the idle timeout closed it.
-async fn serve_connection(
+/// Serve one accepted socket to its end, plain or through a TLS handshake
+/// first; `Ok(true)` means the idle timeout closed it. The handshake is
+/// under the AUTH deadline, so an unauthenticated peer's time on a slot
+/// is capped whether or not it ever completes one.
+async fn serve(
     stream: TcpStream,
+    tls: Option<TlsAcceptor>,
     cache: &Cache,
     token: &[u8],
     idle: Option<Duration>,
 ) -> std::io::Result<bool> {
     stream.set_nodelay(true)?;
-    let (mut r, mut w) = stream.into_split();
-    let mut authed = false;
     let auth_deadline = Instant::now() + AUTH_TIMEOUT;
+    match tls {
+        None => {
+            let (r, w) = stream.into_split();
+            serve_connection(r, w, auth_deadline, cache, token, idle).await
+        }
+        Some(acceptor) => {
+            let Some(stream) = by(Some(auth_deadline), acceptor.accept(stream)).await? else {
+                return Ok(true);
+            };
+            let (r, w) = tokio::io::split(stream);
+            serve_connection(r, w, auth_deadline, cache, token, idle).await
+        }
+    }
+}
+
+/// Serve one connection to its end; `Ok(true)` means the AUTH or idle
+/// deadline closed it.
+async fn serve_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    mut r: R,
+    mut w: W,
+    auth_deadline: Instant,
+    cache: &Cache,
+    token: &[u8],
+    idle: Option<Duration>,
+) -> std::io::Result<bool> {
+    let mut authed = false;
     let mut reader = FrameReader::new(MAX_AUTH_FRAME);
     let mut out = FrameWriter::new();
     loop {
@@ -832,6 +881,73 @@ mod tests {
             .unwrap();
         assert_eq!(wire::decode_header(&hdr).0, Status::Ok as u8);
         assert_eq!(s.open_connections(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn tls_connection_authenticates_and_serves() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let s = server_with(opts().tls(Some(crate::tls::testing::server())));
+        assert!(s.is_tls());
+        let addr = s.local_addr();
+        tokio::spawn(async move { s.run().await });
+        let (connector, name) = crate::tls::testing::client();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut c = connector.connect(name, tcp).await.unwrap();
+        c.write_all(&wire::encode_header(Op::Auth as u8, 1))
+            .await
+            .unwrap();
+        c.write_all(b"t").await.unwrap();
+        let mut hdr = [0u8; wire::HEADER_LEN];
+        c.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(wire::decode_header(&hdr).0, Status::Ok as u8);
+        let keys = wire::encode_keys([&b"k"[..]]);
+        c.write_all(&wire::encode_header(Op::Del as u8, keys.len()))
+            .await
+            .unwrap();
+        c.write_all(&keys).await.unwrap();
+        c.read_exact(&mut hdr).await.unwrap();
+        let (st, len) = wire::decode_header(&hdr);
+        assert_eq!((st, len), (Status::Ok as u8, 5));
+        let mut body = vec![0u8; len];
+        c.read_exact(&mut body).await.unwrap();
+        assert_eq!(wire::decode_flags(body.into()).unwrap(), vec![false]);
+        // A plain-text peer is not a TLS client: closed without a reply.
+        let mut plain = TcpStream::connect(addr).await.unwrap();
+        plain
+            .write_all(&wire::encode_header(Op::Auth as u8, 1))
+            .await
+            .unwrap();
+        plain.write_all(b"t").await.unwrap();
+        let mut rest = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), plain.read_to_end(&mut rest))
+            .await
+            .expect("closed by the server")
+            .unwrap();
+        // At most a TLS alert record (content type 21), never a frame.
+        assert!(rest.is_empty() || rest[0] == 0x15, "{rest:?}");
+    }
+
+    /// The handshake is under the AUTH cap: a peer that opens a socket to
+    /// a TLS listener and never sends a ClientHello is cut at the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn unfinished_tls_handshake_is_cut_at_the_hard_cap() {
+        use tokio::io::AsyncReadExt;
+        let s = server_with(
+            opts()
+                .idle_timeout(None)
+                .tls(Some(crate::tls::testing::server())),
+        );
+        let addr = s.local_addr();
+        tokio::spawn(async move { s.run().await });
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        let mut rest = Vec::new();
+        tokio::time::timeout(AUTH_TIMEOUT * 2, c.read_to_end(&mut rest))
+            .await
+            .expect("closed by the server")
+            .unwrap();
+        assert!(rest.is_empty());
+        assert!(start.elapsed() >= AUTH_TIMEOUT, "cut early");
     }
 
     #[test]

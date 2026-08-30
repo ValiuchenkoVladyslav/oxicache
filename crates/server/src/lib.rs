@@ -2,6 +2,7 @@ pub mod cache;
 pub mod error;
 pub mod http;
 pub mod tcp;
+pub mod tls;
 
 pub use cache::Cache;
 pub use error::{Error, Result};

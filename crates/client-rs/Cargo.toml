@@ -14,6 +14,9 @@ oxicache-wire.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 thiserror.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+rustls-pki-types.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 serde = "1"
 rmp-serde = "1"

@@ -9,7 +9,7 @@ import {
 } from "../src/index";
 import { http } from "../src/transport/http";
 import { must } from "./must";
-import { startServer, type TestServer } from "./server";
+import { CA_PEM, SERVER_PEM, startServer, type TestServer } from "./server";
 
 const AUTH_FRAME = new Uint8Array([Op.Auth, 0, 0, 0, 0]);
 
@@ -163,5 +163,40 @@ describe("http token auth", () => {
     await ok.set("a", 1);
     expect(await ok.get<number>("a")).toBe(1);
     ok.close();
+  });
+});
+
+describe("http transport over tls", () => {
+  let server: TestServer;
+  beforeAll(async () => {
+    server = await startServer({ OXICACHE_TLS_CERT: SERVER_PEM });
+  });
+  afterAll(() => server.stop());
+
+  test("a trusted CA gets through, an untrusted one does not", async () => {
+    expect(server.url.startsWith("https://")).toBe(true);
+    const c = await Client.connect(
+      http({ url: server.url, token: "any", tls: { ca: CA_PEM } }),
+    );
+    await c.set("t", "secure");
+    expect(await c.get<string>("t")).toBe("secure");
+    c.close();
+    // Without the CA the certificate is not trusted, and with the wrong
+    // name it is not the server's; plain http is refused. Connecting sends
+    // nothing on HTTP, so the first call is where each fails.
+    const bare = await Client.connect(http({ url: server.url, token: "any" }));
+    await expect(bare.get("t")).rejects.toThrow();
+    const wrongName = await Client.connect(
+      http({
+        url: server.url,
+        token: "any",
+        tls: { ca: CA_PEM, serverName: "example.com" },
+      }),
+    );
+    await expect(wrongName.get("t")).rejects.toThrow();
+    const plain = await Client.connect(
+      http({ url: server.url.replace("https", "http"), token: "any" }),
+    );
+    await expect(plain.get("t")).rejects.toThrow();
   });
 });

@@ -1,5 +1,16 @@
 import { Status } from "./wire.js";
 
+/**
+ * How to trust a TLS server, for a server started with `OXICACHE_TLS_CERT`.
+ * Nothing set means the runtime's trust store and the connection's host.
+ */
+export interface TlsOptions {
+  /** PEM certificate(s) to trust instead of the system roots: a private CA. */
+  ca?: string | Uint8Array | Array<string | Uint8Array>;
+  /** Name (DNS or IP) to verify the certificate against, if not the host connected to. */
+  serverName?: string;
+}
+
 /** The server answered with a non-OK status. */
 export class StatusError extends Error {
   override name = "StatusError";

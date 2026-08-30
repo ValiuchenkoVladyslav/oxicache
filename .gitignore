@@ -1,4 +1,6 @@
 /target
 *.pem
+# Test-only CA and certificate for localhost; nothing trusts them outside the test suites.
+!testdata/tls/*.pem
 node_modules
 packages/*/dist

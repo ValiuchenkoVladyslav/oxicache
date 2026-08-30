@@ -39,8 +39,8 @@ accepted is dropped; that cap is fixed, not a setting. There is no unauthenticat
 either side: the Rust
 `Client::connect(addr, token)` and the TS transports (`tcp({ …, token })`,
 `http({ …, token })`) take the token as a required argument, and the CLI requires `--token` /
-`OXICACHE_TOKEN` (it also reads the server address from `OXICACHE_ADDR`). The token travels in clear text — pair it with a private network or a TLS
-tunnel.
+`OXICACHE_TOKEN` (it also reads the server address from `OXICACHE_ADDR`). Without TLS the token
+travels in clear text — set `OXICACHE_TLS_CERT` (see [TLS](#tls)) or stay on a private network.
 
 A connection that sends nothing for `OXICACHE_IDLE_TIMEOUT` (default 300 s) is closed, so both TCP
 clients PING on their own after 100 s without a write — a third of that default, so two lost
@@ -65,8 +65,9 @@ GET  /health                -> 200, no body; never needs a token
 Every request except `/health` carries `Authorization: Bearer <token>`. Every response sent
 before the token has been verified — `/health`, 401, 404, 405 — carries `Connection: close`,
 so no connection stays open without the token. Both listeners serve one
-cache, so a value written over TCP is readable over HTTP. Keep-alive is on; there is no TLS and
-no CORS handling — put a reverse proxy in front for either.
+cache, so a value written over TCP is readable over HTTP. Keep-alive is on; with
+`OXICACHE_TLS_CERT` the listener is `https://`. There is no CORS handling — put a reverse proxy
+in front for that.
 
 ## Run
 
@@ -85,16 +86,42 @@ OXICACHE_TOKEN=s3cret OXICACHE_HTTP_ADDR=0.0.0.0:4434 OXICACHE_CAPACITY=1G cargo
 | `OXICACHE_TOKEN` | required | the shared secret; must not be empty |
 | `OXICACHE_IDLE_TIMEOUT` | `300` | close a connection that sends nothing for this many seconds |
 | `OXICACHE_MAX_CONNS` | `10000` | at most this many open connections, TCP and HTTP together; beyond it the listeners stop accepting until one closes |
+| `OXICACHE_TLS_CERT` | unset (plain) | PEM file with the server's certificate chain and private key; set, both listeners speak TLS |
 
-A missing token or an unparseable value is a startup error naming the variable. SIGINT or
-SIGTERM stops accepting and drains open connections before exit.
+A missing token, an unparseable value or an unreadable certificate file is a startup error
+naming the variable. SIGINT or SIGTERM stops accepting and drains open connections before exit.
 
 ```sh
 cargo run --release -p oxicache-client -- set a 1 b 2
 cargo run --release -p oxicache-client -- get a b c
 cargo run --release -p oxicache-client -- del a
 cargo run --release -p oxicache-client -- bench --conns 8 --pipeline 16 --batch 16
+cargo run --release -p oxicache-client -- --addr cache.internal:4433 --tls-ca ca.pem get a
 ```
+
+### TLS
+
+`OXICACHE_TLS_CERT=/path/to/server.pem` is the whole switch: the file holds the certificate
+chain (leaf first) and the private key, both PEM, and its presence makes the TCP listener and
+the HTTP listener (`https://`) speak TLS 1.3 — there is no per-listener setting and no
+plain-text fallback. On TCP the handshake counts against the 30 s cap on unauthenticated
+connections; on HTTP it has the same 30 s, then hyper's header timeout applies as before.
+Clients are not asked for a certificate; the token still authenticates them, now encrypted.
+
+Every client takes the same two things: what to trust (a private CA's PEM, or the runtime's
+roots) and the name the certificate must be issued for (a DNS name or an IP).
+
+- `oxicache-cli --addr host:port --tls-ca ca.pem …` — TLS on, trusting the CA(s) in `ca.pem`,
+  verifying the certificate against `host`.
+- Rust: `Client::connect_tls(addr, Tls::trusting(ca_path, server_name)?, token)`, or a `Tls`
+  built from any `rustls::ClientConfig`.
+- TypeScript: `tcp({ …, tls: true })` for the system roots or `tcp({ …, tls: { ca } })` for a
+  private CA (`serverName` when the certificate is not for `hostname`); `http({ url:
+  "https://…", tls: { ca } })` — Bun honours `tls`, other runtimes take a custom `fetch` or
+  `NODE_EXTRA_CA_CERTS`.
+
+`testdata/tls` holds a CA and a certificate for `localhost` / `127.0.0.1` / `::1` that the test
+suites use; they are for tests only.
 
 ### Rust client API
 
@@ -107,9 +134,13 @@ connects (a refused token means no client). Values are any `Serialize` type in a
 the same encoding the TypeScript client writes, so both clients read each other's values
 (`Vec<u8>` is a MessagePack array; wrap it in `serde_bytes` for a `bin`). `get` and
 `get_multi` decode as part of the call: the type argument names the value types only.
+`Client::connect_tls(addr, tls, token)` is the same over TLS: `Tls::trusting(ca, server_name)`
+trusts a PEM file of CA certificates, or fill `Tls { server_name, config }` with your own
+`rustls::ClientConfig`; a refused certificate is an `Error::Io`.
 
 ```rust
 let client = Client::connect(addr, "s3cret").await?;
+let secure = Client::connect_tls(addr, Tls::trusting(Path::new("ca.pem"), "cache.internal".try_into()?)?, "s3cret").await?;
 
 #[derive(Serialize, Deserialize)] struct User { id: u64, name: String }
 client.set("user:7", User { id: 7, name: "alice".into() }).await?;
@@ -150,7 +181,8 @@ the client usable. Dropping the last clone closes the connection.
 `packages/client-ts` is a `Client` over a pluggable `Transport`, each transport on its own
 subpath so a bundle only carries the one it imports (the package is `sideEffects: false`):
 
-- `@oxicache/client/transport/tcp` — `Bun.connect`, with the same framing, pipelining and
+- `@oxicache/client/transport/tcp` — `Bun.connect` (a `node:tls` socket with `tls`, since
+  `Bun.connect` does not verify server certificates), with the same framing, pipelining and
   in-order response matching as the Rust client. Bun only.
 - `@oxicache/client/transport/http` — one `fetch` per call against the server's HTTP listener.
   Runs wherever `fetch` does: Bun, Node 18+, edge runtimes, lambdas. Importing it, or the main
@@ -171,6 +203,9 @@ import { http } from "@oxicache/client/transport/http";
 const c = await Client.connect(tcp({ hostname: "127.0.0.1", port: 4433, token: "s3cret" }));
 // or, from an edge function:
 const c = await Client.connect(http({ url: "http://cache.internal:4434", token: "s3cret" }));
+// over TLS, with a private CA:
+const c = await Client.connect(tcp({ hostname: "cache.internal", port: 4433, token: "s3cret", tls: { ca } }));
+const c = await Client.connect(http({ url: "https://cache.internal:4434", token: "s3cret", tls: { ca } }));
 
 await c.set("user:7", { id: 7, name: "alice", joined: new Date() });  // one
 await c.set(["a", 1], ["b", ["x", null]]);                             // several
@@ -249,7 +284,10 @@ The pre-commit hook (`.husky/pre-commit`) runs `cargo fmt --check`, `clippy -D w
   HTTP keep-alive). Defaults: 10 000 connections, 300 s idle; the library `Options` can
   lift either with `None`, the binary cannot. TCP clients send a PING after 100 s without
   a write (`oxicache_wire::KEEPALIVE`; the server default is three of them), so a quiet
-  connection is not mistaken for a dead one. Still put the server on a private network.
+  connection is not mistaken for a dead one. `Options::tls` (the binary: `OXICACHE_TLS_CERT`)
+  wraps both listeners in rustls (TLS 1.3, `ring`); the frame loop is generic over the
+  stream, so the plain path is unchanged and a TLS connection is split with `tokio::io::split`
+  instead of `into_split`. Still put the server on a private network.
 - 64-bit targets only: index slots pack a 48-bit entry address next to a 16-bit tag.
 - The client pipelines calls from any number of tasks onto one connection (writer task
   coalesces queued frames into one flush; reader task matches responses in order).
