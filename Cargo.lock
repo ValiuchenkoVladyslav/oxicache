@@ -400,6 +400,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

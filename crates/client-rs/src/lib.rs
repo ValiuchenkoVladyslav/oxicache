@@ -42,6 +42,12 @@
 //! A server started with `OXICACHE_TLS_CERT` speaks TLS; connect to it with
 //! [`Client::connect_tls`] and a [`Tls`] naming what to trust and who the
 //! server must be.
+//!
+//! With the `tracing` feature (off by default) the client emits
+//! connection-lifecycle events under the `oxicache_client` target: connects
+//! at DEBUG, reconnects at INFO, failed attempts and their backoff at WARN,
+//! fatal errors at ERROR, keepalive pings at TRACE. Requests themselves are
+//! never traced.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -490,6 +496,8 @@ impl Inner {
         self.attempts.fetch_add(1, Ordering::Release);
         match outcome {
             Ok(conn) => {
+                #[cfg(feature = "tracing")]
+                tracing::info!(addr = %self.addr, "reconnected");
                 self.set_link(Link::Up(conn.clone()));
                 *backoff = Backoff::fresh();
                 self.reconnects.fetch_add(1, Ordering::Relaxed);
@@ -497,8 +505,21 @@ impl Inner {
             }
             Err(failed) => {
                 match &failed {
-                    Failed::Fatal(fatal) => self.set_link(Link::Dead(fatal.clone())),
-                    Failed::Setback(setback) => backoff.failed(setback.clone()),
+                    Failed::Fatal(fatal) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(addr = %self.addr, error = %fatal.error(), "client dead");
+                        self.set_link(Link::Dead(fatal.clone()));
+                    }
+                    Failed::Setback(setback) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            addr = %self.addr,
+                            error = %setback.error(),
+                            retry_in = ?backoff.delay,
+                            "reconnect failed"
+                        );
+                        backoff.failed(setback.clone());
+                    }
                 }
                 Err(failed.error())
             }
@@ -537,6 +558,8 @@ impl Client {
         let conn = Conn::open(addr, tls.as_ref(), &token, keepalive)
             .await
             .map_err(|f| f.error())?;
+        #[cfg(feature = "tracing")]
+        tracing::debug!(%addr, "connected");
         Ok(Self {
             inner: Arc::new(Inner {
                 addr,
@@ -863,6 +886,8 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                 }
             }
             None => {
+                #[cfg(feature = "tracing")]
+                tracing::trace!("keepalive ping");
                 // The reply goes through the same in-order queue as every
                 // request, so the reader matches it; nobody waits on the
                 // receiver, and a send to it fails silently.
@@ -873,7 +898,9 @@ async fn write_loop<W: AsyncWrite + Unpin>(
                 out.frame(Op::Ping as u8, Bytes::new());
             }
         }
-        if out.flush(&mut w).await.is_err() {
+        if let Err(_e) = out.flush(&mut w).await {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(error = %_e, "write failed");
             // Dropping the write half shuts the socket down for writing, so
             // the reader sees EOF and fails the callers still queued.
             let _ = lost.set(Lost::Transient);
@@ -943,5 +970,10 @@ async fn read_loop<R: AsyncRead + Unpin>(
             _ => break Lost::Transient,
         }
     };
+    #[cfg(feature = "tracing")]
+    match &why {
+        Lost::Transient => tracing::debug!("connection lost"),
+        Lost::Fatal(f) => tracing::error!(error = %f.error(), "connection dead"),
+    }
     let _ = lost.set(why);
 }

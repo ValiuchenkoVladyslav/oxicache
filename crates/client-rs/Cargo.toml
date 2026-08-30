@@ -21,6 +21,12 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = "1"
 rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
+tracing = { version = "0.1", optional = true, default-features = false, features = ["std"] }
+
+[features]
+# Connection-lifecycle events (connects, reconnects, losses) via `tracing`;
+# the per-request path stays uninstrumented.
+tracing = ["dep:tracing"]
 
 [dev-dependencies]
 oxicache-server = { path = "../server" }
