@@ -1,0 +1,46 @@
+# Mirrors .husky/pre-commit: the same commands, in the same order.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # The ubuntu-24.04 image preinstalls stable Rust (1.98 at the time of
+      # writing) with rustfmt; clippy is not in the image's tool list, and
+      # this is a fast no-op when it is.
+      - run: rustup component add clippy rustfmt
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # The TCP transport works around Bun-version-specific quirks
+          # (Bun.connect TLS, node:http2); test against the version the
+          # workarounds were written for.
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+
+      # Rust: format, lint, build, then unit + e2e tests
+      # (client-rs e2e lives in crates/client-rs/tests).
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo build --workspace
+      - run: cargo test --workspace --all-features
+      # byte API without the serde feature
+      - run: cargo test -p oxicache-client
+
+      # TypeScript: type check, build the package, lint, then unit + e2e
+      # tests (bun test spawns the debug server built above).
+      - run: bun run --cwd packages/client-ts check
+      - run: bun run --cwd packages/client-ts build
+      - run: bunx biome check
+      - run: bun test
