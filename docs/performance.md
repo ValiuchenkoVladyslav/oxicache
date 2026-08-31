@@ -597,3 +597,41 @@ deadline costs ~2–3 % of the single-key profile (`Instant::now` twice plus a t
 semantics; deferring the small-retire `Guard::flush` from per-SET to per-wake
 (round 9 showed cross-request deferral hurts allocator warmth; within a wake it
 would not, but it needs a `set_many` variant that hands `Retired` back).
+
+## Round 15: size-class slab on huge pages (2026-08-31)
+
+The round-8 plan, finally executed: entry allocations leave glibc for a process-wide
+size-class slab (`crates/server/src/cache/slab.rs`). Per-class free lists under short
+mutexes, fronted by per-thread magazines that refill/flush ~64 KiB of chunks at a time
+(drained to the lists when a thread exits); chunks are carved from 8 MiB regions,
+2 MiB-aligned and `MADV_HUGEPAGE`d. Classes: 64-byte steps to 1 KiB, then four per
+doubling to 64 KiB (waste ≤ 1/4 + 63 B); every class is a multiple of 64, so entries are
+cache-line aligned for free and round 14's padded-allocation trick is gone. Entries
+beyond 64 KiB stay on glibc (exact size, `Meta::class = 255`). Allocation on one thread,
+free on whichever thread flushes the epoch collector; the magazines fall back to the
+central lists during TLS teardown.
+
+Same harness, both binaries under the shipped `tcache_count=1024`, min of 3 (2 for A/W)
+alternating pairs — better in **every pair on every profile**:
+
+| profile | before (user / total µs/req, req/s) | slab | user delta |
+|---|---|---|---|
+| A: single key 128 B | 0.58 / 1.31, 1.55M | 0.51 / 1.21, 1.63M | **−12 %** |
+| B: 16-key 128 B | 3.97 / 5.25, 528k | 3.45 / 4.60, 626k | **−13 %** (+18 % req/s) |
+| K: 16-key 1 KiB 50/50 | 21.7 / 36.0, 125k | 14.3 / 28.5, 163k | **−34 %** (+30 % req/s) |
+| E: eviction 128 B 50 % w | 10.2 / 12.2, 378k | 8.75 / 10.6, 422k | **−14 %** |
+| W: 12×32 16-key 4 KiB 90 % w | 124 / 247, 17.7k | 104 / 227, 18.9k | **−16 %** |
+
+Huge pages materialise (THP `madvise` mode): 270 of 300 MB RSS on `AnonHugePages`
+during a B run. RSS on the 4 KiB write profile is flat at 771 MB over 16 s. `perf` on K
+afterwards: glibc `malloc` is 1.6 % of user time (the `_int_malloc`/`unlink_chunk`/free
+family was ~20 % on this shape); what remains is `Table::find` 20 %, `Shard::set` 20 %,
+`dispatch` 15 %, entry drop glue 11 %, the non-temporal value copy 10 %, and dead-entry
+compaction ~10 % — compaction is the next visible target.
+
+The trade, measured: slab memory is never returned to the kernel, per class. A server
+that serves one value-size mix and then switches (a 1 GB budget of 4 KiB entries, then
+128 B entries) plateaus at the *sum* of the two mixes' peaks — 1.22 GB RSS in that
+experiment — because the old classes' chunks cannot serve the new sizes. It stops there;
+steady mixes and same-size churn reuse chunks exactly. If mix shifts ever matter, the
+follow-up is one-way splitting of larger free chunks into smaller classes.

@@ -21,6 +21,7 @@ use crossbeam_epoch::Guard;
 use parking_lot::Mutex;
 
 use super::key::Key;
+use super::slab;
 use super::table::{EntryRef, Index, Writer, retire};
 
 /// Maximum frequency value tracked per entry.
@@ -83,8 +84,9 @@ pub struct Meta {
     hash: u64,
     freq: AtomicU8,
     live: AtomicBool,
-    /// Bytes between the allocation base and this header; see [`layout`].
-    pad: u8,
+    /// Slab class of the allocation, or [`GLIBC_CLASS`] for an entry too
+    /// large for the slab, so `Drop` knows where to return it.
+    class: u8,
 }
 
 /// Allocation header of an entry: refcount, value length, metadata. The
@@ -140,54 +142,50 @@ impl Drop for Entry {
         }
         std::sync::atomic::fence(Acquire);
         let len = self.header().len;
-        let pad = self.meta().pad as usize;
+        let class = self.meta().class;
         // SAFETY: last handle; nobody else can observe the allocation.
         unsafe {
             std::ptr::drop_in_place(self.0.as_ptr());
-            std::alloc::dealloc((self.0.as_ptr() as *mut u8).sub(pad), layout(len));
+            if class == GLIBC_CLASS {
+                std::alloc::dealloc(self.0.as_ptr() as *mut u8, glibc_layout(len));
+            } else {
+                slab::free(self.0.cast(), class);
+            }
         }
     }
 }
 
-/// Small entries sit on a cache-line boundary so a header plus a short
-/// value spans the minimum number of lines (a 192-byte entry from a
-/// 16-byte-aligned allocation straddles four lines three times out of
-/// four). The boundary comes from over-allocating by [`PAD`] and placing
-/// the header at the first 64-byte mark, not from an aligned allocation:
-/// glibc serves `align > 16` through `_int_memalign`, which bypasses the
-/// per-thread tcache, so every small entry paid the arena's slow path
-/// (`unlink_chunk` alone was ~8 % of user time on the batch profile).
-/// [`Meta::pad`] records the placement for `Drop`. Large values gain
-/// nothing from the alignment and keep the exact-size allocation.
-const PAD: usize = 64 - 16;
+/// [`Meta::class`] value of an entry allocated by the global allocator
+/// because it is larger than the slab serves ([`slab::MAX_SLAB`]).
+const GLIBC_CLASS: u8 = u8::MAX;
 
+/// Layout of a beyond-the-slab entry: exact size, natural alignment.
 #[inline]
-fn layout(len: usize) -> std::alloc::Layout {
-    let (size, align) = if len < NT_MIN {
-        (HEADER + len + PAD, 16)
-    } else {
-        (HEADER + len, std::mem::align_of::<Header>())
-    };
-    std::alloc::Layout::from_size_align(size, align).expect("entry size overflow")
+fn glibc_layout(len: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(HEADER + len, std::mem::align_of::<Header>())
+        .expect("entry size overflow")
 }
 
 impl Entry {
     pub(super) fn new(key: Key, value: &[u8], hash: u64) -> Self {
-        let layout = layout(value.len());
-        // SAFETY: layout is nonzero-sized; the header is written before use
-        // and the value bytes are fully initialised by `copy_value`.
-        unsafe {
-            let base = std::alloc::alloc(layout);
-            if base.is_null() {
-                std::alloc::handle_alloc_error(layout)
+        // The slab serves every size it covers 64-byte aligned from huge
+        // pages; only entries beyond it go to the global allocator.
+        let (p, class) = match slab::alloc(HEADER + value.len()) {
+            Some((p, class)) => (p.cast::<Header>(), class),
+            None => {
+                let layout = glibc_layout(value.len());
+                // SAFETY: `layout` is nonzero-sized.
+                let p = unsafe { std::alloc::alloc(layout) } as *mut Header;
+                let Some(p) = NonNull::new(p) else {
+                    std::alloc::handle_alloc_error(layout)
+                };
+                (p, GLIBC_CLASS)
             }
-            let pad = if value.len() < NT_MIN {
-                base.align_offset(64)
-            } else {
-                0
-            };
-            debug_assert!(pad <= PAD);
-            let p = NonNull::new_unchecked(base.add(pad) as *mut Header);
+        };
+        // SAFETY: the chunk holds `HEADER + value.len()` bytes; the header
+        // is written before use and the value bytes are fully initialised
+        // by `copy_value`.
+        unsafe {
             p.as_ptr().write(Header {
                 rc: AtomicUsize::new(1),
                 len: value.len(),
@@ -196,7 +194,7 @@ impl Entry {
                     hash,
                     freq: AtomicU8::new(0),
                     live: AtomicBool::new(true),
-                    pad: pad as u8,
+                    class,
                 },
             });
             copy_value(p.as_ptr().cast::<u8>().add(HEADER), value);
@@ -666,7 +664,17 @@ mod tests {
 
     #[test]
     fn entry_layout_and_copies() {
-        for len in [0, 1, 31, 64, 1000, NT_MIN, NT_MIN + 33, 3 * NT_MIN + 7] {
+        for len in [
+            0,
+            1,
+            31,
+            64,
+            1000,
+            NT_MIN,
+            NT_MIN + 33,
+            3 * NT_MIN + 7,
+            slab::MAX_SLAB + 100, // beyond the slab: global-allocator path
+        ] {
             let v: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
             let e = Entry::new(Key::new(b"k"), &v, 7);
             assert_eq!(e.value(), &v[..]);

@@ -412,6 +412,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "oxicache-wire",
  "parking_lot",
  "rapidhash",

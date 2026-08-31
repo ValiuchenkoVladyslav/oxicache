@@ -5,6 +5,7 @@
 
 mod key;
 mod s3fifo;
+mod slab;
 mod table;
 
 use std::cell::Cell;
