@@ -198,7 +198,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // explicitly: with a timer installed hyper would otherwise fall back to
     // its own 30 s default.
     let mut builder = http1::Builder::new();
-    builder.timer(TokioTimer::new()).header_read_timeout(idle);
+    // No automatic `Date` header: nothing reads it, and every response is
+    // ~37 bytes smaller without it.
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(idle)
+        .auto_date_header(false);
     let conn = builder.serve_connection(TokioIo::new(stream), svc);
     tokio::pin!(conn);
     let res = tokio::select! {
@@ -211,22 +216,16 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     Ok(res?)
 }
 
-fn reply(code: StatusCode, body: Bytes, binary: bool) -> Response<Full<Bytes>> {
+/// A response is the status code and the frame body (or a UTF-8 message);
+/// no content type is declared — neither side reads one.
+fn reply(code: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
     let mut res = Response::new(Full::new(body));
     *res.status_mut() = code;
-    res.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static(if binary {
-            "application/octet-stream"
-        } else {
-            "text/plain; charset=utf-8"
-        }),
-    );
     res
 }
 
 fn text(code: StatusCode, msg: impl Into<Bytes>) -> Response<Full<Bytes>> {
-    reply(code, msg.into(), false)
+    reply(code, msg.into())
 }
 
 /// Every response sent before the token has been verified closes the
@@ -255,7 +254,7 @@ async fn handle(
 ) -> Response<Full<Bytes>> {
     let op = match req.uri().path() {
         // Status code only, no body: a probe target.
-        "/health" => return closing(reply(StatusCode::OK, Bytes::new(), false)),
+        "/health" => return closing(reply(StatusCode::OK, Bytes::new())),
         // The one authenticated GET; the token gates it like any other path.
         "/metrics" => {
             if req.method() != Method::GET {
@@ -267,11 +266,7 @@ async fn handle(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return closing(text(StatusCode::UNAUTHORIZED, "auth required"));
             }
-            return reply(
-                StatusCode::OK,
-                Bytes::from(metrics.render(cache, limit)),
-                false,
-            );
+            return reply(StatusCode::OK, Bytes::from(metrics.render(cache, limit)));
         }
         "/get" => Op::Get,
         "/set" => Op::Set,
@@ -316,13 +311,13 @@ async fn handle(
     debug_assert_eq!(raw.len(), wire::HEADER_LEN + len);
     let body = raw.slice(wire::HEADER_LEN..);
     match Status::from_u8(status) {
-        Some(Status::Ok) => reply(StatusCode::OK, body, true),
-        Some(Status::NotFound) => reply(StatusCode::NOT_FOUND, body, true),
-        Some(Status::BadRequest) => reply(StatusCode::BAD_REQUEST, body, false),
-        Some(Status::TooLarge) => reply(StatusCode::PAYLOAD_TOO_LARGE, body, false),
-        Some(Status::Unauthorized) => reply(StatusCode::UNAUTHORIZED, body, false),
+        Some(Status::Ok) => reply(StatusCode::OK, body),
+        Some(Status::NotFound) => reply(StatusCode::NOT_FOUND, body),
+        Some(Status::BadRequest) => reply(StatusCode::BAD_REQUEST, body),
+        Some(Status::TooLarge) => reply(StatusCode::PAYLOAD_TOO_LARGE, body),
+        Some(Status::Unauthorized) => reply(StatusCode::UNAUTHORIZED, body),
         // The path already selected a known op, so this cannot happen.
-        Some(Status::UnknownOp) | None => reply(StatusCode::INTERNAL_SERVER_ERROR, body, false),
+        Some(Status::UnknownOp) | None => reply(StatusCode::INTERNAL_SERVER_ERROR, body),
     }
 }
 
