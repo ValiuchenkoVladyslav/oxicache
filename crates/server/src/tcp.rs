@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
+use crossbeam_epoch as epoch;
 use oxicache_wire::io::{FrameReader, FrameWriter};
 use oxicache_wire::{self as wire, Op, Status};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -464,33 +465,46 @@ async fn serve_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut reader = FrameReader::new(MAX_AUTH_FRAME);
     let mut out = FrameWriter::new();
     loop {
-        // Serve every complete frame already buffered, then flush once.
-        loop {
-            match reader.next_buffered() {
-                Ok(Some((op, body))) if authed => dispatch(op, body, cache, metrics, &mut out),
-                Ok(Some((op, body))) => {
-                    let ok = op == Op::Auth as u8 && ct_eq(token, body);
-                    if ok {
-                        authed = true;
-                        reader.set_max_frame(MAX_FRAME);
-                        out.header(Status::Ok as u8, 0);
-                    } else {
-                        metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-                        out.frame(
-                            Status::Unauthorized as u8,
-                            Bytes::from_static(b"auth required"),
-                        );
-                        out.flush(&mut w).await?;
-                        return Ok(false);
+        // Serve every complete frame already buffered, then flush once. One
+        // epoch pin covers the whole burst: the pins the cache takes per
+        // request become re-entrant counter bumps instead of full fences,
+        // and a single-key GET borrows its entry under this pin without
+        // touching the refcount. The guard must drop before any await (it
+        // is not `Send`), so a fatal reply only breaks out here and the
+        // flush that closes the connection happens below.
+        let close = {
+            let guard = epoch::pin();
+            loop {
+                match reader.next_buffered() {
+                    Ok(Some((op, body))) if authed => {
+                        dispatch(op, body, cache, metrics, &mut out, &guard)
+                    }
+                    Ok(Some((op, body))) => {
+                        let ok = op == Op::Auth as u8 && ct_eq(token, body);
+                        if ok {
+                            authed = true;
+                            reader.set_max_frame(MAX_FRAME);
+                            out.header(Status::Ok as u8, 0);
+                        } else {
+                            metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+                            out.frame(
+                                Status::Unauthorized as u8,
+                                Bytes::from_static(b"auth required"),
+                            );
+                            break true;
+                        }
+                    }
+                    Ok(None) => break false,
+                    Err(e) => {
+                        out.frame(Status::TooLarge as u8, Bytes::from(e.to_string()));
+                        break true;
                     }
                 }
-                Ok(None) => break,
-                Err(e) => {
-                    out.frame(Status::TooLarge as u8, Bytes::from(e.to_string()));
-                    out.flush(&mut w).await?;
-                    return Ok(false);
-                }
             }
+        };
+        if close {
+            out.flush(&mut w).await?;
+            return Ok(false);
         }
         // Until AUTH the deadline is fixed; after it the idle clock restarts
         // at every wait, so a peer only has to move something within each
@@ -536,9 +550,18 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Route a request to the cache and append the response frame to `out`.
-pub fn dispatch(op: u8, body: &[u8], cache: &Cache, metrics: &Metrics, out: &mut FrameWriter) {
+/// `guard` is the caller's epoch pin; a GET's entry is borrowed under it
+/// (and cloned only when the value is written by reference).
+pub fn dispatch(
+    op: u8,
+    body: &[u8],
+    cache: &Cache,
+    metrics: &Metrics,
+    out: &mut FrameWriter,
+    guard: &epoch::Guard,
+) {
     match Op::from_u8(op) {
-        Some(Op::Get) => match cache.get(body) {
+        Some(Op::Get) => match cache.get_in(body, guard) {
             Some(e) if e.value().len() > MAX_RESPONSE => out.frame(
                 Status::TooLarge as u8,
                 Bytes::from(format!(
@@ -707,7 +730,7 @@ mod tests {
 
     fn call(cache: &Cache, op: u8, body: Bytes) -> (Status, Bytes) {
         let mut out = FrameWriter::new();
-        dispatch(op, &body, cache, &Metrics::new(), &mut out);
+        dispatch(op, &body, cache, &Metrics::new(), &mut out, &epoch::pin());
         let raw = out.take();
         let (status, len) = wire::decode_header(raw[..wire::HEADER_LEN].try_into().unwrap());
         assert_eq!(raw.len(), wire::HEADER_LEN + len);

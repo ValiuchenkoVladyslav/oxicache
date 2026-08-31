@@ -83,6 +83,8 @@ pub struct Meta {
     hash: u64,
     freq: AtomicU8,
     live: AtomicBool,
+    /// Bytes between the allocation base and this header; see [`layout`].
+    pad: u8,
 }
 
 /// Allocation header of an entry: refcount, value length, metadata. The
@@ -138,26 +140,35 @@ impl Drop for Entry {
         }
         std::sync::atomic::fence(Acquire);
         let len = self.header().len;
+        let pad = self.meta().pad as usize;
         // SAFETY: last handle; nobody else can observe the allocation.
         unsafe {
             std::ptr::drop_in_place(self.0.as_ptr());
-            std::alloc::dealloc(self.0.as_ptr() as *mut u8, layout(len));
+            std::alloc::dealloc((self.0.as_ptr() as *mut u8).sub(pad), layout(len));
         }
     }
 }
 
-/// Small entries are cache-line aligned so a header plus a short value spans
-/// the minimum number of lines (a 192-byte entry from a 16-byte-aligned
-/// allocation straddles four lines three times out of four). Large values
-/// pay glibc's aligned-allocation overhead without a proportionate gain.
+/// Small entries sit on a cache-line boundary so a header plus a short
+/// value spans the minimum number of lines (a 192-byte entry from a
+/// 16-byte-aligned allocation straddles four lines three times out of
+/// four). The boundary comes from over-allocating by [`PAD`] and placing
+/// the header at the first 64-byte mark, not from an aligned allocation:
+/// glibc serves `align > 16` through `_int_memalign`, which bypasses the
+/// per-thread tcache, so every small entry paid the arena's slow path
+/// (`unlink_chunk` alone was ~8 % of user time on the batch profile).
+/// [`Meta::pad`] records the placement for `Drop`. Large values gain
+/// nothing from the alignment and keep the exact-size allocation.
+const PAD: usize = 64 - 16;
+
 #[inline]
 fn layout(len: usize) -> std::alloc::Layout {
-    let align = if len < NT_MIN {
-        64
+    let (size, align) = if len < NT_MIN {
+        (HEADER + len + PAD, 16)
     } else {
-        std::mem::align_of::<Header>()
+        (HEADER + len, std::mem::align_of::<Header>())
     };
-    std::alloc::Layout::from_size_align(HEADER + len, align).expect("entry size overflow")
+    std::alloc::Layout::from_size_align(size, align).expect("entry size overflow")
 }
 
 impl Entry {
@@ -166,10 +177,17 @@ impl Entry {
         // SAFETY: layout is nonzero-sized; the header is written before use
         // and the value bytes are fully initialised by `copy_value`.
         unsafe {
-            let p = std::alloc::alloc(layout) as *mut Header;
-            let Some(p) = NonNull::new(p) else {
+            let base = std::alloc::alloc(layout);
+            if base.is_null() {
                 std::alloc::handle_alloc_error(layout)
+            }
+            let pad = if value.len() < NT_MIN {
+                base.align_offset(64)
+            } else {
+                0
             };
+            debug_assert!(pad <= PAD);
+            let p = NonNull::new_unchecked(base.add(pad) as *mut Header);
             p.as_ptr().write(Header {
                 rc: AtomicUsize::new(1),
                 len: value.len(),
@@ -178,6 +196,7 @@ impl Entry {
                     hash,
                     freq: AtomicU8::new(0),
                     live: AtomicBool::new(true),
+                    pad: pad as u8,
                 },
             });
             copy_value(p.as_ptr().cast::<u8>().add(HEADER), value);

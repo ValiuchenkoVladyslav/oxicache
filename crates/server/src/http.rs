@@ -305,7 +305,14 @@ async fn handle(
         Err(e) => return text(StatusCode::BAD_REQUEST, e.to_string()),
     };
     let mut out = FrameWriter::new();
-    tcp::dispatch(op as u8, &body, cache, metrics, &mut out);
+    tcp::dispatch(
+        op as u8,
+        &body,
+        cache,
+        metrics,
+        &mut out,
+        &crossbeam_epoch::pin(),
+    );
     let raw = out.take_bytes();
     let (status, len) = wire::decode_header(raw[..wire::HEADER_LEN].try_into().expect("header"));
     debug_assert_eq!(raw.len(), wire::HEADER_LEN + len);

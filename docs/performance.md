@@ -572,3 +572,28 @@ quiet machine, min-of-3 (baseline → with metrics):
 
 Deltas flip sign between pairs on every profile; the per-key variant's regression was
 outside that band and is the shape to avoid in future counters.
+
+## Round 14: glibc fast paths and per-wake epoch pin (2026-08-31)
+
+`perf` on the 16-key 128 B profile put ~15 % of user time in glibc's allocator —
+`unlink_chunk` alone at 7.5 % — and 4 % in `Guard::flush`/`try_advance` on the
+single-key profile. Same harness as round 13 (2 s warm-up, 6 s runs, min of 3
+alternating pairs, server user/sys from `/proc`); profiles: A single key 128 B 10 % w,
+B 16-key batch 128 B 10 % w, K 16-key 1 KiB 50/50, W 12×32 16-key 4 KiB 90 % w
+(66 KiB frames), E 16-key 128 B 50 % w, 1M keys, `--capacity 32M` (evicting).
+
+| change | measurement | verdict |
+|---|---|---|
+| small entries allocated 16-aligned with the header placed at the first 64-byte boundary inside a `PAD = 48`-byte-padded allocation (`Meta::pad` records the offset for `Drop`), replacing the round-8 `align = 64` allocation: glibc serves `align > 16` through `_int_memalign`, which bypasses the per-thread tcache, so every small entry paid the arena path | B: user 4.23 → 3.99 µs/req (−5.5 %, every pair), +3 % req/s; E: user −5.5 % (both pairs); A, K, W neutral; RSS flat. `_int_memalign` gone from the profile, `unlink_chunk` 7.5 → 4.1 % | kept |
+| one epoch pin per connection wake (`serve_connection` drains every buffered frame under a single guard; `dispatch` takes `&Guard`): the cache's per-request pins become re-entrant counter bumps instead of full fences, and a single-key GET borrows its entry under the wake's pin (`Cache::get_in`) with no refcount round-trip | A: total 1.385 → 1.362 µs/req, better in 6/6 pairs (−1.5 %); B, W neutral | kept |
+| `GLIBC_TUNABLES=glibc.malloc.tcache_count=1024` (default 7 chunks per bin; a 16-SET batch frees in bursts that overflow it). Env-only — no `mallopt` — so it ships as a `Dockerfile` `ENV` and a README note rather than in `tune_allocator` | E: user 12.3 → 10.3 (−16 %), total −20 %, +14 % req/s (both pairs); A: +6–7 % req/s, total neutral; B, W neutral | kept (deployment env) |
+
+Still open, in expected-value order: a size-class slab on an `MADV_HUGEPAGE` region
+(glibc is still ~14 % of B-profile user time, and 1 KiB+ entries never fit tcache);
+PGO — blocked on this box, rustc 1.98 has no matching `llvm-profdata` (no rustup
+`llvm-tools`, no Void llvm package installed) and BOLT is likewise absent; the idle
+deadline costs ~2–3 % of the single-key profile (`Instant::now` twice plus a timer
+(de)registration per wake) but a coarser scheme needs care around the flush-stall
+semantics; deferring the small-retire `Guard::flush` from per-SET to per-wake
+(round 9 showed cross-request deferral hurts allocator warmth; within a wake it
+would not, but it needs a `set_many` variant that hands `Retired` back).

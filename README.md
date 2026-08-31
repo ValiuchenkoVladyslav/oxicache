@@ -117,6 +117,13 @@ OXICACHE_TOKEN=s3cret OXICACHE_HTTP_ADDR=0.0.0.0:4434 OXICACHE_CAPACITY=1G cargo
 A missing token, an unparseable value or an unreadable certificate file is a startup error
 naming the variable. SIGINT or SIGTERM stops accepting and drains open connections before exit.
 
+On glibc systems, run the server with `GLIBC_TUNABLES=glibc.malloc.tcache_count=1024`:
+write batches free entries in bursts that overflow the default 7-chunk-per-bin thread
+cache into the allocator's slow path, and the tunable is worth up to −20 % server CPU
+per request under eviction-heavy load (docs/performance.md, round 14). It is read from
+the environment at startup — the server cannot set it for itself — and the `Dockerfile`
+already sets it, so only bare-metal deployments need to.
+
 ### Container
 
 The `Dockerfile` builds the release binary (workspace profile: fat LTO, one codegen unit)

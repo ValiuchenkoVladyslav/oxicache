@@ -379,6 +379,11 @@ impl FrameWriter {
 /// defaults the heap top is trimmed after each burst and page-faulted back
 /// in on the next, which makes every copy into a fresh buffer run at
 /// page-fault speed. No-op on non-glibc targets.
+///
+/// One knob this cannot reach: `glibc.malloc.tcache_count` has no `mallopt`
+/// and is read from `GLIBC_TUNABLES` before `main`, so it is set in the
+/// server's environment instead (Dockerfile, README); measured well worth
+/// it on entry-churning loads (docs/performance.md, round 14).
 pub fn tune_allocator() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: mallopt only adjusts allocator parameters.

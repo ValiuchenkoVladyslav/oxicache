@@ -72,15 +72,23 @@ impl Cache {
     /// Look up one key. The returned handle keeps the value alive.
     #[inline]
     pub fn get(&self, key: &[u8]) -> Option<Entry> {
-        let (shard, hash) = self.locate(key);
         let guard = epoch::pin();
-        let Some(e) = shard.get(hash, key, &guard) else {
+        self.get_in(key, &guard).map(|e| Entry::clone(&e))
+    }
+
+    /// Look up one key under the caller's epoch pin. The entry is borrowed,
+    /// not cloned: no refcount is touched, and the borrow lives as long as
+    /// the pin does.
+    #[inline]
+    pub fn get_in<'g>(&self, key: &[u8], guard: &'g epoch::Guard) -> Option<EntryRef<'g>> {
+        let (shard, hash) = self.locate(key);
+        let Some(e) = shard.get(hash, key, guard) else {
             shard.stats.get_misses.fetch_add(1, Relaxed);
             return None;
         };
         shard.stats.get_hits.fetch_add(1, Relaxed);
         e.touch();
-        Some(Entry::clone(&e))
+        Some(e)
     }
 
     /// Look up many keys and hand the resolved entries (in key order) to `f`.

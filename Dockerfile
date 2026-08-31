@@ -16,5 +16,11 @@ RUN cargo build --release --locked -p oxicache-server
 FROM docker.io/library/debian:bookworm-slim
 COPY --from=build /src/target/release/oxicache-server /usr/local/bin/oxicache-server
 USER 65534:65534
+# The per-thread tcache holds only 7 chunks per size class by default; a
+# 16-item write batch retires entries in bursts that overflow it into the
+# arena's slow path. 1024 costs a few hundred KiB per thread at most and
+# was measured -20 % server CPU/req on the eviction-heavy profile
+# (docs/performance.md, round 14). Env-only: glibc reads it at startup.
+ENV GLIBC_TUNABLES=glibc.malloc.tcache_count=1024
 EXPOSE 4433
 ENTRYPOINT ["/usr/local/bin/oxicache-server"]
