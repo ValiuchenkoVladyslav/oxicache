@@ -1,6 +1,7 @@
 {
   "name": "oxicache",
   "private": true,
+  "packageManager": "bun@1.3.14",
   "workspaces": [
     "packages/*"
   ],

@@ -24,13 +24,13 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           # The TCP transport works around Bun-version-specific quirks
-          # (Bun.connect TLS, node:http2); test against the version the
-          # workarounds were written for.
-          bun-version: 1.3.14
+          # (Bun.connect TLS, node:http2); test against the pinned version
+          # the workarounds were written for. The pin lives in
+          # package.json's packageManager field, which dependabot and
+          # setup-bun both read.
+          bun-version-file: package.json
       - run: bun install --frozen-lockfile
 
-      # Rust: format, lint, build, then unit + e2e tests
-      # (client-rs e2e lives in crates/client-rs/tests).
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo build --workspace
@@ -38,8 +38,6 @@ jobs:
       # byte API without the serde feature
       - run: cargo test -p oxicache-client
 
-      # TypeScript: type check, build the package, lint, then unit + e2e
-      # tests (bun test spawns the debug server built above).
       - run: bun run --cwd packages/client-ts check
       - run: bun run --cwd packages/client-ts build
       - run: bunx biome check
