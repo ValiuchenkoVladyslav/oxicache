@@ -1,11 +1,9 @@
-# Rust: format, lint, build, then unit + e2e tests (client-rs e2e lives in crates/client-rs/tests).
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo build --workspace
 cargo test --workspace --all-features
 cargo test -p oxicache-client  # byte API without the serde feature
 
-# TypeScript: type check, build the package, lint, then unit + e2e tests.
 bun run --cwd packages/client-ts check
 bun run --cwd packages/client-ts build
 bunx biome check

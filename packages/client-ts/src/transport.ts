@@ -23,7 +23,6 @@ export class StatusError extends Error {
   }
 }
 
-/** The transport is closed (or was closed before a reply arrived). */
 /** Whether a status is an answer rather than a refusal. */
 export function isAnswer(
   status: number,
@@ -31,6 +30,7 @@ export function isAnswer(
   return status === Status.Ok || status === Status.NotFound;
 }
 
+/** The transport is closed (or was closed before a reply arrived). */
 export class ClosedError extends Error {
   override name = "ClosedError";
   constructor(cause?: unknown) {
