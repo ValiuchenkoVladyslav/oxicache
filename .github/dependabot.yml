@@ -9,3 +9,5 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "@biomejs/biome" # new biome version fails ci when it tries to validate against $schema field
