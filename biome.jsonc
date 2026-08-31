@@ -1,5 +1,5 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.5.8/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.5.11/schema.json",
 
   "files": {
     "includes": ["**"]
@@ -56,7 +56,6 @@
         "noUnnecessaryTemplateExpression": "error",
         "noUselessTypeConversion": "error",
         "useAwaitThenable": "error",
-        "useIframeSandbox": "error",
         "useImportsFirst": "error",
         "useNullishCoalescing": "error"
       },
@@ -64,9 +63,6 @@
         "noAwaitInLoops": "error",
         "noDelete": "error",
         "useTopLevelRegex": "error"
-      },
-      "security": {
-        "noScriptUrl": "error"
       }
     }
   }
