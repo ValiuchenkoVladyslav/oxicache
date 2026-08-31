@@ -1,6 +1,6 @@
 # oxicache
 
-In-memory cache server in Rust: [S3-FIFO](https://blog.jasony.me/system/cache/2023/08/01/s3fifo)
+In-memory cache server in Rust: [S3-FIFO](https://s3fifo.com)
 eviction, length-prefixed binary frames over plain TCP (and the same frames over HTTP/1.1 for
 runtimes without sockets), tokio multi-threaded runtime. No persistence.
 
