@@ -635,3 +635,22 @@ that serves one value-size mix and then switches (a 1 GB budget of 4 KiB entries
 experiment — because the old classes' chunks cannot serve the new sizes. It stops there;
 steady mixes and same-size churn reuse chunks exactly. If mix shifts ever matter, the
 follow-up is one-way splitting of larger free chunks into smaller classes.
+
+## Round 16: compaction fused, write-path prefetch (2026-08-31)
+
+The two items round 15's profile pointed at, measured separately, same harness, both
+sides under `tcache_count=1024`:
+
+| change | measurement (vs the round-15 binary) | verdict |
+|---|---|---|
+| dead-entry compaction walks once: the cost of kept entries is summed off the line the liveness check just loaded (`compact` returns it), replacing the second full dereferencing walk that recomputed `small_bytes`; the lookahead prefetches only the header line (`Entry::prefetch_header`) — a queue walk never reads value bytes, so `Entry::prefetch`'s value lines were wasted bandwidth | K: user better 3/3 pairs (−1.5 %), req/s +3 % every pair (161.5k → 166k); `compact`+`maybe_compact` fell from ~10 % of K user time to 1.7 % | kept |
+| `set_many`/`del_many` prefetch candidate buckets, then tag-matching entries, before the write pass (the `get_many` pattern from round 6): the insert's existence check dereferences entries for a key compare, previously a cold miss inside the shard's critical section; the `I::IntoIter: Clone` bound on `set_many` is gone (fit-checking happens in the locate pass) | K: user −2.4 %, 3/3 pairs; E: user 8.68 → 8.29 (−4.5 %, 3/3), +4 % req/s; B: +1–2 % req/s every pair; A and W neutral | kept |
+
+Cumulative on K vs round 15: user ~14.5 → ~14.0, req/s 161k → 167k. Less than the
+~10 % + 20 % the profile shares suggested: the compaction walk's second pass was
+partly cache-hot, and the set-side prefetch converts stalls in `find` (20 → 12.7 %)
+into visible overlap work in `prefetch_entries` (12.7 %) rather than removing the
+DRAM traffic. The K profile is now: `Shard::set` 25 % (with `maybe_compact` inlined),
+`find` + `prefetch_entries` 25 %, non-temporal copy 12 %, entry drop glue 10 %,
+`dispatch` 9 %, glibc ~4 % — dependent memory latency and the value copy itself,
+with no cheap structural waste left visible.

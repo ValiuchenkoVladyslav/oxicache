@@ -243,6 +243,19 @@ impl Entry {
         }
     }
 
+    /// Hint the CPU to fetch only the header line: enough for `live`,
+    /// `freq` and [`cost`](Self::cost), which is all a queue walk reads —
+    /// [`prefetch`](Self::prefetch) would pull value lines in for nothing.
+    #[inline]
+    pub(super) fn prefetch_header(&self) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: prefetch is a pure hint; it never faults or dereferences.
+        unsafe {
+            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            _mm_prefetch(self.0.as_ptr() as *const i8, _MM_HINT_T0);
+        }
+    }
+
     #[inline]
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
         a.0 == b.0
@@ -599,27 +612,32 @@ impl Shard {
         if q.dead_bytes <= self.capacity / 4 {
             return;
         }
-        compact(&mut q.small);
+        q.small_bytes = compact(&mut q.small);
         compact(&mut q.main);
-        q.small_bytes = q.small.iter().map(|e| e.cost()).sum();
         q.dead_bytes = 0;
     }
 }
 
-/// Stable in-place removal of dead entries. Each liveness check dereferences
-/// an entry, so the walk prefetches a few entries ahead to overlap the misses.
-fn compact(q: &mut VecDeque<Entry>) {
+/// Stable in-place removal of dead entries, returning the cost of the
+/// entries kept. Each liveness check dereferences an entry, so the walk
+/// prefetches a few headers ahead to overlap the misses; the cost is
+/// summed in the same pass, off the line the liveness check just loaded,
+/// so the byte accounting needs no second dereferencing walk.
+fn compact(q: &mut VecDeque<Entry>) -> usize {
     const AHEAD: usize = 8;
     let s = q.make_contiguous();
     let n = s.len();
     let mut w = 0;
+    let mut kept = 0;
     for i in 0..n {
         if let Some(e) = s.get(i + AHEAD) {
-            e.prefetch();
+            e.prefetch_header();
         }
         // SAFETY: `w <= i < n == s.len()`.
         unsafe {
-            if s.get_unchecked(i).live().load(Relaxed) {
+            let e = s.get_unchecked(i);
+            if e.live().load(Relaxed) {
+                kept += e.cost();
                 let p = s.as_mut_ptr();
                 std::ptr::swap(p.add(w), p.add(i));
                 w += 1;
@@ -627,6 +645,7 @@ fn compact(q: &mut VecDeque<Entry>) {
         }
     }
     q.truncate(w);
+    kept
 }
 
 #[cfg(test)]

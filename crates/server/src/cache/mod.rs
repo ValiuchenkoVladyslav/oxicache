@@ -142,19 +142,30 @@ impl Cache {
     /// Store many entries under a single epoch pin. An entry that could
     /// never fit its shard fails the whole batch before anything is written,
     /// rather than flushing every resident entry of that shard to make room.
+    /// Candidate buckets and then the tag-matching entries of every key are
+    /// prefetched before the writes: the insert's existence check
+    /// dereferences entries for a key compare, and this overlaps those
+    /// misses across the batch instead of paying each one inside its
+    /// shard's critical section.
     pub fn set_many<'a, I>(&self, entries: I) -> std::result::Result<(), TooLarge>
     where
         I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
-        I::IntoIter: Clone,
     {
         let entries = entries.into_iter();
-        for (k, v) in entries.clone() {
-            self.shards[0].check_fits(k, v)?;
-        }
         let guard = epoch::pin();
-        let mut retired = Retired::default();
+        let mut located: Vec<(&Shard, u64, &'a [u8], &'a [u8])> =
+            Vec::with_capacity(entries.size_hint().0);
         for (k, v) in entries {
+            self.shards[0].check_fits(k, v)?;
             let (shard, hash) = self.locate(k);
+            shard.prefetch(hash, &guard);
+            located.push((shard, hash, k, v));
+        }
+        for (shard, hash, ..) in &located {
+            shard.prefetch_entries(*hash, &guard);
+        }
+        let mut retired = Retired::default();
+        for (shard, hash, k, v) in located {
             retired += shard.set(k, v, hash, &guard);
         }
         collect(&guard, retired);
@@ -168,18 +179,29 @@ impl Cache {
         found
     }
 
-    /// Delete many keys under a single epoch pin, reporting each result to `f`.
+    /// Delete many keys under a single epoch pin, reporting each result to
+    /// `f`. Buckets and candidate entries are prefetched up front, as in
+    /// [`set_many`](Self::set_many).
     pub fn del_many<'a, I, F>(&self, keys: I, mut f: F)
     where
         I: IntoIterator<Item = &'a [u8]>,
         F: FnMut(bool),
     {
         let guard = epoch::pin();
+        let keys = keys.into_iter();
+        let mut located: Vec<(&Shard, u64, &'a [u8])> = Vec::with_capacity(keys.size_hint().0);
+        for k in keys {
+            let (shard, hash) = self.locate(k);
+            shard.prefetch(hash, &guard);
+            located.push((shard, hash, k));
+        }
+        for (shard, hash, _) in &located {
+            shard.prefetch_entries(*hash, &guard);
+        }
         let mut retired = Retired::default();
         let (mut hits, mut total) = (0, 0);
         let mut last = None;
-        for k in keys {
-            let (shard, hash) = self.locate(k);
+        for (shard, hash, k) in located {
             let found = shard.del(hash, k, &guard);
             if let Some(r) = found {
                 hits += 1;
