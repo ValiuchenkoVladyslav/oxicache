@@ -34,7 +34,11 @@ export interface HttpOptions {
   tls?: TlsOptions;
 }
 
-/** The part of `fetch` the transport uses. */
+/**
+ * The part of `fetch` the transport uses. The transport reuses one `init`
+ * object across calls (only `body` changes), so a custom `fetch` must read
+ * `init` before its first `await`, as real `fetch` does.
+ */
 export type Fetch = (
   url: string,
   init: RequestInit & { tls?: TlsOptions },
@@ -63,34 +67,39 @@ const TRAILING_SLASHES = /\/+$/;
 
 class HttpTransport implements Transport {
   private readonly base: string;
-  private readonly headers: Record<string, string>;
   private readonly fetch: Fetch;
-  private readonly tls: TlsOptions | undefined;
+  /** Built once and reused; `request` only swaps the body in. */
+  private readonly init: RequestInit & { tls?: TlsOptions };
   private closed: ClosedError | null = null;
 
   constructor(opts: HttpOptions) {
     this.base = String(opts.url).replace(TRAILING_SLASHES, "");
-    this.headers = {
-      "content-type": "application/octet-stream",
-      authorization: `Bearer ${opts.token}`,
-    };
     this.fetch = opts.fetch ?? globalThis.fetch;
-    this.tls = opts.tls;
+    // Only what the server reads; no content type — neither side looks
+    // at one, and the body is the raw frame body either way.
+    this.init = {
+      method: "POST",
+      headers: { authorization: `Bearer ${opts.token}` },
+      ...(opts.tls && { tls: opts.tls }),
+    };
   }
 
   async request(frame: Uint8Array): Promise<Reply> {
     if (this.closed) throw this.closed;
-    // The op byte picks the path; the token travels as a header instead of
-    // an AUTH frame, so AUTH has nothing to send.
+    // The op byte picks the path. The token travels as a header on every
+    // request instead of an AUTH frame, so sending one is a caller bug.
     const op = frame[0] as Op;
-    if (op === Op.Auth) return { status: Status.Ok, body: new Uint8Array(0) };
-    const res = await this.fetch(this.base + PATH[op], {
-      method: "POST",
-      headers: this.headers,
-      // The view is always over a plain ArrayBuffer; the cast only narrows the generic.
-      body: frame.subarray(HEADER_LEN) as Uint8Array<ArrayBuffer>,
-      ...(this.tls && { tls: this.tls }),
-    });
+    if (op === Op.Auth) {
+      throw new Error(
+        "AUTH is not a request over HTTP: the token rides as the Authorization header",
+      );
+    }
+    // `fetch` consumes `init` before it returns (the Request is built
+    // synchronously), so one reused object is safe across concurrent
+    // calls. The view is over a plain ArrayBuffer; the cast narrows the
+    // generic.
+    this.init.body = frame.subarray(HEADER_LEN) as Uint8Array<ArrayBuffer>;
+    const res = await this.fetch(this.base + PATH[op], this.init);
     const body = new Uint8Array(await res.arrayBuffer());
     if (res.ok) return { status: Status.Ok, body };
     // The path is known, so an empty 404 is the key's absence; an unknown

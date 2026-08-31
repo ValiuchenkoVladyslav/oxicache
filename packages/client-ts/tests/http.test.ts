@@ -122,8 +122,10 @@ describe("http transport e2e", () => {
     expect((e502 as Error).message).toBe(
       "server returned HTTP 502: bad gateway",
     );
-    // AUTH has nothing to send: the token is a header on every request.
-    expect((await t.request(AUTH_FRAME)).body.length).toBe(0);
+    // AUTH is refused loudly: the token is a header on every request.
+    await expect(t.request(AUTH_FRAME)).rejects.toThrow(
+      "AUTH is not a request over HTTP",
+    );
     // A key the server does not have is a 404 without a body: an answer.
     const miss = await t.request(new Uint8Array([Op.Get, 1, 0, 0, 0, 0x7a]));
     expect(miss).toEqual({ status: Status.NotFound, body: new Uint8Array(0) });
@@ -152,7 +154,7 @@ describe("http transport e2e", () => {
     expect(s.url).toBe("http://cache.example/del");
     expect([...s.body]).toEqual([...frame.subarray(HEADER_LEN)]);
     expect(s.headers.get("authorization")).toBe("Bearer tok");
-    expect(s.headers.get("content-type")).toBe("application/octet-stream");
+    expect(s.headers.get("content-type")).toBeNull();
   });
 });
 
