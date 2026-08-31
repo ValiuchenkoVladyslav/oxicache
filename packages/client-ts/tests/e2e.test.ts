@@ -189,23 +189,30 @@ describe("tcp transport e2e", () => {
   });
 
   test("a refused op rejects the batch, naming the op", async () => {
-    const c = await Client.connect(tcp({ port: server.port, token: "any" }));
-    // 256 MiB across 16 shards: a value this big fits no shard.
-    const huge = new Uint8Array(32 << 20);
-    const err = await c
-      .batch([op.set("ok", 1), op.set("huge", huge), op.get("ok")])
-      .catch((e) => e);
-    expect(err).toBeInstanceOf(StatusError);
-    expect((err as StatusError).status).toBe(Status.TooLarge);
-    expect((err as Error).message).toContain("item 1:");
-    // The ops the server accepted were still applied.
-    expect(await c.get<number>("ok")).toBe(1);
-    await expect(c.set("huge", huge)).rejects.toBeInstanceOf(StatusError);
-    // Too many ops never reach the wire.
-    expect(() => c.batch(new Array(65537).fill(op.get("x")))).toThrow(
-      RangeError,
-    );
-    c.close();
+    // A dedicated 4 MiB server: the shard count follows the host's CPU
+    // count, but a value bigger than the whole capacity fits no shard
+    // whatever that count is.
+    const small = await startServer({ OXICACHE_CAPACITY: "4M" });
+    try {
+      const c = await Client.connect(tcp({ port: small.port, token: "any" }));
+      const huge = new Uint8Array(8 << 20);
+      const err = await c
+        .batch([op.set("ok", 1), op.set("huge", huge), op.get("ok")])
+        .catch((e) => e);
+      expect(err).toBeInstanceOf(StatusError);
+      expect((err as StatusError).status).toBe(Status.TooLarge);
+      expect((err as Error).message).toContain("item 1:");
+      // The ops the server accepted were still applied.
+      expect(await c.get<number>("ok")).toBe(1);
+      await expect(c.set("huge", huge)).rejects.toBeInstanceOf(StatusError);
+      // Too many ops never reach the wire.
+      expect(() => c.batch(new Array(65537).fill(op.get("x")))).toThrow(
+        RangeError,
+      );
+      c.close();
+    } finally {
+      await small.stop();
+    }
   });
 
   test("objects of any shape round-trip", async () => {
