@@ -396,10 +396,7 @@ impl Cluster {
                 first.get_or_insert(e);
             }
         }
-        match first {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        first.map_or(Ok(()), Err)
     }
 
     /// Send every item of `batch` to the server that owns its key — one
@@ -474,11 +471,10 @@ impl Cluster {
             let (at, items, result) = joined(joined_result);
             let node = &inner.nodes[at];
             inner.note(node, &result);
-            match result.and_then(|(_, replies)| merge(&mut merged, &mut index, &items, replies)) {
-                Ok(()) => {}
-                Err(e) => {
-                    failure.get_or_insert(e);
-                }
+            if let Err(e) =
+                result.and_then(|(_, replies)| merge(&mut merged, &mut index, &items, replies))
+            {
+                failure.get_or_insert(e);
             }
         }
         match failure {
@@ -549,8 +545,5 @@ struct Group {
 /// up early), so the one way one fails to return is a panic in the client,
 /// which is re-raised in the caller that was waiting for it.
 fn joined<T>(result: std::result::Result<T, tokio::task::JoinError>) -> T {
-    match result {
-        Ok(value) => value,
-        Err(e) => std::panic::resume_unwind(e.into_panic()),
-    }
+    result.unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()))
 }

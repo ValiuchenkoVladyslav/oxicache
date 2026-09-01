@@ -18,21 +18,21 @@ impl Key {
         if k.len() <= INLINE {
             let mut buf = [0u8; INLINE];
             buf[..k.len()].copy_from_slice(k);
-            Key::Inline(k.len() as u8, buf)
+            Self::Inline(k.len() as u8, buf)
         } else {
-            Key::Heap(k.into())
+            Self::Heap(k.into())
         }
     }
 
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
         match self {
-            Key::Inline(len, buf) => {
+            Self::Inline(len, buf) => {
                 debug_assert!(*len as usize <= INLINE);
                 // SAFETY: `new` only builds `Inline` with `len <= INLINE`.
                 unsafe { buf.get_unchecked(..*len as usize) }
             }
-            Key::Heap(b) => b,
+            Self::Heap(b) => b,
         }
     }
 }

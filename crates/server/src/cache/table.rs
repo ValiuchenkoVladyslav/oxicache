@@ -162,8 +162,8 @@ impl Drop for Table {
         if !*self.owns.get_mut() {
             return;
         }
-        for b in self.buckets.iter_mut() {
-            for s in b.0.iter_mut() {
+        for b in &mut self.buckets {
+            for s in &mut b.0 {
                 let w = *s.get_mut();
                 if w != 0 {
                     // SAFETY: an owning table holds one handle per nonzero slot.

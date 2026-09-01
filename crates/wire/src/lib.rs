@@ -41,15 +41,15 @@ pub enum Op {
 
 impl Op {
     pub fn from_u8(b: u8) -> Option<Self> {
-        match b {
-            1 => Some(Op::Get),
-            2 => Some(Op::Set),
-            3 => Some(Op::Del),
-            4 => Some(Op::Auth),
-            5 => Some(Op::Ping),
-            6 => Some(Op::Batch),
-            _ => None,
-        }
+        Some(match b {
+            1 => Self::Get,
+            2 => Self::Set,
+            3 => Self::Del,
+            4 => Self::Auth,
+            5 => Self::Ping,
+            6 => Self::Batch,
+            _ => return None,
+        })
     }
 }
 
@@ -68,15 +68,15 @@ pub enum Status {
 
 impl Status {
     pub fn from_u8(b: u8) -> Option<Self> {
-        match b {
-            0 => Some(Status::Ok),
-            1 => Some(Status::BadRequest),
-            2 => Some(Status::UnknownOp),
-            3 => Some(Status::TooLarge),
-            4 => Some(Status::Unauthorized),
-            5 => Some(Status::NotFound),
-            _ => None,
-        }
+        Some(match b {
+            0 => Self::Ok,
+            1 => Self::BadRequest,
+            2 => Self::UnknownOp,
+            3 => Self::TooLarge,
+            4 => Self::Unauthorized,
+            5 => Self::NotFound,
+            _ => return None,
+        })
     }
 }
 

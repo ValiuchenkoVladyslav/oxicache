@@ -170,17 +170,16 @@ impl Entry {
     pub(super) fn new(key: Key, value: &[u8], hash: u64) -> Self {
         // The slab serves every size it covers 64-byte aligned from huge
         // pages; only entries beyond it go to the global allocator.
-        let (p, class) = match slab::alloc(HEADER + value.len()) {
-            Some((p, class)) => (p.cast::<Header>(), class),
-            None => {
-                let layout = glibc_layout(value.len());
-                // SAFETY: `layout` is nonzero-sized.
-                let p = unsafe { std::alloc::alloc(layout) } as *mut Header;
-                let Some(p) = NonNull::new(p) else {
-                    std::alloc::handle_alloc_error(layout)
-                };
-                (p, GLIBC_CLASS)
-            }
+        let (p, class) = if let Some((p, class)) = slab::alloc(HEADER + value.len()) {
+            (p.cast::<Header>(), class)
+        } else {
+            let layout = glibc_layout(value.len());
+            // SAFETY: `layout` is nonzero-sized.
+            let p = unsafe { std::alloc::alloc(layout) } as *mut Header;
+            let Some(p) = NonNull::new(p) else {
+                std::alloc::handle_alloc_error(layout)
+            };
+            (p, GLIBC_CLASS)
         };
         // SAFETY: the chunk holds `HEADER + value.len()` bytes; the header
         // is written before use and the value bytes are fully initialised

@@ -192,10 +192,7 @@ impl ConnLimit {
 /// Take a permit if there is a limit; both accept loops call this before
 /// `accept`.
 pub(crate) async fn admit(limit: Option<&Arc<ConnLimit>>) -> Option<OwnedSemaphorePermit> {
-    match limit {
-        Some(l) => Some(l.acquire().await),
-        None => None,
-    }
+    Some(limit?.acquire().await)
 }
 
 /// An accepted connection's slot: counted as open for as long as it lives,
@@ -361,18 +358,15 @@ async fn serve(
 ) -> std::io::Result<bool> {
     stream.set_nodelay(true)?;
     let auth_deadline = Instant::now() + AUTH_TIMEOUT;
-    match tls {
-        None => {
-            let (r, w) = stream.into_split();
-            serve_connection(r, w, auth_deadline, cache, token, idle, metrics).await
-        }
-        Some(acceptor) => {
-            let Some(stream) = by(Some(auth_deadline), acceptor.accept(stream)).await? else {
-                return Ok(true);
-            };
-            let (r, w) = tokio::io::split(Drained(stream));
-            serve_connection(r, w, auth_deadline, cache, token, idle, metrics).await
-        }
+    if let Some(acceptor) = tls {
+        let Some(stream) = by(Some(auth_deadline), acceptor.accept(stream)).await? else {
+            return Ok(true);
+        };
+        let (r, w) = tokio::io::split(Drained(stream));
+        serve_connection(r, w, auth_deadline, cache, token, idle, metrics).await
+    } else {
+        let (r, w) = stream.into_split();
+        serve_connection(r, w, auth_deadline, cache, token, idle, metrics).await
     }
 }
 
@@ -534,10 +528,7 @@ async fn by<T>(
     fut: impl Future<Output = std::io::Result<T>>,
 ) -> std::io::Result<Option<T>> {
     match deadline {
-        Some(at) => match tokio::time::timeout_at(at, fut).await {
-            Ok(res) => res.map(Some),
-            Err(_) => Ok(None),
-        },
+        Some(at) => tokio::time::timeout_at(at, fut).await.ok().transpose(),
         None => fut.await.map(Some),
     }
 }

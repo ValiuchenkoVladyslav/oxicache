@@ -158,8 +158,8 @@ impl std::ops::Deref for Piece {
     #[inline]
     fn deref(&self) -> &[u8] {
         match self {
-            Piece::Own(b) => b,
-            Piece::Shared(b) => b,
+            Self::Own(b) => b,
+            Self::Shared(b) => b,
         }
     }
 }
@@ -234,10 +234,10 @@ impl FrameWriter {
         if mark.piece == self.pieces.len() {
             self.chunk[at..at + 4].copy_from_slice(&len);
         } else {
-            match &mut self.pieces[mark.piece] {
-                Piece::Own(b) => b[at..at + 4].copy_from_slice(&len),
-                Piece::Shared(_) => unreachable!("a mark is always in an owned piece"),
-            }
+            let Piece::Own(b) = &mut self.pieces[mark.piece] else {
+                unreachable!("a mark is always in an owned piece")
+            };
+            b[at..at + 4].copy_from_slice(&len);
         }
     }
 

@@ -324,18 +324,16 @@ impl Conn {
     ) -> Result<Arc<Self>> {
         let stream = TcpStream::connect(addr).await?;
         stream.set_nodelay(true)?;
-        match tls {
-            None => {
-                let (r, w) = stream.into_split();
-                Ok(Self::spawn(r, w, keepalive))
-            }
-            Some(tls) => {
-                let stream = TlsConnector::from(tls.config.clone())
-                    .connect(tls.server_name.clone(), stream)
-                    .await?;
-                let (r, w) = tokio::io::split(stream);
-                Ok(Self::spawn(r, w, keepalive))
-            }
+
+        if let Some(tls) = tls {
+            let stream = TlsConnector::from(tls.config.clone())
+                .connect(tls.server_name.clone(), stream)
+                .await?;
+            let (r, w) = tokio::io::split(stream);
+            Ok(Self::spawn(r, w, keepalive))
+        } else {
+            let (r, w) = stream.into_split();
+            Ok(Self::spawn(r, w, keepalive))
         }
     }
 
