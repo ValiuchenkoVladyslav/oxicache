@@ -10,8 +10,8 @@ runtimes without sockets), tokio multi-threaded runtime. No persistence.
 |---|---|
 | `crates/wire` (`oxicache-wire`) | binary request/response framing shared by both sides |
 | `crates/server` (`oxicache-server`) | `oxicache-server` binary: sharded S3-FIFO engine + TCP and HTTP front ends |
-| `crates/client-rs` (`oxicache-client`) | Rust `Client` library (any serde type, stored as MessagePack) + `oxicache-cli` |
-| `packages/client-ts` (`@oxicache/client`) | TypeScript `Client` library: TCP transport for Node and Bun, HTTP transport for anything with `fetch` |
+| `crates/client-rs` (`oxicache-client`) | Rust `Client` library (any serde type, stored as MessagePack), `Cluster` over several servers + `oxicache-cli` |
+| `packages/client-ts` (`@oxicache/client`) | TypeScript `Client` library: TCP transport for Node and Bun, HTTP transport for anything with `fetch`, `cluster` over several servers |
 
 ## Protocol
 
@@ -214,6 +214,9 @@ named type as `Error::Deserialize`; the connection stays usable after either.
 (`oxicache_wire::KEEPALIVE`) without a write, so a quiet connection survives the server's
 300 s idle timeout.
 
+Several servers behind one keyspace are a [`Cluster`](#clusters), which has the same API and
+spreads keys over them.
+
 A connection lost to the server or the network (EOF, reset, any socket I/O error — the
 server's idle close, a restart) is reconnected lazily: nothing happens in the background, the
 next call re-connects and re-authenticates, and the calls that were in flight are re-issued
@@ -288,6 +291,9 @@ after `keepaliveMs` (default 100 000, a third of the server's 300 s idle timeout
 write, on an unref'd timer, so a quiet connection stays open without keeping the process
 alive; HTTP needs no heartbeat, since each call is its own request.
 
+`cluster({ nodes })` is a transport over several servers that spreads keys across them; see
+[Clusters](#clusters).
+
 The TCP transport reconnects lazily when the connection is lost (closed by the server or the
 network: idle timeout, restart, reset): the next call re-connects and re-authenticates, and
 in-flight calls are re-issued once on the new connection, failing with `ClosedError` if that
@@ -297,6 +303,78 @@ connection is down. It never reconnects on a refused token (the transport is dea
 later call rejects with that `StatusError`), on a protocol desync (an invalid status byte or
 an unsolicited frame — dead with `ClosedError`), on any other `StatusError` or encode error
 (the call fails, the connection stays), or after `close()`, which is final.
+
+## Clusters
+
+Several servers, one keyspace: each key belongs to exactly one of them, chosen by consistent
+hashing in the client. The servers know nothing of each other — there is no proxy, no
+replication and no data failover, exactly as with memcached.
+
+```rust
+let cache = Cluster::connect(
+    ["10.0.0.1:4433".parse()?, "10.0.0.2:4433".parse()?, "10.0.0.3:4433".parse()?],
+    "s3cret",
+).await?;
+cache.set("user:7", &user).await?;                   // goes to whichever server owns the key
+let user = cache.get::<User>("user:7").await?;
+let out = cache.batch(b).await?;                     // one request per server, answered in order
+cache.node_for("user:7");                            // 10.0.0.2:4433
+cache.live();                                        // the servers still in the ring
+```
+
+```ts
+import { Client, cluster } from "@oxicache/client";
+import { tcp } from "@oxicache/client/transport/tcp";
+
+const servers = await cluster({
+  nodes: ["10.0.0.1", "10.0.0.2", "10.0.0.3"].map((hostname) => ({
+    name: `${hostname}:4433`,                          // the ring identity: address as written
+    open: () => tcp({ hostname, port: 4433, token: "s3cret" }),
+  })),
+});
+const c = await Client.connect(servers);              // the cluster is itself a Transport
+await c.set("user:7", user);
+servers.nodeFor("user:7");                            // "10.0.0.2:4433"
+servers.live();
+```
+
+A cluster has the same API as one server (`get`/`set`/`del`/`batch`/`ping` in Rust, any
+`Client` over the cluster transport in TypeScript), one pipelined connection per server, and
+is cheap to clone or share. A batch is split into one request per server, sent to all of them
+at once, and answered slot by slot in the order it was built; if any of those requests fails
+the whole call fails, so a batch is all-or-nothing about the servers it reaches, not about the
+writes — the servers that did answer have applied their share. An empty batch asks nobody.
+
+**The ring.** Each server puts 512 points on a circle at `hash("<name>#<i>")`, and a key
+belongs to the first point at or after its own hash; `hash` is MurmurHash3's 32-bit x86
+variant with seed 0. Adding or losing a server moves only that server's share of the keys.
+Both clients implement the same recipe and are pinned to the same answers by
+`testdata/ring.tsv`, so a Rust and a TypeScript client hit the same server for a key — as long
+as they are given the same servers under the same **names**. The Rust client's name for a
+server is its `SocketAddr` printed (`10.0.0.1:4433`, and IPv6 in its canonical short form,
+`[2001:db8::1]:4433`), and the TypeScript client's is the `name` given, character for
+character: write it the way Rust prints it. Naming one server `cache-a:4433` in one client and
+`10.0.0.1:4433` in another gives two different rings, and so does `[2001:0db8::1]:4433`.
+
+**When a server fails.** After `failures` connection failures in a row (default 2) the server
+is dropped from the ring, its keys go to the next server round, and `retry` later (default
+30 s) it is let back in; the call that runs into the failure gets the error, the ones after it
+go elsewhere. One answer of any kind puts the server back at once and clears the count, so a
+refusal (a value too large, say) is the call's own business and never drops a server — only
+connection failures and a refused token do. `Cluster::connect_with(addrs, tls, token,
+failover, keepalive)` and `cluster({ nodes, failover })` take the policy, and `None` / `null`
+turns it off: keys then never move and a call to a server that is down is an error.
+
+Moving keys is the memcached trade, not a free lunch: nothing is copied between servers, so a
+key that moves is cold on its new server, and a value written while a server was out is not
+the one a later read finds once it is back — cache entries can go stale across an outage.
+Turn failover off for the clusters where that matters.
+
+Connecting round-trips every server at once — a transport that connects lazily, as `http`
+does, is pinged rather than taken on trust. One that is down starts out of the ring and is
+retried by the policy, so a cluster comes up without needing the whole fleet, though it does
+wait for every attempt to answer or fail; a refused token (every server shares one) fails the
+connect, and so does having no server up at all.
 
 ## Development
 

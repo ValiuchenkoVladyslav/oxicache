@@ -10,6 +10,14 @@ export {
   type SetOp,
 } from "./client.js";
 export {
+  type ClusterNode,
+  type ClusterOptions,
+  ClusterTransport,
+  cluster,
+  DEFAULT_FAILOVER,
+  type Failover,
+} from "./cluster.js";
+export {
   ClosedError,
   isAnswer,
   StatusError,

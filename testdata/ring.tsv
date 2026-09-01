@@ -1,0 +1,63 @@
+# The ring both clients must agree on; see crates/client-rs/src/ring.rs.
+# Regenerate with UPDATE_RING_FIXTURE=1 cargo test -p oxicache-client.
+points	512
+node	10.0.0.1:4433
+node	10.0.0.2:4433
+node	10.0.0.3:4433
+node	[::1]:4433
+node	cache-a:4433
+hash		0
+hash	a	1009084850
+hash	foobar	2764362941
+hash	user:1	3416794175
+hash	10.0.0.1:4433#0	2923287817
+hash	ключ	2589532226
+route	user:0	[::1]:4433
+route	user:1	cache-a:4433
+route	user:2	[::1]:4433
+route	user:3	10.0.0.2:4433
+route	user:4	10.0.0.2:4433
+route	user:5	cache-a:4433
+route	user:6	[::1]:4433
+route	user:7	10.0.0.2:4433
+route	user:8	[::1]:4433
+route	user:9	cache-a:4433
+route	user:10	10.0.0.2:4433
+route	user:11	[::1]:4433
+route	user:12	cache-a:4433
+route	user:13	10.0.0.1:4433
+route	user:14	10.0.0.1:4433
+route	user:15	cache-a:4433
+route	user:16	10.0.0.2:4433
+route	user:17	10.0.0.2:4433
+route	user:18	10.0.0.1:4433
+route	user:19	10.0.0.3:4433
+route	user:20	[::1]:4433
+route	user:21	10.0.0.2:4433
+route	user:22	10.0.0.2:4433
+route	user:23	10.0.0.1:4433
+down	10.0.0.2:4433
+route-down	user:0	[::1]:4433
+route-down	user:1	cache-a:4433
+route-down	user:2	[::1]:4433
+route-down	user:3	10.0.0.1:4433
+route-down	user:4	[::1]:4433
+route-down	user:5	cache-a:4433
+route-down	user:6	[::1]:4433
+route-down	user:7	[::1]:4433
+route-down	user:8	[::1]:4433
+route-down	user:9	cache-a:4433
+route-down	user:10	10.0.0.1:4433
+route-down	user:11	[::1]:4433
+route-down	user:12	cache-a:4433
+route-down	user:13	10.0.0.1:4433
+route-down	user:14	10.0.0.1:4433
+route-down	user:15	cache-a:4433
+route-down	user:16	10.0.0.3:4433
+route-down	user:17	cache-a:4433
+route-down	user:18	10.0.0.1:4433
+route-down	user:19	10.0.0.3:4433
+route-down	user:20	[::1]:4433
+route-down	user:21	[::1]:4433
+route-down	user:22	[::1]:4433
+route-down	user:23	10.0.0.1:4433

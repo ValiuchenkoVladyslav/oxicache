@@ -249,6 +249,15 @@ impl BatchEncoder {
         self.out.put_slice(key);
     }
 
+    /// Append an item that is already encoded as `(op, body)`, exactly as
+    /// [`frames`] yields it: what a batch being split across servers
+    /// re-emits for each of them.
+    pub fn push(&mut self, op: u8, body: &[u8]) {
+        self.out.put_slice(&encode_header(op, body.len()));
+        self.count += 1;
+        self.out.put_slice(body);
+    }
+
     /// The body. Panics past [`MAX_ITEMS`]; check [`len`](Self::len) first.
     pub fn finish(mut self) -> Bytes {
         assert!(
@@ -379,6 +388,33 @@ mod tests {
             ]
         );
         assert_eq!(frames(&BatchEncoder::new().finish()).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn push_re_emits_a_parsed_item() {
+        let mut src = BatchEncoder::new();
+        src.get(b"a");
+        src.set(b"k", b"v");
+        src.del(b"z");
+        let body = src.finish();
+        // Split the items over two encoders and read them back.
+        let (mut even, mut odd) = (BatchEncoder::new(), BatchEncoder::new());
+        for (i, (op, item)) in frames(&body).unwrap().enumerate() {
+            if i % 2 == 0 {
+                even.push(op, item)
+            } else {
+                odd.push(op, item)
+            }
+        }
+        assert_eq!((even.len(), odd.len()), (2, 1));
+        assert_eq!(
+            frames(&even.finish()).unwrap().collect::<Vec<_>>(),
+            vec![(Op::Get as u8, &b"a"[..]), (Op::Del as u8, &b"z"[..])]
+        );
+        assert_eq!(
+            frames(&odd.finish()).unwrap().collect::<Vec<_>>(),
+            vec![(Op::Set as u8, &encode_set(b"k", b"v")[..])]
+        );
     }
 
     #[test]

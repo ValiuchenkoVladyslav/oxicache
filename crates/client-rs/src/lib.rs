@@ -39,6 +39,11 @@
 //! dead and every call fails with that error. Status, encoding and decoding
 //! errors are the call's alone; the connection stays.
 //!
+//! Several servers with the keyspace spread over them are a [`Cluster`]:
+//! the same calls, with the server for each key picked by consistent
+//! hashing, and a server that stops answering dropped from the ring until
+//! it is back.
+//!
 //! A server started with `OXICACHE_TLS_CERT` speaks TLS; connect to it with
 //! [`Client::connect_tls`] and a [`Tls`] naming what to trust and who the
 //! server must be.
@@ -66,6 +71,10 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
+mod cluster;
+mod ring;
+
+pub use cluster::{Cluster, Failover};
 pub use rustls;
 pub use rustls_pki_types::ServerName;
 
@@ -541,6 +550,41 @@ impl Client {
         Self::connect_with(addr, Some(tls), token, wire::KEEPALIVE).await
     }
 
+    /// A client that has not connected yet: the first call opens the
+    /// connection and authenticates, exactly as a reconnect does. A
+    /// [`Cluster`] builds its servers this way, so one that is down when
+    /// the cluster starts is a server to retry rather than a missing
+    /// client.
+    pub(crate) fn lazy(
+        addr: SocketAddr,
+        tls: Option<Tls>,
+        token: Bytes,
+        keepalive: Duration,
+    ) -> Self {
+        Self {
+            inner: Self::inner(addr, tls, token, keepalive, Link::Down),
+        }
+    }
+
+    fn inner(
+        addr: SocketAddr,
+        tls: Option<Tls>,
+        token: Bytes,
+        keepalive: Duration,
+        link: Link,
+    ) -> Arc<Inner> {
+        Arc::new(Inner {
+            addr,
+            tls,
+            token,
+            keepalive,
+            link: RwLock::new(link),
+            slow: Mutex::new(Backoff::fresh()),
+            attempts: AtomicU64::new(0),
+            reconnects: AtomicU64::new(0),
+        })
+    }
+
     /// [`connect`](Self::connect) or [`connect_tls`](Self::connect_tls) with
     /// a heartbeat interval other than [`KEEPALIVE`](wire::KEEPALIVE): after
     /// `keepalive` without a write the client pings so the server's idle
@@ -561,16 +605,7 @@ impl Client {
         #[cfg(feature = "tracing")]
         tracing::debug!(%addr, "connected");
         Ok(Self {
-            inner: Arc::new(Inner {
-                addr,
-                tls,
-                token,
-                keepalive,
-                link: RwLock::new(Link::Up(conn)),
-                slow: Mutex::new(Backoff::fresh()),
-                attempts: AtomicU64::new(0),
-                reconnects: AtomicU64::new(0),
-            }),
+            inner: Self::inner(addr, tls, token, keepalive, Link::Up(conn)),
         })
     }
 
@@ -641,7 +676,14 @@ impl Client {
         if n > wire::MAX_ITEMS {
             return Err(Error::TooManyItems(n));
         }
-        let (_, body) = self.call(Op::Batch, batch.enc.finish()).await?;
+        self.batch_body(batch.enc.finish(), n).await
+    }
+
+    /// Send an encoded BATCH body of `n` items and index the replies. A
+    /// [`Cluster`] splits a batch into one body per server and lands here
+    /// for the server that gets all of it.
+    pub(crate) async fn batch_body(&self, body: Bytes, n: usize) -> Result<Outcome> {
+        let (_, body) = self.call(Op::Batch, body).await?;
         let frames = wire::frames(&body)?;
         if frames.len() != n {
             return Err(Error::Count {

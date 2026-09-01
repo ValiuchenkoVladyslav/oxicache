@@ -216,6 +216,27 @@ export function encodeBatchFrame(items: readonly BatchItem[]): Uint8Array {
   return f;
 }
 
+/**
+ * A BATCH frame carrying items that are already encoded, exactly as they
+ * arrived inside another batch: what a batch split across the servers of a
+ * cluster sends to each of them. Throws RangeError past `MAX_ITEMS`.
+ */
+export function encodeBatchOf(items: readonly Uint8Array[]): Uint8Array {
+  checkCount(items.length);
+  let size = HEADER_LEN + U32;
+  for (const item of items) size += item.length;
+  const f = new Uint8Array(size);
+  f[0] = Op.Batch;
+  storeU32(f, 1, size - HEADER_LEN);
+  storeU32(f, HEADER_LEN, items.length);
+  let pos = HEADER_LEN + U32;
+  for (const item of items) {
+    f.set(item, pos);
+    pos += item.length;
+  }
+  return f;
+}
+
 /** One answer inside a BATCH response. */
 export interface Reply {
   status: number;
@@ -233,6 +254,22 @@ export function decodeReplies(body: Uint8Array): Reply[] {
   }
   r.finish();
   return out;
+}
+
+/** The body of a BATCH response: what {@link decodeReplies} reads back. */
+export function encodeReplies(replies: readonly Reply[]): Uint8Array {
+  let size = U32;
+  for (const r of replies) size += HEADER_LEN + r.body.length;
+  const b = new Uint8Array(size);
+  storeU32(b, 0, replies.length);
+  let pos = U32;
+  for (const r of replies) {
+    b[pos] = r.status;
+    storeU32(b, pos + 1, r.body.length);
+    b.set(r.body, pos + HEADER_LEN);
+    pos += HEADER_LEN + r.body.length;
+  }
+  return b;
 }
 
 export function encodeRawFrame(op: Op, body: Uint8Array): Uint8Array {

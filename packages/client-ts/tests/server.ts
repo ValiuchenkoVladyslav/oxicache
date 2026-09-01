@@ -31,7 +31,7 @@ function build(): Promise<void> {
 }
 
 /** A loopback port that was free a moment ago. */
-function freePort(): number {
+export function freePort(): number {
   const l = Bun.listen({
     hostname: "127.0.0.1",
     port: 0,
