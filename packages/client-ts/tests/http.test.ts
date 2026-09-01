@@ -67,8 +67,11 @@ describe("http transport e2e", () => {
   });
 
   test("ping round-trips as POST /ping", async () => {
-    const c = await Client.connect(http({ url: server.url, token: "any" }));
+    const transport = http({ url: server.url, token: "any" });
+    const c = await Client.connect(transport);
     await c.ping();
+    // The transport answers a ping of its own, without a client.
+    await transport.ping();
     c.close();
     await expect(c.ping()).rejects.toBeInstanceOf(ClosedError);
   });

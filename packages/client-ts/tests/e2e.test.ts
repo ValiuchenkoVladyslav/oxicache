@@ -328,8 +328,11 @@ describe("tcp transport e2e", () => {
   });
 
   test("ping round-trips", async () => {
-    const c = await Client.connect(tcp({ port: server.port, token: "any" }));
+    const transport = await tcp({ port: server.port, token: "any" });
+    const c = await Client.connect(transport);
     await c.ping();
+    // The transport answers a ping of its own, without a client.
+    await transport.ping();
     await c.set("p", 1);
     await Promise.all([c.ping(), c.ping()]);
     expect(await c.get<number>("p")).toBe(1);
