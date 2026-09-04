@@ -225,31 +225,51 @@ impl Drop for Slot {
     }
 }
 
+/// What a front end serves with, resolved from its `Options` once at bind
+/// and shared by every connection it accepts: one refcount per connection
+/// rather than one per field.
+pub(crate) struct Shared {
+    pub(crate) cache: Arc<Cache>,
+    pub(crate) token: Box<[u8]>,
+    pub(crate) idle_timeout: Option<Duration>,
+    pub(crate) limit: Option<Arc<ConnLimit>>,
+    pub(crate) tls: Option<TlsAcceptor>,
+    pub(crate) metrics: Arc<Metrics>,
+}
+
+impl Shared {
+    pub(crate) fn new(cache: Arc<Cache>, opts: Options) -> Result<Arc<Self>> {
+        if opts.token.is_empty() {
+            return Err(Error::EmptyToken);
+        }
+        Ok(Arc::new(Self {
+            cache,
+            token: opts.token,
+            idle_timeout: opts.idle_timeout,
+            limit: opts.limit,
+            tls: opts.tls.map(TlsAcceptor::from),
+            metrics: opts.metrics,
+        }))
+    }
+
+    /// Connections open under the limit, if there is one.
+    pub(crate) fn open_connections(&self) -> Option<usize> {
+        self.limit.as_ref().map(|l| l.open())
+    }
+}
+
 pub struct Server {
     listener: std::net::TcpListener,
-    cache: Arc<Cache>,
-    token: Arc<[u8]>,
-    idle_timeout: Option<Duration>,
-    limit: Option<Arc<ConnLimit>>,
-    tls: Option<TlsAcceptor>,
-    metrics: Arc<Metrics>,
+    shared: Arc<Shared>,
 }
 
 impl Server {
     /// Bind `addr` serving `cache`; every connection must authenticate with
     /// `opts.token`.
     pub fn bind(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
-        let token = token(&opts)?;
+        let shared = Shared::new(cache, opts)?;
         let listener = listener(addr).map_err(|source| Error::Bind { addr, source })?;
-        Ok(Self {
-            listener,
-            cache,
-            token,
-            idle_timeout: opts.idle_timeout,
-            limit: opts.limit,
-            tls: opts.tls.map(TlsAcceptor::from),
-            metrics: opts.metrics,
-        })
+        Ok(Self { listener, shared })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -258,12 +278,12 @@ impl Server {
 
     /// Connections open under the shared limit, if there is one.
     pub fn open_connections(&self) -> Option<usize> {
-        self.limit.as_ref().map(|l| l.open())
+        self.shared.open_connections()
     }
 
     /// Whether connections are served over TLS.
     pub fn is_tls(&self) -> bool {
-        self.tls.is_some()
+        self.shared.tls.is_some()
     }
 
     /// Accept connections on the current runtime until the task is dropped.
@@ -293,14 +313,6 @@ impl Server {
     }
 }
 
-/// Validate the shared secret; shared by both front ends.
-pub(crate) fn token(opts: &Options) -> Result<Arc<[u8]>> {
-    if opts.token.is_empty() {
-        return Err(Error::EmptyToken);
-    }
-    Ok(Arc::from(&*opts.token))
-}
-
 /// A non-blocking listening socket with `SO_REUSEADDR`, shared by both front ends.
 pub(crate) fn listener(addr: SocketAddr) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
@@ -317,18 +329,16 @@ async fn accept_loop(listener: std::net::TcpListener, server: &Server, conns: &m
     loop {
         // Reap finished tasks so the set does not grow with every connection.
         while conns.try_join_next().is_some() {}
-        let permit = admit(server.limit.as_ref()).await;
+        let permit = admit(server.shared.limit.as_ref()).await;
         match listener.accept().await {
             Ok((stream, remote)) => {
-                let (cache, token) = (server.cache.clone(), server.token.clone());
-                let (idle, tls) = (server.idle_timeout, server.tls.clone());
-                let metrics = server.metrics.clone();
-                let slot = Slot::open(server.limit.as_ref(), permit);
+                let shared = server.shared.clone();
+                let slot = Slot::open(shared.limit.as_ref(), permit);
                 conns.spawn(async move {
                     // Held until the connection is done, whatever the reason.
                     let _slot = slot;
                     debug!(%remote, "connection open");
-                    let res = serve(stream, tls, &cache, &token, idle, &metrics).await;
+                    let res = serve(stream, &shared).await;
                     match res {
                         Ok(true) => debug!(%remote, "idle connection closed"),
                         Ok(false) => {}
@@ -348,25 +358,18 @@ async fn accept_loop(listener: std::net::TcpListener, server: &Server, conns: &m
 /// first; `Ok(true)` means the idle timeout closed it. The handshake is
 /// under the AUTH deadline, so an unauthenticated peer's time on a slot
 /// is capped whether or not it ever completes one.
-async fn serve(
-    stream: TcpStream,
-    tls: Option<TlsAcceptor>,
-    cache: &Cache,
-    token: &[u8],
-    idle: Option<Duration>,
-    metrics: &Metrics,
-) -> std::io::Result<bool> {
+async fn serve(stream: TcpStream, shared: &Shared) -> std::io::Result<bool> {
     stream.set_nodelay(true)?;
     let auth_deadline = Instant::now() + AUTH_TIMEOUT;
-    if let Some(acceptor) = tls {
+    if let Some(acceptor) = &shared.tls {
         let Some(stream) = by(Some(auth_deadline), acceptor.accept(stream)).await? else {
             return Ok(true);
         };
         let (r, w) = tokio::io::split(Drained(stream));
-        serve_connection(r, w, auth_deadline, cache, token, idle, metrics).await
+        serve_connection(r, w, auth_deadline, shared).await
     } else {
         let (r, w) = stream.into_split();
-        serve_connection(r, w, auth_deadline, cache, token, idle, metrics).await
+        serve_connection(r, w, auth_deadline, shared).await
     }
 }
 
@@ -450,11 +453,15 @@ async fn serve_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     mut r: R,
     mut w: W,
     auth_deadline: Instant,
-    cache: &Cache,
-    token: &[u8],
-    idle: Option<Duration>,
-    metrics: &Metrics,
+    shared: &Shared,
 ) -> std::io::Result<bool> {
+    let Shared {
+        cache,
+        token,
+        idle_timeout: idle,
+        metrics,
+        ..
+    } = shared;
     let mut authed = false;
     let mut reader = FrameReader::new(MAX_AUTH_FRAME);
     let mut out = FrameWriter::new();
@@ -961,7 +968,7 @@ mod tests {
         let mut hdr = [0u8; wire::HEADER_LEN];
         c.read_exact(&mut hdr).await.unwrap();
         assert_eq!(wire::decode_header(&hdr).0, Status::Unauthorized as u8);
-        assert_eq!(s.metrics.auth_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(s.shared.metrics.auth_failures.load(Ordering::Relaxed), 1);
     }
 
     /// PING is an op like any other: before AUTH it is refused and the
@@ -1100,7 +1107,7 @@ mod tests {
         drop(c); // RST rather than FIN
         tokio::time::sleep(Duration::from_millis(50)).await;
         // The server is still accepting.
-        let (st, _) = call(&s.cache, Op::Get as u8, Bytes::from_static(b"k"));
+        let (st, _) = call(&s.shared.cache, Op::Get as u8, Bytes::from_static(b"k"));
         assert_eq!(st, Status::NotFound);
         let mut c = TcpStream::connect(addr).await.unwrap();
         auth(&mut c).await;

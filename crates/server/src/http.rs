@@ -40,13 +40,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 use crate::cache::Cache;
 use crate::error::{Error, Result};
-use crate::metrics::Metrics;
-use crate::tcp::{self, AUTH_TIMEOUT, ConnLimit, MAX_FRAME, Options};
+use crate::tcp::{self, AUTH_TIMEOUT, MAX_FRAME, Options, Shared};
 
 /// How long in-flight requests get to finish at shutdown.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -54,29 +52,16 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 pub struct HttpServer {
     listener: std::net::TcpListener,
-    cache: Arc<Cache>,
-    token: Arc<[u8]>,
-    idle_timeout: Option<Duration>,
-    limit: Option<Arc<ConnLimit>>,
-    tls: Option<TlsAcceptor>,
-    metrics: Arc<Metrics>,
+    shared: Arc<Shared>,
 }
 
 impl HttpServer {
     /// Bind `addr` serving `cache`; every request except `/health` must
     /// carry `opts.token`.
     pub fn bind(addr: SocketAddr, cache: Arc<Cache>, opts: Options) -> Result<Self> {
-        let token = tcp::token(&opts)?;
+        let shared = Shared::new(cache, opts)?;
         let listener = tcp::listener(addr).map_err(|source| Error::Bind { addr, source })?;
-        Ok(Self {
-            listener,
-            cache,
-            token,
-            idle_timeout: opts.idle_timeout,
-            limit: opts.limit,
-            tls: opts.tls.map(TlsAcceptor::from),
-            metrics: opts.metrics,
-        })
+        Ok(Self { listener, shared })
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -85,12 +70,12 @@ impl HttpServer {
 
     /// Connections open under the shared limit, if there is one.
     pub fn open_connections(&self) -> Option<usize> {
-        self.limit.as_ref().map(|l| l.open())
+        self.shared.open_connections()
     }
 
     /// Whether connections are served over TLS (`https://`).
     pub fn is_tls(&self) -> bool {
-        self.tls.is_some()
+        self.shared.tls.is_some()
     }
 
     /// Accept connections on the current runtime until the task is dropped.
@@ -131,29 +116,24 @@ async fn accept_loop(
     let listener = TcpListener::from_std(listener).expect("register listener");
     loop {
         while conns.try_join_next().is_some() {}
-        let permit = tcp::admit(server.limit.as_ref()).await;
+        let permit = tcp::admit(server.shared.limit.as_ref()).await;
         match listener.accept().await {
             Ok((stream, remote)) => {
-                let (cache, token, stop) =
-                    (server.cache.clone(), server.token.clone(), stop.clone());
-                let (idle, tls) = (server.idle_timeout, server.tls.clone());
-                let (limit, metrics) = (server.limit.clone(), server.metrics.clone());
-                let slot = tcp::Slot::open(server.limit.as_ref(), permit);
+                let (shared, stop) = (server.shared.clone(), stop.clone());
+                let slot = tcp::Slot::open(shared.limit.as_ref(), permit);
                 conns.spawn(async move {
                     let _slot = slot;
                     debug!(%remote, "http connection open");
                     let _ = stream.set_nodelay(true);
-                    let res = match tls {
-                        None => serve(stream, cache, token, limit, metrics, idle, stop).await,
+                    let res = match shared.tls.clone() {
+                        None => serve(stream, shared, stop).await,
                         // The handshake is under the same hard cap as AUTH
                         // on TCP: a peer that never finishes one does not
                         // get to sit on a slot.
                         Some(acceptor) => {
                             match tokio::time::timeout(AUTH_TIMEOUT, acceptor.accept(stream)).await
                             {
-                                Ok(Ok(stream)) => {
-                                    serve(stream, cache, token, limit, metrics, idle, stop).await
-                                }
+                                Ok(Ok(stream)) => serve(stream, shared, stop).await,
                                 Ok(Err(e)) => Err(e.into()),
                                 Err(_) => {
                                     debug!(%remote, "tls handshake timed out");
@@ -179,19 +159,13 @@ async fn accept_loop(
 /// the current request and close.
 async fn serve<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
-    cache: Arc<Cache>,
-    token: Arc<[u8]>,
-    limit: Option<Arc<ConnLimit>>,
-    metrics: Arc<Metrics>,
-    idle: Option<Duration>,
+    shared: Arc<Shared>,
     mut stop: watch::Receiver<bool>,
 ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let idle = shared.idle_timeout;
     let svc = service_fn(move |req| {
-        let (cache, token) = (cache.clone(), token.clone());
-        let (limit, metrics) = (limit.clone(), metrics.clone());
-        async move {
-            Ok::<_, hyper::Error>(handle(req, &cache, &token, limit.as_deref(), &metrics).await)
-        }
+        let shared = shared.clone();
+        async move { Ok::<_, hyper::Error>(handle(req, &shared).await) }
     });
     // hyper re-arms its header timeout for every request on a keep-alive
     // connection, so it doubles as the idle timeout. `None` is passed
@@ -245,13 +219,14 @@ fn authorized(req: &Request<Incoming>, token: &[u8]) -> bool {
         .is_some_and(|t| tcp::ct_eq(token, t))
 }
 
-async fn handle(
-    req: Request<Incoming>,
-    cache: &Cache,
-    token: &[u8],
-    limit: Option<&ConnLimit>,
-    metrics: &Metrics,
-) -> Response<Full<Bytes>> {
+async fn handle(req: Request<Incoming>, shared: &Shared) -> Response<Full<Bytes>> {
+    let Shared {
+        cache,
+        token,
+        limit,
+        metrics,
+        ..
+    } = shared;
     let op = match req.uri().path() {
         // Status code only, no body: a probe target.
         "/health" => return closing(reply(StatusCode::OK, Bytes::new())),
@@ -266,7 +241,10 @@ async fn handle(
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return closing(text(StatusCode::UNAUTHORIZED, "auth required"));
             }
-            return reply(StatusCode::OK, Bytes::from(metrics.render(cache, limit)));
+            return reply(
+                StatusCode::OK,
+                Bytes::from(metrics.render(cache, limit.as_deref())),
+            );
         }
         "/get" => Op::Get,
         "/set" => Op::Set,
