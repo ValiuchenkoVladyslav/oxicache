@@ -71,7 +71,7 @@ pub(crate) fn hash(bytes: &[u8]) -> u32 {
 /// every call.
 pub(crate) struct Ring {
     /// `(hash, server index)`, sorted by hash and free of duplicates.
-    points: Vec<(u32, u32)>,
+    points: Box<[(u32, u32)]>,
 }
 
 impl Ring {
@@ -96,7 +96,9 @@ impl Ring {
             })
         });
         points.dedup_by_key(|p| p.0);
-        Self { points }
+        Self {
+            points: points.into_boxed_slice(),
+        }
     }
 
     /// The server `key` belongs to: the first one clockwise from the key's

@@ -784,7 +784,7 @@ impl<T> std::fmt::Debug for Slot<T> {
 pub struct Outcome {
     body: Bytes,
     /// Per item: status, and where its body lies in `body`.
-    index: Vec<(u8, u32, u32)>,
+    index: Box<[(u8, u32, u32)]>,
 }
 
 impl Outcome {

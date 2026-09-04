@@ -434,7 +434,7 @@ impl Cluster {
         let Some(&only) = route.first() else {
             return Ok(Outcome {
                 body: Bytes::new(),
-                index: Vec::new(),
+                index: Box::new([]),
             });
         };
         if !split {
@@ -464,7 +464,7 @@ impl Cluster {
         // Every server is waited for even once one has failed: they are all
         // applying their share, and each one's outcome is the failure
         // policy's business.
-        let mut index = vec![(Status::Ok as u8, 0u32, 0u32); n];
+        let mut index = vec![(Status::Ok as u8, 0u32, 0u32); n].into_boxed_slice();
         let mut merged = BytesMut::new();
         let mut failure = None;
         while let Some(joined_result) = tasks.join_next().await {

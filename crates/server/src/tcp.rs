@@ -57,7 +57,7 @@ pub struct Options {
     /// Shared secret every connection must present in an `Auth` frame before
     /// its first request. Must not be empty: there is no unauthenticated
     /// mode.
-    pub token: Vec<u8>,
+    pub token: Box<[u8]>,
     /// Close a connection that sends nothing for this long (on HTTP: a
     /// keep-alive connection that starts no request). `None` never closes.
     pub idle_timeout: Option<Duration>,
@@ -86,7 +86,7 @@ impl Options {
     /// than remember to opt in.
     pub fn new(token: impl Into<Vec<u8>>) -> Self {
         Self {
-            token: token.into(),
+            token: token.into().into_boxed_slice(),
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
             limit: Some(Arc::new(ConnLimit::new(DEFAULT_MAX_CONNECTIONS))),
             tls: None,
@@ -298,7 +298,7 @@ pub(crate) fn token(opts: &Options) -> Result<Arc<[u8]>> {
     if opts.token.is_empty() {
         return Err(Error::EmptyToken);
     }
-    Ok(Arc::from(opts.token.as_slice()))
+    Ok(Arc::from(&*opts.token))
 }
 
 /// A non-blocking listening socket with `SO_REUSEADDR`, shared by both front ends.

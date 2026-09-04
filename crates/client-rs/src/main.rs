@@ -241,11 +241,9 @@ async fn bench(
     // One contiguous buffer with a fixed stride: picking a key is index
     // arithmetic, not a pointer chase into a separate allocation per key.
     let key_len = "bench:00000000".len();
-    let keys: Arc<Vec<u8>> = Arc::new(
-        (0..keyspace)
-            .flat_map(|i| format!("bench:{i:08}").into_bytes())
-            .collect(),
-    );
+    let keys: Arc<[u8]> = (0..keyspace)
+        .flat_map(|i| format!("bench:{i:08}").into_bytes())
+        .collect();
 
     let mut clients = Vec::with_capacity(conns);
     for _ in 0..conns {

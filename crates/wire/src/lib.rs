@@ -329,15 +329,14 @@ impl ExactSizeIterator for Frames<'_> {}
 
 /// The replies of a BATCH response as owned `(status, body)` pairs sharing
 /// the response's allocation.
-pub fn decode_replies(body: Bytes) -> Result<Vec<(u8, Bytes)>> {
-    let it = frames(&body)?;
-    let mut replies = Vec::with_capacity(it.len());
+pub fn decode_replies(body: Bytes) -> Result<Box<[(u8, Bytes)]>> {
     let base = body.as_ptr() as usize;
-    for (tag, b) in it {
-        let start = b.as_ptr() as usize - base;
-        replies.push((tag, body.slice(start..start + b.len())));
-    }
-    Ok(replies)
+    Ok(frames(&body)?
+        .map(|(tag, b)| {
+            let start = b.as_ptr() as usize - base;
+            (tag, body.slice(start..start + b.len()))
+        })
+        .collect())
 }
 
 #[cfg(test)]
