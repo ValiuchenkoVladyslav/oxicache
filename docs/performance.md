@@ -654,3 +654,57 @@ DRAM traffic. The K profile is now: `Shard::set` 25 % (with `maybe_compact` inli
 `find` + `prefetch_entries` 25 %, non-temporal copy 12 %, entry drop glue 10 %,
 `dispatch` 9 %, glibc ~4 % — dependent memory latency and the value copy itself,
 with no cheap structural waste left visible.
+
+## memcached comparison, container vs container (2026-09-01)
+
+The 2026-08-30 comparison re-measured with both servers in the same shape: each runs in a
+rootless podman container on `--network host` — oxicache from the `Dockerfile` image built
+at HEAD (the image's `GLIBC_TUNABLES=glibc.malloc.tcache_count=1024`, `OXICACHE_CAPACITY=1G`),
+memcached 1.6.45 from `docker.io/library/memcached` with `-t 12 -m 1024`. Same box, every
+other container stopped, load average below 0.4 at the start of each sweep. Method as in
+round 13: server user+sys from `/proc` of the containerised process over a 6 s run after a
+2 s warm-up, divided by requests; min of 3 alternating reps, spread ±2 % on every row.
+
+One method change from 2026-08-30: **both key spaces are prefilled** (100k keys at the row's
+value size) before the warm-up, so every GET hits on both sides. The old memcached numbers
+were partly measuring misses, which are cheaper — that is why its single-key 128 B figure
+rose from 1.5 to 1.58 µs/req (text) between the two runs.
+
+Drivers: `oxicache-cli bench` and memtier_benchmark 2.5.1, the latter on memcached's cheaper
+binary protocol wherever it supports it.
+
+| shape | memcached | oxicache | ratio | asymmetry |
+|---|---|---|---|---|
+| single key, 8×16, 128 B, 10 % writes | 1.50 µs/req, 2.15M req/s | **1.20 µs/req**, 1.58M | −20 % | |
+| single key, 8×16, 1 KiB, 50 % writes | 3.54 µs/req, 1.38M | **1.53 µs/req**, 1.23M | −57 % | |
+| single key, 64×2, 128 B, 10 % writes | 5.42 µs/req, 684k | **4.64 µs/req**, 470k | −15 % | oxicache's throughput on this shape moved 470–507k between reps while its CPU/req held at 4.64–4.73; read the CPU number, not the req/s |
+| 16-key batch, 8×16, 128 B, 10 % writes | 1.47 µs/key-op (8.82 µs/req), 3.17M key-ops/s | **0.266 µs/key-op** (4.26 µs/req), 11.1M | 5.5× | memcached has no multi-key SET, so this is mget-16 + single-key sets against our 16-key batches: only the per-key-op column compares, and what it compares is the protocol, not two engines doing the same work. Text protocol forced — memtier rejects `--multi-key-get` with `memcache_binary`, worth 2–7 % to memcached. Write mix 11.1 % of key-ops against our 10 % |
+| 16-key batch, 64×2, 128 B, 10 % writes | 1.61 µs/key-op (9.68 µs/req), 2.44M | **0.506 µs/key-op** (8.10 µs/req), 6.11M | 3.2× | as above |
+| 16-key batch, 8×16, 1 KiB, 50 % writes | 2.13 µs/key-op (4.01 µs/req), 1.60M | **1.61 µs/key-op** (25.8 µs/req), 3.08M | 1.3× | as above, except the write mix is 50 % of key-ops on both sides |
+
+### What is still not equal, on every row
+
+- **The clients are different programs.** Nothing speaks both protocols, so memtier (C, 8
+  threads) drives memcached and our tokio bench drives oxicache. Per request they cost about
+  the same — ours 3.44 cores at 1.52M req/s (2.26 µs/req), memtier 4.0–4.5 cores at
+  1.7–2.1M (2.2–2.7 µs/req) — but memcached's runs keep more of the 12 cores busy (≈7.4
+  against ≈5.3), so part of its per-request CPU is SMT and cache contention rather than
+  server work. Bounded below by the rate-limit check.
+- **Huge pages, one-sided.** The slab `madvise(MADV_HUGEPAGE)`s its regions; memcached's
+  `-L` refuses on this box ("Transparent huge pages support not detected") because THP is in
+  `madvise` mode, not `always`. We get huge pages and memcached cannot opt in.
+- **Not the same product.** memcached items carry TTL, flags, CAS, LRU maintenance and slab
+  rebalancing; oxicache entries have none of that and the server has no TTL at all. Some of
+  memcached's per-op cost buys features this one does not offer.
+- Values here are MessagePack (a 128 B string is ~131 B on the wire) against memtier's raw
+  bytes, and every req/s column is client-bound on both sides — context, not a result.
+
+All four point the same way, mildly in oxicache's favour.
+
+### Checks run alongside
+
+| check | result |
+|---|---|
+| oxicache native vs in its container, shapes A and B, 3 alternating reps | 1.183–1.222 vs 1.200–1.214 µs/req, and 4.241–4.302 vs 4.260–4.310 — overlapping. Containerisation on `--network host` costs nothing, as the 2026-08-30 container section found |
+| memtier rate-limited to oxicache's request rate (196k/conn × 8), single key 128 B | 1.73 vs 1.71 µs/req unlimited — the gap is not an artefact of memcached being driven harder |
+| memcached text vs binary protocol | binary is cheaper: 1.54 vs 1.58, 3.55 vs 3.69, 5.42 vs 5.81 µs/req on the three single-key shapes. Unavailable for the batch rows |
